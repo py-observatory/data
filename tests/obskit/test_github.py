@@ -635,7 +635,6 @@ def test_urllib_transport_returns_status_lowercase_headers_and_body(monkeypatch)
     request = seen["request"]
     assert request.get_method() == "POST"
     assert request.full_url == "https://example.test/x?y=1"
-    assert request.data == b"payload"
     assert request.get_header("Accept") == "a/b"
     assert seen["timeout"] == 60
 
@@ -700,6 +699,117 @@ def test_github_defaults_to_the_urllib_transport(monkeypatch, clock):
     [request] = seen
     assert request.full_url == f"{RELEASES_URL}/tags/{TAG}"
     assert request.get_header("Authorization") == f"Bearer {TOKEN}"
+
+
+# A socket timeout bounds a whole sendall(). So a body that goes out in one send gives a
+# whole upload one timeout to finish in, and not just each stall. The body therefore
+# goes to urllib as a file, which http.client sends in blocks, and urllib then needs the
+# Content-Length stated: without it, it falls back to chunked transfer encoding.
+
+
+def stub_urlopen(monkeypatch) -> list:
+    """Replace urlopen with a stub that records each Request and replies 201."""
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return Reply(201, headers_of(), b"{}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return requests
+
+
+def test_urllib_transport_hands_a_body_to_urllib_as_a_file_with_a_content_length(
+    monkeypatch,
+):
+    body = BINARY * 100
+    given = {"Content-Type": "application/octet-stream", "Accept": "a/b"}
+    requests = stub_urlopen(monkeypatch)
+
+    UrllibTransport().request("POST", "https://example.test/up", given, body)
+
+    [request] = requests
+    assert not isinstance(request.data, bytes)
+    assert request.data.read() == body, "a file, and its bytes are the original"
+    assert request.get_header("Content-length") == str(len(body))
+    assert not request.has_header("Transfer-encoding")
+    assert request.get_header("Content-type") == "application/octet-stream"
+    assert request.get_header("Accept") == "a/b"
+    assert given == {"Content-Type": "application/octet-stream", "Accept": "a/b"}
+
+
+def test_urllib_transport_gives_every_call_its_own_stream_of_the_whole_body(
+    monkeypatch,
+):
+    body = BINARY * 100
+    requests = stub_urlopen(monkeypatch)
+    transport = UrllibTransport()
+
+    for _ in range(3):  # what the retries do with one body
+        transport.request("POST", "https://example.test/up", {}, body)
+
+    streams = [request.data for request in requests]
+    assert len({id(stream) for stream in streams}) == 3
+    assert [stream.read() for stream in streams] == [body] * 3
+
+
+@pytest.mark.parametrize("body", [None, b""], ids=["no body", "empty body"])
+def test_urllib_transport_leaves_a_missing_or_empty_body_alone(monkeypatch, body):
+    requests = stub_urlopen(monkeypatch)
+
+    UrllibTransport().request("POST", "https://example.test/x", {}, body)
+
+    [request] = requests
+    assert request.data == body, "bytes or None, not a file"
+    assert not request.has_header("Content-length"), "urllib states 0 itself"
+
+
+class FakeSocket:
+    """A socket that records what it is sent and replays a canned reply."""
+
+    def __init__(self, reply: bytes) -> None:
+        self.reply = reply
+        self.sent: list[bytes] = []
+
+    def sendall(self, data) -> None:
+        self.sent.append(bytes(data))
+
+    def makefile(self, mode: str = "rb", buffering=None):
+        return io.BytesIO(self.reply)
+
+    def close(self) -> None:
+        pass
+
+
+def test_urllib_transport_sends_a_body_in_blocks_and_not_in_one_send(monkeypatch):
+    # The real urllib and http.client, over a socket that only records what is sent.
+    body = BINARY * 4096  # about 1 MiB
+    sock = FakeSocket(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}")
+    timeouts = []
+
+    def connect(self):
+        timeouts.append(self.timeout)
+        self.sock = sock
+
+    monkeypatch.setattr(http.client.HTTPConnection, "connect", connect)
+    given = {"Content-Type": "application/octet-stream"}
+
+    for attempt in (1, 2):  # a retry must send the whole body again
+        sock.sent.clear()
+
+        reply = UrllibTransport().request(
+            "POST", "http://example.test/upload", given, body
+        )
+
+        assert reply == (201, {"content-length": "2"}, b"{}"), attempt
+        head, _, sent_body = b"".join(sock.sent).partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").lower().split("\r\n")
+        assert f"content-length: {len(body)}" in lines
+        assert not any(line.startswith("transfer-encoding") for line in lines)
+        assert sent_body == body
+        assert max(len(chunk) for chunk in sock.sent) <= 64 * 1024
+        assert len(sock.sent) > 16
+    assert timeouts == [60, 60]
 
 
 # --- FakeGitHub itself ---

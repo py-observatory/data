@@ -7,6 +7,7 @@ is retried with backoff. Every other failure is Fatal. No method turns an error 
 empty result.
 """
 
+import io
 import json
 import re
 import time
@@ -26,8 +27,8 @@ _API = "https://api.github.com"
 _UPLOADS = "https://uploads.github.com"
 _API_VERSION = "2022-11-28"
 _PER_PAGE = 100
-# urllib's limit, in seconds, on each blocking socket call. A request body goes out in
-# a single call, so this is also the time that a whole upload has to finish in.
+# urllib's limit, in seconds, on each blocking socket call. A body goes out in blocks
+# (see UrllibTransport.request), so this bounds a stall and not a whole upload.
 _TIMEOUT = 60
 
 # The wait before each retry of a Transient failure, so six attempts in all. A
@@ -94,12 +95,24 @@ def _lowercase(headers: Message) -> dict[str, str]:
 
 class UrllibTransport:
     """The transport that talks to the network, with urllib. It returns the status of an
-    HTTP error and does not raise, and it turns every other failure into OSError."""
+    HTTP error and does not raise, and it turns every other failure into OSError.
+
+    A body goes out in blocks, so the timeout bounds a stall and not a whole upload."""
 
     def request(
         self, method: str, url: str, headers: dict[str, str], body: bytes | None
     ) -> tuple[int, dict[str, str], bytes]:
-        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        data: bytes | io.BytesIO | None = body
+        if body:
+            # http.client sends a bytes body in a single `sendall`, and a socket timeout
+            # bounds the whole call: an upload would have to finish within _TIMEOUT. It
+            # sends a file in blocks of 8 KiB, so each block has its own timeout. urllib
+            # cannot size a file and would fall back to chunked encoding, so the length
+            # is stated. The stream is new on every call, because each retry sends the
+            # whole body again. BytesIO shares the bytes and does not copy them.
+            data = io.BytesIO(body)
+            headers = {**headers, "Content-Length": str(len(body))}
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             try:
                 with urllib.request.urlopen(req, timeout=_TIMEOUT) as reply:
