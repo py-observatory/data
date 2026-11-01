@@ -26,9 +26,19 @@ and runs again adds the same files only when it has the same zstd and SQLite. Wi
 another build its part is other bytes, and it stops with CreateOnceError for a person
 to look at.
 
-A month that its base copy and its deltas do not rebuild stops the run with GateError,
-and no override reason passes that: a run that went on would publish over a month that
-its releases cannot restore.
+Once the run has written what it learned to the open delta and applied it, it
+publishes (`publish`). The state and the open delta are compressed, and the manifest
+lists them with every closed asset of the month releases. The gates check it against
+the last manifest, and then the files and the manifest are swapped into
+`<stream>-current`. A stream's first run publishes with `publish_first` instead, which
+begins the month with a base copy and has no manifest to check against.
+
+The gates hold back a publish that has less history than the last one, and a stream
+can hold one back for reasons of its own, like a limit on removals. A held publish goes
+out only when a person gives a reason, and the manifest keeps a log of each such
+override. A month that its base copy and its deltas do not rebuild stops the run with
+GateError as well, but no override reason passes that: a run that went on would publish
+over a month that its releases cannot restore.
 """
 
 import os
@@ -37,17 +47,44 @@ import sqlite3
 import sys
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 from pathlib import Path
 
-from obskit.gates import GateError, GateFailure
+from obskit.gates import GateError, GateFailure, check
 from obskit.github import GitHub
-from obskit.manifest import Asset, Manifest, ManifestError, dumps, loads
-from obskit.release import PriorStateError, add_create_once, fetch_assets, prepare_asset
+from obskit.manifest import (
+    Asset,
+    Manifest,
+    ManifestError,
+    Watermark,
+    dumps,
+    loads,
+    producer,
+)
+from obskit.release import (
+    PriorStateError,
+    add_create_once,
+    fetch_assets,
+    prepare_asset,
+    publish_current,
+)
 from obskit.sqlite import consolidate, diff_tables, open_db
 from obskit.tags import current_tag, month_tag
 from obskit.zst import sha256_file
+
+
+def _schema_tables(schema: str) -> set[str]:
+    """The names of the tables that `schema` makes, leaving out those that SQLite keeps
+    under its reserved prefix `sqlite_`, like the sqlite_sequence of an AUTOINCREMENT
+    key."""
+    with closing(sqlite3.connect(":memory:")) as scratch:
+        scratch.executescript(schema)
+        rows = scratch.execute(
+            "SELECT name FROM sqlite_master "
+            r"WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\'"
+        )
+        return {name for (name,) in rows}
 
 
 @dataclass(frozen=True)
@@ -58,17 +95,46 @@ class Store:
 
     The names of the stream's databases are made from its id, so a copy of a Store
     with another id names all of them for that stream.
+
+    A Store is checked as it is made: `state_tables` must name every table that the
+    state schema makes, each once, or it raises ValueError. The replay check of a
+    month close compares only those, so a table left out would pass a month close
+    without being compared.
     """
 
     stream: str  # the stream id, e.g. "osv-pypi"
     state_schema: str  # SQL that makes the state database
     delta_schema: str  # SQL that makes a delta database
-    state_tables: tuple[str, ...]  # the state tables that the replay check compares
+    state_tables: tuple[str, ...]  # every table of the state, for the replay check
     classes: dict[str, str]  # history class of every table (stream.toml [tables])
     licences: list[dict]  # stream.toml [[upstreams]]
     # apply(state, delta): apply the delta's rows above the state's applied seq, store
     # the new applied seq in the state, and commit, as every run and every replay does.
     apply: Callable[[sqlite3.Connection, sqlite3.Connection], None]
+
+    def __post_init__(self) -> None:
+        """Raise ValueError unless `state_tables` names every table of the state
+        schema, each once (see the class)."""
+        made = _schema_tables(self.state_schema)
+        named = set(self.state_tables)
+        problems = []
+        lacking = sorted(made - named)
+        if lacking:
+            problems.append(f"it leaves out {', '.join(lacking)}")
+        unknown = sorted(named - made)
+        if unknown:
+            problems.append(f"the state schema makes no {', '.join(unknown)}")
+        repeated = sorted(
+            {name for name in self.state_tables if self.state_tables.count(name) > 1}
+        )
+        if repeated:
+            problems.append(f"it names {', '.join(repeated)} more than once")
+        if problems:
+            raise ValueError(
+                f"the state_tables of the stream {self.stream} must name every table "
+                "of its state schema, each once, because a month close compares only "
+                f"those: {'; '.join(problems)}"
+            )
 
     @property
     def state_db(self) -> str:
@@ -419,3 +485,187 @@ def roll_over(
         added.append(_base_copy(store, workdir, state, plan.new_base))
     _add_create_once(gh, store, added)
     return [asset for _, asset in added]
+
+
+def prepare_current(
+    store: Store, workdir: Path, today: date
+) -> tuple[list[Path], list[Asset]]:
+    """Compress the state and the open delta, which is today's, for the current
+    release. Returns their files and their entries."""
+    tag = current_tag(store.stream)
+    state = prepare_asset(
+        workdir / store.state_db, workdir, tag=tag, role="state", classes=store.classes
+    )
+    delta = prepare_asset(
+        workdir / store.open_delta_db,
+        workdir,
+        tag=tag,
+        role="state",
+        classes=store.classes,
+        period=today.isoformat(),
+    )
+    return [state[0], delta[0]], [state[1], delta[1]]
+
+
+def build_manifest(
+    store: Store,
+    repo: str,
+    prior: Manifest | None,
+    assets: list[Asset],
+    *,
+    data_through: Watermark,
+    cursor: str | None,
+    coverage: dict,
+    complete: bool,
+    moment: str,
+) -> Manifest:
+    """The manifest of a publish to `repo` made at `moment`, which lists `assets`.
+
+    `data_through` and `cursor` say how far the data reaches and what the stream read
+    last. A run that read nothing new upstream, like the registry's sweep, gives those
+    of the prior manifest. `coverage` and `complete` say how much the data covers and
+    whether it is whole, which only the stream can judge. The logs of series breaks,
+    corrections and overrides go on from the prior manifest, and start empty without
+    one.
+    """
+    return Manifest(
+        stream=store.stream,
+        producer=producer(repo),
+        generated_at=moment,
+        complete=complete,
+        coverage=coverage,
+        data_through=data_through,
+        cursor=cursor,
+        licences=store.licences,
+        assets=assets,
+        series_breaks=list(prior.series_breaks) if prior else [],
+        corrections=list(prior.corrections) if prior else [],
+        overrides=list(prior.overrides) if prior else [],
+    )
+
+
+def gate(
+    prior: Manifest,
+    manifest: Manifest,
+    *,
+    allowed_shrink: dict[str, int],
+    extra: list[GateFailure],
+    override_reason: str | None,
+    moment: str,
+) -> tuple[Manifest, list[GateFailure]]:
+    """Check `manifest` against `prior` with the publish gates, and add `extra`, the
+    failures of the stream's own checks, like a limit on removals, after theirs.
+    Returns the manifest to publish and the failures.
+
+    A snapshot table may shrink by the rows that `allowed_shrink` gives it, which the
+    run's upstream removals explain. With no failure, the manifest is returned as it
+    is. A failure raises GateError, unless `override_reason` gives a person's reason to
+    publish anyway: then the manifest's overrides log the time, the reason and the
+    failures.
+    """
+    failures = [*check(prior, manifest, allowed_shrink=allowed_shrink), *extra]
+    if not failures:
+        return manifest, []
+    if not override_reason:
+        raise GateError(failures)
+    entry = {
+        "at": moment,
+        "reason": override_reason,
+        "failures": [asdict(failure) for failure in failures],
+    }
+    return replace(manifest, overrides=[*manifest.overrides, entry]), failures
+
+
+def publish(
+    gh: GitHub,
+    store: Store,
+    workdir: Path,
+    prior: Manifest,
+    added: list[Asset],
+    *,
+    today: date,
+    moment: str,
+    data_through: Watermark,
+    cursor: str | None,
+    coverage: dict,
+    complete: bool,
+    allowed_shrink: dict[str, int],
+    extra: list[GateFailure],
+    override_reason: str | None,
+) -> list[GateFailure]:
+    """Publish the state that a run left in `workdir`: the end of every run that goes
+    on from a published state.
+
+    It compresses the state and the open delta, writes the manifest (see
+    `build_manifest`) from them, the closed assets of `prior` and the `added` entries
+    of the rollover, checks it against `prior` (see `gate`), and swaps the files and
+    the manifest into the current release. Returns the failures that `override_reason`
+    overrode, and raises GateError for any that it did not, before anything is
+    published.
+    """
+    files, current = prepare_current(store, workdir, today)
+    closed = [asset for asset in prior.assets if asset.closed]
+    manifest = build_manifest(
+        store,
+        gh.repo,
+        prior,
+        [*current, *closed, *added],
+        data_through=data_through,
+        cursor=cursor,
+        coverage=coverage,
+        complete=complete,
+        moment=moment,
+    )
+    manifest, failures = gate(
+        prior,
+        manifest,
+        allowed_shrink=allowed_shrink,
+        extra=extra,
+        override_reason=override_reason,
+        moment=moment,
+    )
+    publish_current(gh, store.stream, files, manifest, bootstrap=False)
+    return failures
+
+
+def publish_first(
+    gh: GitHub,
+    store: Store,
+    workdir: Path,
+    *,
+    today: date,
+    moment: str,
+    data_through: Watermark,
+    cursor: str | None,
+    coverage: dict,
+    complete: bool,
+) -> None:
+    """Publish a stream's first state, which its first run left in `workdir` with the
+    open delta.
+
+    Both are compressed, and the state is copied as the base of today's month and
+    added to the month's release. Then both are swapped into the current release,
+    which is created, with a manifest that has no prior (see `build_manifest`).
+
+    It does not check that the stream has never published: only a first run calls it,
+    once `fetch_prior` with `bootstrap` has found no current release. The base copy is
+    added before `publish_current` refuses a current release that holds a state
+    already (PriorStateError).
+    """
+    files, current = prepare_current(store, workdir, today)
+    # The first run starts today's month with a base copy, as plan_rollover says.
+    base = _base_copy(store, workdir, current[0], (today.year, today.month))
+    _add_create_once(gh, store, [base])
+    # A first publish has nothing to fall short of, so no gate can fail.
+    manifest = build_manifest(
+        store,
+        gh.repo,
+        None,
+        [*current, base[1]],
+        data_through=data_through,
+        cursor=cursor,
+        coverage=coverage,
+        complete=complete,
+        moment=moment,
+    )
+    publish_current(gh, store.stream, files, manifest, bootstrap=True)

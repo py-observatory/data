@@ -10,19 +10,27 @@ from pathlib import Path
 
 import pytest
 
-from obskit.cycle import Rollover, carried, month_manifest_name, plan_rollover
+from obskit.cycle import (
+    Rollover,
+    carried,
+    month_manifest_name,
+    plan_rollover,
+    roll_over,
+)
 from obskit.gates import GateError
 from obskit.manifest import Asset
-from obskit.release import CreateOnceError, PriorStateError
+from obskit.release import CreateOnceError, PriorStateError, fetch_prior
 from obskit.sqlite import table_counts
 from obskit.zst import compress_file, sha256_file
 from toy_store import (
+    BASE,
     BASE_DECEMBER,
     BASE_NOVEMBER,
     BASE_OCTOBER,
     CURRENT,
     DECEMBER,
     DELTA,
+    LAST_TWO_DAYS,
     MANIFEST,
     MANIFEST_NOVEMBER,
     MANIFEST_OCTOBER,
@@ -31,15 +39,11 @@ from toy_store import (
     PART_NOVEMBER,
     PART_OCTOBER,
     STATE,
+    STATE_SCHEMA,
     TOY,
     ToyStream,
     sealed_name,
 )
-
-# The items of the state as the month began.
-BASE = {"a": "1", "b": "2"}
-# The puts of the last two days of November, each of which had a run. No put sets b.
-LAST_TWO_DAYS = {date(2026, 11, 29): [("a", "3")], date(2026, 11, 30): [("c", "4")]}
 
 
 class Build:
@@ -69,6 +73,34 @@ def test_names_match_the_registry():
     assert s.base_state_name(2026, 1) == "pypi-registry-state-base-2026-01.db"
     assert s.month_part_name(2026, 1) == "pypi-registry-2026-01.db"
     assert month_manifest_name(2026, 1) == "manifest-2026-01.json"
+
+
+@pytest.mark.parametrize(
+    ("state_tables", "named"),
+    [
+        (("meta",), "it leaves out items"),
+        (("meta", "items", "puts"), "the state schema makes no puts"),
+        (("meta", "items", "meta"), "it names meta more than once"),
+        ((), "it leaves out items, meta"),
+    ],
+    ids=[
+        "a table left out",
+        "a table the state lacks",
+        "a table named twice",
+        "no table",
+    ],
+)
+def test_store_must_compare_every_state_table(state_tables, named):
+    # Each table of the state schema is named once, in any order. SQLite's own tables,
+    # like the sqlite_sequence of an AUTOINCREMENT key, are not the stream's.
+    replace(TOY, state_tables=("items", "meta"))
+    counted = STATE_SCHEMA + "CREATE TABLE runs (n INTEGER PRIMARY KEY AUTOINCREMENT);"
+    replace(TOY, state_schema=counted, state_tables=("meta", "items", "runs"))
+
+    # A month close compares only the tables that the Store names, so a table left out
+    # would pass a month close without being compared.
+    with pytest.raises(ValueError, match=re.escape(named)):
+        replace(TOY, state_tables=state_tables)
 
 
 def test_plan_rollover_of_the_first_run_starts_the_months_base():
@@ -211,6 +243,32 @@ def test_seal_reuses_prior_open_delta_bytes(tmp_path, monkeypatch):
     assert stream.github.asset_bytes(NOVEMBER, sealed_name("2026-11-30")) == open_bytes
 
 
+def test_seal_refuses_bytes_that_differ_from_the_prior(tmp_path):
+    stream = ToyStream(tmp_path)
+    stream.seed(BASE, {date(2026, 11, 29): [("a", "3"), ("c", "4")]})
+    workdir = stream.workdir()
+    prior = fetch_prior(stream.gh, TOY.stream, workdir, bootstrap=False)
+    state, delta = carried(TOY, prior)
+    # The open delta's file is no longer the one that was published and checked: it
+    # was compressed again, with another build, which gives other bytes. The seal
+    # would add them to November's release for good, under an entry that gives the
+    # published bytes (R20).
+    packed = workdir / DELTA
+    Build("b")(workdir / TOY.open_delta_db, packed)
+    stream.github.calls.clear()
+    differ = (
+        f"{packed} has the sha256 {sha256_file(packed)}, but its entry gives "
+        f"{delta.asset_sha256}"
+    )
+
+    with pytest.raises(RuntimeError, match=re.escape(differ)):
+        roll_over(stream.gh, TOY, workdir, prior, (state, delta), date(2026, 11, 30))
+
+    # Nothing is added to November's release, or written anywhere else.
+    assert stream.writes() == []
+    assert stream.assets(NOVEMBER) == [BASE_NOVEMBER]
+
+
 def test_month_close_builds_month_part_and_new_base(tmp_path):
     stream = ToyStream(tmp_path)
     seeded = stream.seed(
@@ -294,8 +352,11 @@ def test_month_close_builds_month_part_and_new_base(tmp_path):
     )
     # The close of a month holds a month of deltas, so what it has used goes as it
     # goes: the downloads of the base copy and the sealed deltas once they expand, the
-    # replayed base once it checks, and each delta once the part has its rows. What is
-    # left is what the run uploads, and the state and the open delta, which is new.
+    # replayed base once it checks, and each delta once the part has its rows. Left
+    # are the files that the rollover added to the month releases and the part's
+    # database, and what `fetch_prior` downloaded: the manifest, the state, and the
+    # published files of the state and the open delta, which it keeps for R20. Only
+    # the open delta's database is new: the prior one went into the part.
     assert sorted(path.name for path in workdir.iterdir()) == sorted(
         [
             MANIFEST,

@@ -1,7 +1,7 @@
 """The smallest event-sourced stream, `kit-toy`, as the Store that the tests of
 obskit.cycle run the cycle on, and what those tests share: writers of its databases, the
 names of its releases and assets, and its releases on a fake GitHub, seeded with what
-its runs would have published.
+its runs would have published, or published by runs of its own.
 
 Its state is a table of items, each a key and a value, and the meta that holds the
 highest `seq` applied. Its delta is a table of puts, each of which sets an item. The
@@ -10,12 +10,13 @@ puts are numbered by `seq` across all of its deltas, as every stream's deltas ar
 
 import sqlite3
 from contextlib import closing
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from obskit import cycle
+from obskit.gates import GateFailure
 from obskit.github import GitHub
-from obskit.manifest import Asset, Manifest, Watermark, dumps, loads
+from obskit.manifest import Asset, Manifest, Watermark, dumps, instant, loads
 from obskit.release import add_create_once, fetch_prior, prepare_asset, publish_current
 from obskit.sqlite import open_db
 from obskit.tags import current_tag, month_tag
@@ -31,22 +32,28 @@ CREATE TABLE puts (seq INTEGER PRIMARY KEY, key TEXT NOT NULL, value TEXT NOT NU
 """
 
 
+def _applied_seq(state: sqlite3.Connection) -> int:
+    """The highest seq of a put that the state has applied."""
+    (applied,) = state.execute(
+        "SELECT value FROM meta WHERE key = 'applied_seq'"
+    ).fetchone()
+    return int(applied)
+
+
 def apply(state: sqlite3.Connection, delta: sqlite3.Connection) -> None:
     """Upsert the puts of `delta` above the state's applied_seq into its items, in seq
     order, store the highest seq applied as its applied_seq, and commit, which is what
     a Store's `apply` must do."""
-    (applied,) = state.execute(
-        "SELECT value FROM meta WHERE key = 'applied_seq'"
-    ).fetchone()
+    applied = _applied_seq(state)
     puts = delta.execute(
-        "SELECT seq, key, value FROM puts WHERE seq > ? ORDER BY seq", (int(applied),)
+        "SELECT seq, key, value FROM puts WHERE seq > ? ORDER BY seq", (applied,)
     ).fetchall()
     state.executemany(
         "INSERT INTO items (key, value) VALUES (?, ?) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         [(key, value) for _, key, value in puts],
     )
-    top = puts[-1][0] if puts else int(applied)
+    top = puts[-1][0] if puts else applied
     state.execute("UPDATE meta SET value = ? WHERE key = 'applied_seq'", (str(top),))
     state.commit()
 
@@ -85,6 +92,11 @@ PART_NOVEMBER = "kit-toy-2026-11.db.zst"
 MANIFEST_OCTOBER = "manifest-2026-10.json"
 MANIFEST_NOVEMBER = "manifest-2026-11.json"
 
+# The items of the state as the month began.
+BASE = {"a": "1", "b": "2"}
+# The puts of the last two days of November, each of which had a run. No put sets b.
+LAST_TWO_DAYS = {date(2026, 11, 29): [("a", "3")], date(2026, 11, 30): [("c", "4")]}
+
 # Who published the seeded manifests.
 _PRODUCER = {
     "repo": REPO,
@@ -122,6 +134,26 @@ def write_delta(path: Path, puts: list[tuple[int, str, str]]) -> Path:
     return path
 
 
+def _write_and_apply(workdir: Path, puts: list[tuple[str, str]]) -> tuple[str, dict]:
+    """Write `puts`, each a key and a value, to the open delta in `workdir`, numbered on
+    from what the state there has applied, and apply them to that state, as a run does.
+    Returns what the manifest gives as the cursor, the seq of the last put applied, and
+    as the coverage, the count of items."""
+    with (
+        closing(open_db(workdir / TOY.state_db, STATE_SCHEMA)) as state,
+        closing(open_db(workdir / TOY.open_delta_db, DELTA_SCHEMA)) as delta,
+    ):
+        first = _applied_seq(state) + 1
+        delta.executemany(
+            "INSERT INTO puts (seq, key, value) VALUES (?, ?, ?)",
+            [(seq, key, value) for seq, (key, value) in enumerate(puts, first)],
+        )
+        delta.commit()
+        apply(state, delta)
+        (count,) = state.execute("SELECT count(*) FROM items").fetchone()
+        return str(_applied_seq(state)), {"items": count}
+
+
 def no_sleep(seconds: float) -> None:
     """GitHub's retries and pacing wait for nothing in a test."""
 
@@ -129,11 +161,12 @@ def no_sleep(seconds: float) -> None:
 class ToyStream:
     """The releases of the toy stream, on a fake GitHub.
 
-    `seed` publishes what the runs of a month would have left, and `roll_over` starts
-    a run as a stream does. Each run has a work directory of its own, as each run has a
-    new runner, so all that a run leaves to the next goes through the releases. The
-    GitHub client is one for the whole test, as a stream's `main` makes one for a
-    process.
+    `seed` publishes what the runs of a month would have left, and `start` and
+    `roll_over` start a run as a stream does. `first` and `run` are whole runs, which
+    publish as a stream does: its first, and one that goes on from the last publish.
+    Each run has a work directory of its own, as each run has a new runner, so all that
+    a run leaves to the next goes through the releases. The GitHub client is one for
+    the whole test, as a stream's `main` makes one for a process.
     """
 
     def __init__(self, tmp_path: Path) -> None:
@@ -229,14 +262,84 @@ class ToyStream:
         )
         return manifest
 
-    def roll_over(self, today: date) -> tuple[Path, list[Asset]]:
+    def start(self, today: date) -> tuple[Path, Manifest, list[Asset]]:
         """Start a run on `today` as a stream does: fetch the prior state into a new
-        work directory, and roll over. Returns the directory, and the entries of the
-        assets that the rollover added to the month releases."""
+        work directory, and roll over. Returns the directory, the prior manifest, and
+        the entries of the assets that the rollover added to the month releases."""
         workdir = self.workdir()
         prior = fetch_prior(self.gh, TOY.stream, workdir, bootstrap=False)
         carried = cycle.carried(TOY, prior)
-        return workdir, cycle.roll_over(self.gh, TOY, workdir, prior, carried, today)
+        added = cycle.roll_over(self.gh, TOY, workdir, prior, carried, today)
+        return workdir, prior, added
+
+    def roll_over(self, today: date) -> tuple[Path, list[Asset]]:
+        """Start a run on `today` (see `start`). Returns the directory, and the entries
+        of the assets that the rollover added to the month releases."""
+        workdir, _, added = self.start(today)
+        return workdir, added
+
+    def first(self, at: str, puts: list[tuple[str, str]]) -> None:
+        """The stream's first run, at `at`, a time with its zone. It writes `puts`, each
+        a key and a value, to the first open delta, applies them to an empty state, as
+        osv_pypi's first run does with every advisory, and publishes both with
+        `cycle.publish_first`. Its manifest says what a `run`'s does."""
+        now = datetime.fromisoformat(at)
+        today = now.astimezone(UTC).date()
+        workdir = self.workdir()
+        write_state(workdir / TOY.state_db, {}, applied_seq=0)
+        write_delta(workdir / TOY.open_delta_db, [])
+        cursor, coverage = _write_and_apply(workdir, puts)
+        cycle.publish_first(
+            self.gh,
+            TOY,
+            workdir,
+            today=today,
+            moment=instant(now),
+            data_through=Watermark(today.isoformat(), "day"),
+            cursor=cursor,
+            coverage=coverage,
+            complete=True,
+        )
+
+    def run(
+        self,
+        at: str,
+        puts: list[tuple[str, str]],
+        *,
+        complete: bool = True,
+        allowed_shrink: dict[str, int] | None = None,
+        extra: list[GateFailure] | None = None,
+        override_reason: str | None = None,
+    ) -> list[GateFailure]:
+        """A run at `at`, a time with its zone, that goes on from the last publish as a
+        stream does. It starts (see `start`), writes `puts`, each a key and a value, to
+        the open delta and applies them to the state, and publishes with
+        `cycle.publish`. Returns the gate failures that `override_reason` overrode.
+
+        The manifest says that the data reaches the run's day, gives the seq of the last
+        put applied as the cursor, and counts the items as the coverage. `complete`,
+        `allowed_shrink` and `extra` are what the stream gives the publish.
+        """
+        now = datetime.fromisoformat(at)
+        today = now.astimezone(UTC).date()
+        workdir, prior, added = self.start(today)
+        cursor, coverage = _write_and_apply(workdir, puts)
+        return cycle.publish(
+            self.gh,
+            TOY,
+            workdir,
+            prior,
+            added,
+            today=today,
+            moment=instant(now),
+            data_through=Watermark(today.isoformat(), "day"),
+            cursor=cursor,
+            coverage=coverage,
+            complete=complete,
+            allowed_shrink=allowed_shrink or {},
+            extra=extra or [],
+            override_reason=override_reason,
+        )
 
     def workdir(self) -> Path:
         """A new, empty work directory, as each run has a new runner."""
