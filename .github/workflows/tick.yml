@@ -10,6 +10,8 @@ name: tick
 # Run it by hand with `bootstrap` to build the stream's first state. That is accepted only
 # for a stream that has never published. `override_reason` publishes although a publish
 # gate failed, and the manifest logs the reason.
+#
+# The order of the first runs is in streams/pypi_registry/README.md, under "On GitHub".
 
 on:
   schedule:

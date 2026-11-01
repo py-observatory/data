@@ -46,9 +46,17 @@ A run publishes to `GITHUB_REPOSITORY` (`py-observatory/data` when it is not set
 uv run --package pypi-registry python -m pypi_registry run
 ```
 
-`--bootstrap` builds the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. It does not override a failed month close: when the month that ended, rebuilt from its base copy and its deltas, differs from the state, the run stops whatever the reason, because publishing would build on a month that its releases cannot restore. `--max-seconds` is how long after its start a run stops starting projects (18,000 by default), and the projects that it does not reach are read by the next run.
+`--bootstrap` builds the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. It does not override a failed month close: when the month that ended, rebuilt from its base copy and its deltas, differs from the state, the run stops whatever the reason, because publishing would build on a month that its releases cannot restore. `--max-seconds` is how long after its start a run stops starting projects (18,000 by default), and the projects that it does not reach are read by the next run. `--workdir PATH` is the folder in which a run makes its own directory and removes it afterwards (`work` by default). A month close holds the month's deltas there, so a workflow can point it at a larger disk.
+
+A file that the daily run finds is marked as seen when it appeared (`first_seen_exact`), with the time of that run as its `first_seen`. That has a limit while the daily run has a backlog (`coverage.remaining > 0`): a project that one run does not reach is read by a later run, and a file that it gained in between is still marked exact, with the later run's time.
 
 A bootstrap that adds the month's base copy and then fails before it publishes cannot simply be run again. A second bootstrap refuses a `pypi-registry-current` release that the first one left, even a half-made one. Without one, a second bootstrap in the same month stops with CreateOnceError on `pypi-registry-state-base-YYYY-MM.db.zst`, because the state that it builds is new bytes. The way back is a manual reset with the owner: delete the half-made `pypi-registry-current` release, if there is one, and that base copy, and record the deletions in a dated entry in `RETENTION.md`. Waiting for the next month keeps the base copy, as the next month's has another name, but a half-made `pypi-registry-current` must still go.
+
+A month close that keeps failing needs a person, and what to do depends on the error:
+
+- A `GateError` that names the replay: do not override it. The month, rebuilt from its base copy and its sealed deltas, differs from the state, so look into the base copy and the sealed deltas.
+- A `CreateOnceError` on the month's part (`pypi-registry-YYYY-MM.db.zst`): usually the zstd or SQLite build changed between a failed attempt and its retry, so the retry built the part as other bytes. First pin back the Python and uv versions that the failed attempt used, and run again. Only if that is impossible, and only with the owner's dated entry in `RETENTION.md`, delete the month's part and `manifest-YYYY-MM.json` from the month's release, so that the next run builds them again.
+- Bump the pinned Python (`.python-version`) and uv (the `version` of each `setup-uv` step in the workflows) deliberately, and never on the first of a month.
 
 ### The sweep
 
@@ -61,6 +69,12 @@ uv run --package pypi-registry python -m pypi_registry sweep
 It goes on from the last published state and reads no root. For each project whose page no run has read in full, it records the files with their yanks and the status of the project, as the page shows them now. They are rows of the delta and not events, because nothing says when they changed, and none of the files is marked as seen when it appeared: the sweep comes to a project when its turn is, and not when the project changes. It writes no serial and no cursor, so the manifest keeps those of the last daily run. A page that is missing, quarantined or older than the state is skipped, and the next sweep asks for it again; the daily run records a project that PyPI has removed or quarantined when the root stops listing it.
 
 A sweep waits 1.25 seconds between requests, about 0.8 a second, so that the pages of close to a million projects take about two weeks of sweeps. `--max-seconds` is how long after its start a sweep stops starting projects (16,200 by default), so each sweep reads part of the projects. The manifest's `coverage.unswept` says how many are left, and `coverage.remaining` is what the last daily run left to the next one, which a sweep keeps as it was. The data is `complete` only when both are 0, for every run: the manifest of the bootstrap is not complete, because it has read no page. A sweep exits with 3 when it has read some projects and others are left, which is the signal to run it again, and with 0 otherwise. One that reads nothing exits with 0 although projects are left: it met only pages that it cannot use, and another sweep would meet the same ones. Any other failure ends the sweep with an error and publishes nothing, so the next sweep reads again what that one had read.
+
+### On GitHub
+
+`tick.yml` runs the daily run every six hours, `backfill.yml` runs the sweep as a chain of runs that each dispatch the next, and `smoke.yml` runs the kit's weekly smoke test. Start them in this order: push the repository, dispatch `tick.yml` with `bootstrap`, dispatch `smoke.yml` with `bootstrap`, and then dispatch `backfill.yml` to start the sweep. A scheduled tick or smoke run that comes before its bootstrap fails closed and opens its rolling issue. That is expected, and the first run that succeeds closes it.
+
+The tick and the sweep share one concurrency group, which holds one running job and one waiting job, and a job that queues replaces the one that waits. So during the two-week sweep the Actions page shows some cancelled ticks: a tick that queues behind a waiting tick replaces it, and so can a sweep that the backfill dispatches. This is harmless, because the next tick catches up.
 
 ## Tests
 
