@@ -21,14 +21,22 @@ the stored cursor, which is a stale copy, before it writes anything. Then:
 `sweep` is the other run. A bootstrap stores every project of the root without reading
 its page, so every project starts unswept, and the daily run reads a page only when its
 project changes. The sweep reads the page of each project that is not swept yet, in
-full, a time budget at a time, and is run again until none is left. It takes the same
-steps as `run_once`, except that it reads no root: it goes on from the state as it is,
-rolls over, reads the unswept projects (`_sweep_projects`), and then applies the delta,
-writes the manifest, checks the gates and publishes in the same way (`_resume` and
-`_publish` are the start and the end of both). With no root it has no serial to record,
-so it writes no serial and no cursor, and its manifest keeps the `data_through` and the
-`cursor` of the run before it. It writes no event either: it reads a page as it is now,
-and nothing says when a file was added or a status changed.
+full, a time budget at a time, and is run again until none is left. It goes at about
+0.8 requests a second (SWEEP_INTERVAL), which spreads the pages of close to a million
+projects over about two weeks of sweeps. It takes the same steps as `run_once`, except
+that it reads no root: it goes on from the state as it is, rolls over, reads the
+unswept projects (`_sweep_projects`), and then applies the delta, writes the manifest,
+checks the gates and publishes in the same way (`_resume` and `_publish` are the start
+and the end of both). With no root it has no serial to record, so it writes no serial
+and no cursor, and its manifest keeps the `data_through`, the `cursor` and the backlog of
+the run before it: the coverage's `remaining` is what the last daily run left to the
+next one, and its `unswept` is the sweep's progress. It writes no event either: it
+reads a page as it is now, and nothing says when a file was added or a status changed,
+so none of the files that it records is exact.
+
+A manifest says that the data is `complete` when neither is left: no project to the next
+daily run, and none unswept. That holds for every run, so the bootstrap, which has read
+no page, publishes a manifest that is not complete.
 
 The assets of a month's release are never replaced. The sealed delta and the base copy
 are the files that the last run published, byte for byte: compressing again gives the
@@ -118,6 +126,12 @@ MAX_REMOVALS = 1_000
 # runs it can dispatch the next. Any other non-zero code is a failure.
 SWEEP_AGAIN = 3
 
+# The seconds between two requests of a sweep: about 0.8 a second. A sweep reads a page
+# for each project on PyPI, close to a million, and at this pace the sweeps take about
+# two weeks, where the kit's default of a request every 0.25 s would take a few days.
+# The daily run keeps that default.
+SWEEP_INTERVAL = 1.25
+
 # The repository that `main` publishes to when GITHUB_REPOSITORY does not say.
 _REPOSITORY = "py-observatory/data"
 _STREAM_TOML = Path(__file__).resolve().parents[2] / "stream.toml"
@@ -151,9 +165,11 @@ class RunReport:
     The counts of projects and versions are those of `ProcessReport`, and a bootstrap,
     which processes no project, has none. A sweep counts only `versions_fetched`,
     `swept` and `remaining`: it does not sort projects into new, changed, vanished and
-    returned, and its `remaining` is the number of projects that are still unswept.
-    `requests` counts the requests to PyPI, the retries among them. `gate_failures`
-    lists the failures that a person overrode, and is empty when no gate failed.
+    returned, and its `remaining` is the number of projects that are still unswept. That
+    is not the `remaining` of the manifest's coverage, which is always what the last
+    daily run left to the next one. `requests` counts the requests to PyPI, the retries
+    among them. `gate_failures` lists the failures that a person overrode, and is empty
+    when no gate failed.
     """
 
     new: int
@@ -273,6 +289,25 @@ def _resume(prior: Manifest, workdir: Path) -> _Resume:
         cursor = int(_meta(state, "cursor"))
         applied = int(_meta(state, "applied_seq"))
     return _Resume(carried, cursor, applied)
+
+
+def _backlog(prior: Manifest) -> int:
+    """The number of projects that the last daily run left to the next one, which the
+    coverage of the prior manifest gives as `remaining`. A sweep reads no root, so it
+    has no such backlog of its own, and its manifest carries this one on as it is.
+
+    Raises PriorStateError when the coverage does not give a count, because the sweep
+    would otherwise publish a manifest that says nothing of the backlog, or one that it
+    made up.
+    """
+    remaining = prior.coverage.get("remaining")
+    if type(remaining) is not int:  # a bool is not a count, and nor is a missing value
+        shown = "nothing" if remaining is None else f"a {type(remaining).__name__}"
+        raise PriorStateError(
+            "the coverage of the prior manifest must give `remaining` as a count, and "
+            f"gives {shown}, so the backlog of the daily run is not known"
+        )
+    return remaining
 
 
 def _reuse(workdir: Path, entry: Asset, name: str) -> Path:
@@ -496,8 +531,8 @@ def _coverage(state: sqlite3.Connection, remaining: int) -> dict:
     """What the state covers. `projects` counts the projects that are neither removed
     nor quarantined, which are the ones that the sweep reads, and `swept` and
     `unswept` split them by whether their page has been read in full. `remaining`
-    counts the projects that the run left to the next one, and `bootstrap_at` is when
-    the state was first built."""
+    counts the projects that the last daily run left to the next one, which a sweep
+    carries on, and `bootstrap_at` is when the state was first built."""
     projects, swept = state.execute(
         f"SELECT count(*), coalesce(sum(swept), 0) FROM projects WHERE {_ACTIVE}",
         INACTIVE,
@@ -523,7 +558,8 @@ def _apply_run(
     `applied` is the highest `seq` that the state had applied when the run began, so
     the rows above it are the run's. Returns the number of `removed` events among them,
     and what the state covers once they are applied (see `_coverage`), where `remaining`
-    is the projects that the run left to the next one.
+    is the projects that the last daily run left to the next one: this run's own for a
+    daily run, and the prior manifest's for a sweep.
     """
     conn.commit()
     removals = _removals(conn, after_seq=applied)
@@ -577,13 +613,14 @@ def _manifest(
     """The manifest of a publish made at `moment`. `data_through` and `cursor` say how
     far the data reaches and which root was read last. A run that read a root gives its
     serial for both, and one that read none, like the sweep, gives those of the prior
-    manifest. The run is complete when it left no project to the next one. The logs of
+    manifest. The data is complete when no project is left to the next daily run
+    (`remaining`) and none is left unswept (`unswept`), whichever run it is. The logs of
     series breaks, corrections and overrides go on from the prior manifest."""
     return Manifest(
         stream=STREAM,
         producer=_producer(repo),
         generated_at=moment,
-        complete=coverage["remaining"] == 0,
+        complete=coverage["remaining"] == 0 and coverage["unswept"] == 0,
         coverage=coverage,
         data_through=data_through,
         cursor=cursor,
@@ -842,7 +879,9 @@ def _sweep_projects(
     which writes the files that the state lacks, the versions, the release records of
     the versions with a file from after the bootstrap, and a swept row that carries the
     status of the page. That is all that is written. There is no event, because the
-    page is read as it is now, and nothing says when it changed. There is no serial,
+    page is read as it is now, and nothing says when it changed. No file is exact: the
+    sweep comes to a project when its turn is, so it was not there to see a file when
+    it was uploaded, whether that was before the bootstrap or after. There is no serial,
     because no root is read: a project keeps the serial that it has, so a daily run that
     later finds it changed reads its page again, and writes only what the page has
     gained since.
@@ -874,7 +913,7 @@ def _sweep_projects(
         _, page = get_page(http, name)
         if page is None or page.status == "quarantined" or page.serial < stored_serial:
             continue
-        process_unswept(ctx, name, incarnation, page)
+        process_unswept(ctx, name, incarnation, page, exact=False)
     return ProcessReport(
         new=0,
         changed=0,
@@ -906,8 +945,10 @@ def sweep(
     passed (see `_sweep_projects`), and applies the delta to the state. It then writes
     the manifest, checks it with the gates, and swaps the state, the open delta and the
     manifest into the current release, as `run_once` does. The manifest keeps the
-    `data_through` and the `cursor` of the prior one, because no root was read, and it
-    is complete when no project is left unswept.
+    `data_through`, the `cursor` and the backlog of the prior one, because no root was
+    read: the coverage's `remaining` stays what the last daily run left to the next one
+    (`_backlog`), and its `unswept` is how many projects the sweep has left. The data is
+    complete when both are 0.
 
     The report's `swept` is the number of projects that this sweep read, and its
     `remaining` is the number that are still unswept. Each sweep reads what it has the
@@ -930,6 +971,7 @@ def sweep(
             "bootstrap of the daily run"
         )
     resume = _resume(prior, workdir)
+    backlog = _backlog(prior)
     added = _roll_over(gh, workdir, prior, resume.carried, today)
     with (
         closing(open_db(workdir / STATE_DB, STATE_SCHEMA)) as state,
@@ -938,7 +980,7 @@ def sweep(
         delta = Delta(conn, moment, first_seq=resume.applied + 1)
         processed = _sweep_projects(state, delta, http, deadline=deadline, clock=clock)
         removals, coverage = _apply_run(
-            state, conn, applied=resume.applied, remaining=processed.remaining
+            state, conn, applied=resume.applied, remaining=backlog
         )
     failures = _publish(
         gh,
@@ -965,7 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
     py-observatory/data when that is not set. It makes one GitHub client, whose
     writes are paced, for every call of the run, and works in a new directory under
     ./work, which is removed afterwards. It prints the report as JSON. Every error
-    propagates.
+    propagates. A sweep waits SWEEP_INTERVAL seconds between requests, and a run waits
+    for as long as the kit's `Http` does by default.
 
     `run` returns 0. `sweep` returns 3, when it has swept some projects and others
     are left, to say that it is to be run again, and 0 otherwise. A sweep that reads
@@ -1017,7 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "sweep":
             report = sweep(
                 gh,
-                Http(),
+                Http(interval=SWEEP_INTERVAL),
                 Path(workdir),
                 now=datetime.now(UTC),
                 max_seconds=args.max_seconds,

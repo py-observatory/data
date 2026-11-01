@@ -4,7 +4,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from run_helpers import OPENED
+from opened_connections import OPENED
 
 
 @pytest.fixture(autouse=True)

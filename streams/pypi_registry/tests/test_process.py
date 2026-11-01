@@ -8,6 +8,7 @@ import pytest
 
 from obskit.http import Http, UpstreamError
 from obskit.testing import FakeHttp
+from opened_connections import OPENED
 from pypi_registry.process import ProcessReport, process_projects
 from pypi_registry.simple import ACCEPT, Root, project_url, version_url
 from pypi_registry.store import (
@@ -21,7 +22,6 @@ from pypi_registry.store import (
 from run_helpers import (
     BEFORE,
     BOOTSTRAP_AT,
-    OPENED,
     Clock,
     Ticking,
     dist,

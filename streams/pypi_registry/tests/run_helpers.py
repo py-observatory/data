@@ -16,6 +16,7 @@ from obskit.manifest import Asset, Manifest, dumps, loads
 from obskit.release import fetch_assets
 from obskit.testing import FakeGitHub, FakeHttp
 from obskit.zst import decompress_file
+from opened_connections import OPENED
 from pypi_registry.layout import OPEN_DELTA_DB, STATE_DB, base_state_name, delta_name
 from pypi_registry.run import RunReport, replay, run_once, sweep
 from pypi_registry.simple import ROOT_URL, project_url, version_url
@@ -54,11 +55,6 @@ class Ticking:
     ) -> tuple[int, dict[str, str], bytes]:
         self.clock.now += 1.0
         return self.fake.request(method, url, headers, body)
-
-
-# The connections that the tests open. SQLite warns about a connection that is
-# collected while it is open, so conftest.py closes them when each test ends.
-OPENED: list[sqlite3.Connection] = []
 
 
 def dist(

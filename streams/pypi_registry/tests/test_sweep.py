@@ -26,6 +26,7 @@ from run_helpers import (
     NOVEMBER,
     PART_NOVEMBER,
     STATE,
+    Clock,
     Stream,
     dist,
     files_of,
@@ -168,12 +169,13 @@ def test_sweep_fetches_records_for_versions_after_bootstrap(tmp_path):
     report = stream.sweep(SWEPT_AT, pages=[alpha], releases=[("alpha", "2.0")])
 
     # Only a version with a file from after the bootstrap is asked for. The releases
-    # from before are the history fill's, and are not read again here. A file from
-    # after the bootstrap is exact: it was there to be seen as it came.
+    # from before are the history fill's, and are not read again here. No file is
+    # exact, not even one from after the bootstrap: the sweep comes to a project when
+    # its turn is, so it was not there to see the file when it was uploaded.
     assert written(stream.open(CURRENT, DELTA), 0) == [
         ("file", "alpha", 1, "alpha-1.0.tar.gz", 0),
-        ("file", "alpha", 1, "alpha-2.0.tar.gz", 1),
-        ("file", "alpha", 1, "alpha-2.1.tar.gz", 1),
+        ("file", "alpha", 1, "alpha-2.0.tar.gz", 0),
+        ("file", "alpha", 1, "alpha-2.1.tar.gz", 0),
         ("version", "alpha", 1, "1.0", 0),
         ("version", "alpha", 1, "2.0", 1),
         ("record", "alpha", 1, "2.0"),
@@ -200,12 +202,46 @@ def test_sweep_fetches_records_for_versions_after_bootstrap(tmp_path):
     ]
 
 
+def test_sweep_marks_no_file_exact_but_a_daily_run_still_does(tmp_path):
+    stream = bootstrapped(tmp_path, {"alpha": 10, "beta": 20})
+    # A daily run reads beta, which changed and is not swept yet. Its file is from after
+    # the bootstrap, and the run sees it about when it appears, so the file is exact.
+    stream.run(
+        "2026-11-02T08:00:00Z",
+        110,
+        {"alpha": 10, "beta": 21},
+        pages=[page("beta", 21, dist("beta-1.0.tar.gz", NEW), versions=["1.0"])],
+        releases=[("beta", "1.0")],
+    )
+
+    # The sweep reads alpha, whose file is from after the bootstrap as well. It is
+    # not exact, though its record is still asked for.
+    stream.sweep(
+        SWEPT_AT,
+        pages=[page("alpha", 10, dist("alpha-1.0.tar.gz", NEW), versions=["1.0"])],
+        releases=[("alpha", "1.0")],
+    )
+
+    assert written(stream.open(CURRENT, DELTA), 0) == [
+        ("file", "beta", 1, "beta-1.0.tar.gz", 1),
+        ("version", "beta", 1, "1.0", 1),
+        ("record", "beta", 1, "1.0"),
+        ("swept", "beta", 1, "active"),
+        ("serial", "beta", 21),
+        ("cursor", 110),
+        ("file", "alpha", 1, "alpha-1.0.tar.gz", 0),
+        ("version", "alpha", 1, "1.0", 1),
+        ("record", "alpha", 1, "1.0"),
+        ("swept", "alpha", 1, "active"),
+    ]
+
+
 def test_sweep_exit_code_3_while_unswept_remain(tmp_path, monkeypatch, capsys):
     stream = bootstrapped(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
     monkeypatch.setattr("pypi_registry.run.GitHub", lambda repo, token: stream.gh)
-    monkeypatch.setattr("pypi_registry.run.Http", lambda: stream.http)
+    monkeypatch.setattr("pypi_registry.run.Http", lambda **options: stream.http)
 
     def sweep_here(gh, http, workdir, *, now, max_seconds) -> RunReport:
         """What `main` calls, on the stream's clock and on the day of its bootstrap."""
@@ -228,7 +264,9 @@ def test_sweep_exit_code_3_while_unswept_remain(tmp_path, monkeypatch, capsys):
 
     printed = json.loads(capsys.readouterr().out)
     assert (printed["swept"], printed["remaining"]) == (2, 1)
-    assert stream.manifest().complete is False
+    manifest = stream.manifest()
+    assert manifest.complete is False
+    assert manifest.coverage["unswept"] == 1
     assert list((tmp_path / "work").iterdir()) == [], "the work directory is removed"
 
     # The run that follows reads gamma, and there is nothing left.
@@ -324,6 +362,46 @@ def test_main_sweeps_with_one_github_client(tmp_path, monkeypatch, capsys):
         main(["sweep"])
 
 
+def test_main_sweep_waits_longer_between_requests_than_the_daily_run(
+    tmp_path, monkeypatch
+):
+    clock = Clock()
+    begun: list[float] = []
+
+    class Timed:
+        """A transport that notes when each request begins, and answers each with a 200."""
+
+        def request(self, method, url, headers, body):
+            begun.append(clock.now)
+            return 200, {}, b""
+
+    def http_here(**options) -> Http:
+        return Http(transport=Timed(), sleep=clock.sleep, clock=clock, **options)
+
+    def reads_two_pages(gh, http, workdir, **options) -> RunReport:
+        http.get("https://pypi.org/simple/alpha/")
+        http.get("https://pypi.org/simple/beta/")
+        return report_of()
+
+    monkeypatch.setattr("pypi_registry.run.Http", http_here)
+    monkeypatch.setattr("pypi_registry.run.sweep", reads_two_pages)
+    monkeypatch.setattr("pypi_registry.run.run_once", reads_two_pages)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
+
+    # The sweep reads a page for every project, close to a million, so it goes at about
+    # 0.8 requests a second, which spreads its pages over about two weeks.
+    main(["sweep"])
+    first, second = begun
+    assert second - first == 1.25
+
+    # The daily run keeps the pace of the kit's default.
+    begun.clear()
+    main(["run"])
+    first, second = begun
+    assert second - first == 0.25
+
+
 def test_sweep_skips_pages_it_cannot_use(tmp_path):
     stream = bootstrapped(
         tmp_path, {"fine": 10, "gone": 20, "held": 30, "lost": 40, "stale": 50}
@@ -361,8 +439,10 @@ def test_sweep_skips_pages_it_cannot_use(tmp_path):
         "lost": (1, 40, "active", 0),
         "stale": (1, 50, "active", 0),
     }
+    # The sweep's progress is `unswept`. `remaining` is what the last daily run left to
+    # the next one, which a sweep leaves as it was: here, nothing.
     manifest = stream.manifest()
-    assert manifest.coverage["unswept"] == manifest.coverage["remaining"] == 4
+    assert (manifest.coverage["unswept"], manifest.coverage["remaining"]) == (4, 0)
     assert manifest.complete is False
 
     # The next sweep tries them again. The old copy has been replaced by then, and is
@@ -427,7 +507,7 @@ def test_sweep_stops_at_its_budget_and_the_next_run_goes_on(tmp_path):
     assert report == report_of(requests=2, swept=2, remaining=1)
     manifest = stream.manifest()
     assert manifest.complete is False
-    assert (manifest.coverage["remaining"], manifest.coverage["unswept"]) == (1, 1)
+    assert (manifest.coverage["remaining"], manifest.coverage["unswept"]) == (0, 1)
     assert project_rows(stream.open(CURRENT, STATE)) == {
         "alpha": (1, 10, "active", 1),
         "beta": (1, 20, "active", 1),
@@ -487,6 +567,50 @@ def test_sweep_keeps_the_cursor_and_data_through_of_the_last_run(tmp_path):
     manifest = stream.manifest()
     assert manifest.cursor == "110"
     assert manifest.data_through == Watermark("110", "serial")
+
+
+def test_sweep_carries_the_daily_runs_backlog_and_complete_needs_both_clear(tmp_path):
+    stream = bootstrapped(tmp_path)
+    listed = {"alpha": 11, "beta": 21, "gamma": 31}
+    # The root says that all three projects changed. A daily run with the time for two
+    # of them leaves gamma to the next run, and gamma is not swept either.
+    stream.run(
+        "2026-11-02T08:00:00Z",
+        110,
+        listed,
+        pages=[page("alpha", 11), page("beta", 21)],
+        max_seconds=2.5,
+    )
+    manifest = stream.manifest()
+    assert (manifest.coverage["remaining"], manifest.coverage["unswept"]) == (1, 1)
+    assert manifest.complete is False
+
+    # The sweep reads gamma, the only project left unswept, so its report has nothing
+    # remaining. The backlog of the daily run is not the sweep's to clear: gamma is
+    # still to be read by a daily run. The manifest keeps that backlog, so it is not
+    # complete, though nothing is unswept.
+    report = stream.sweep(SWEPT_AT, pages=[page("gamma", 31)])
+
+    assert report == report_of(requests=1, swept=1)
+    manifest = stream.manifest()
+    assert (manifest.coverage["remaining"], manifest.coverage["unswept"]) == (1, 0)
+    assert manifest.complete is False
+
+    # The sweep wrote no serial, so the root still shows gamma as changed, and the next
+    # daily run reads its page again. Nothing in it is new, so only the serial is
+    # written. Now neither is left, and the manifest is complete.
+    before = applied(stream)
+
+    report = stream.run("2026-11-02T18:00:00Z", 120, listed, pages=[page("gamma", 31)])
+
+    assert (report.changed, report.remaining) == (1, 0)
+    assert written(stream.open(CURRENT, DELTA), before) == [
+        ("serial", "gamma", 31),
+        ("cursor", 120),
+    ]
+    manifest = stream.manifest()
+    assert (manifest.coverage["remaining"], manifest.coverage["unswept"]) == (0, 0)
+    assert manifest.complete is True
 
 
 def test_sweep_and_daily_runs_share_a_month_that_restores(tmp_path):
@@ -583,6 +707,28 @@ def test_sweep_never_starts_a_state(tmp_path, monkeypatch):
 
     with pytest.raises(PriorStateError, match="no published state to sweep"):
         stream.sweep(SWEPT_AT)
+
+    assert stream.writes() == []
+    assert stream.pypi.requests == []
+
+
+@pytest.mark.parametrize("backlog", [None, "0", True], ids=["none", "text", "bool"])
+def test_sweep_refuses_a_prior_manifest_with_no_backlog_to_carry(tmp_path, backlog):
+    stream = bootstrapped(tmp_path)
+    manifest = stream.manifest()
+    coverage = dict(manifest.coverage)
+    if backlog is None:
+        del coverage["remaining"]
+    else:
+        coverage["remaining"] = backlog
+    stream.replace_manifest(dataclasses.replace(manifest, coverage=coverage))
+    stream.github.calls.clear()
+
+    # The sweep carries the daily run's backlog into its manifest. It cannot do that
+    # from a manifest that gives none, and it will not make one up. It is a day on from
+    # the bootstrap, so a rollover would seal the open delta: the refusal comes first.
+    with pytest.raises(PriorStateError, match="remaining"):
+        stream.sweep("2026-11-03T06:00:00Z", pages=[page("alpha", 10)])
 
     assert stream.writes() == []
     assert stream.pypi.requests == []

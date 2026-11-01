@@ -275,16 +275,25 @@ def _unseen(versions: list[str], seen: set[str]) -> list[str]:
 
 
 def process_unswept(
-    ctx: Context, name: str, incarnation: int, page: ProjectPage
+    ctx: Context,
+    name: str,
+    incarnation: int,
+    page: ProjectPage,
+    *,
+    exact: bool = True,
 ) -> None:
     """Read the page of a project in full, as the sweep does, and end with a swept row.
 
     Each file that the state does not hold is written, in filename order. It is exact
-    only when it was uploaded after the bootstrap: a file from before then was there
-    before the project was first read. A version that the state has not seen gets its
+    only when it was uploaded after the bootstrap, and `exact` is true: a file from
+    before the bootstrap was there before the project was first read. The daily run
+    leaves `exact` true, because it reads a project as it changes and sees a file about
+    when it appears. The sweep passes false, because it comes to a project when its turn
+    is, so a file that it finds was not seen when it was uploaded, whenever that was,
+    and none of its files is exact. A version that the state has not seen gets its
     record when a file of it was uploaded after the bootstrap, and record=False
-    otherwise, as the history fill holds the releases from before. The swept row
-    carries the page's status, and no event is written.
+    otherwise, as the history fill holds the releases from before. That does not depend
+    on `exact`. The swept row carries the page's status, and no event is written.
 
     Raises ValueError for a quarantined page, before anything is written. Such a page
     lists no files, so the caller records the quarantine instead.
@@ -303,7 +312,7 @@ def process_unswept(
         if after and info.version is not None:
             recent.add(info.version)
         if filename not in held:
-            ctx.delta.file(name, incarnation, info, exact=after)
+            ctx.delta.file(name, incarnation, info, exact=after and exact)
     for version in _unseen(page.versions, _seen_versions(ctx.state, name, incarnation)):
         if version in recent:
             _record_version(ctx, name, incarnation, version)

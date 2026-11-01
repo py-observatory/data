@@ -146,7 +146,9 @@ def test_bootstrap_publishes_state_base_and_manifest(tmp_path, monkeypatch):
         "remaining": 0,
         "bootstrap_at": "2026-11-02T06:00:00Z",
     }
-    assert manifest.complete is True
+    # The bootstrap read no page, so every project is unswept, and until a sweep has read
+    # them the data is not complete.
+    assert manifest.complete is False
     assert manifest.generated_at == "2026-11-02T06:00:00Z"
     assert manifest.licences == LICENCES
     assert manifest.producer == {
@@ -236,7 +238,8 @@ def test_second_run_records_changes(tmp_path):
         "remaining": 0,
         "bootstrap_at": "2026-11-02T06:00:00Z",
     }
-    assert manifest.complete is True
+    # The run left no project to the next one, but two are still unswept.
+    assert manifest.complete is False
     assert report == RunReport(
         new=0,
         changed=1,
