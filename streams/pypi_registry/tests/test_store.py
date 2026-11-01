@@ -675,6 +675,15 @@ def test_a_record_needs_exactly_the_record_columns(tmp_path):
     assert rows_of(conn, "serials") == [(1, "demo", 1)]
 
 
+def test_a_delta_tells_the_time_of_its_run(tmp_path):
+    # A release record carries the time it was observed, and the run takes it from the
+    # delta, so the record and the rows around it give one time.
+    _, delta = new_delta(tmp_path)
+    assert delta.observed_at == OBSERVED_AT
+    with pytest.raises(AttributeError):
+        delta.observed_at = "2026-11-01T07:00:00Z"
+
+
 # ---- apply_delta: what each row does
 
 

@@ -301,6 +301,12 @@ class Delta:
         highest = _highest_seq(conn)
         self._next_seq = first_seq if highest is None else max(first_seq, highest + 1)
 
+    @property
+    def observed_at(self) -> str:
+        """The time of the run, which every row with a time takes. A release record is
+        made with it too, so that the record and the rows around it give one time."""
+        return self._observed_at
+
     def _write(self, statement: str, values: tuple) -> None:
         self._conn.execute(statement, (self._next_seq, *values))
         self._next_seq += 1

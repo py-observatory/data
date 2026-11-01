@@ -26,6 +26,7 @@ The Simple API is read as PEP 691 JSON (`application/vnd.pypi.simple.v1+json`). 
 - `src/pypi_registry/records.py`: the record kept for each release, with the facts of its README in place of its text. Email addresses are taken out of it, and the names of people stay. A reply of a shape that it does not know raises a ValueError.
 - `src/pypi_registry/diff.py`: what changed since the last run. It sorts the names of the root into new, changed, vanished and returned, compares a project page with the stored files, and reads the reply to a probe of a name that left the root. It also defines the events that a run records.
 - `src/pypi_registry/store.py`: the state database and the delta databases. A run writes each change as a numbered row of a delta, and `apply_delta` applies the rows to the state in order. The state at the end of any day can be rebuilt from the state at the start of the month and that month's deltas.
+- `src/pypi_registry/run.py`: the run. It probes the names that left the root, and reads the page of each project that is new, changed or listed again, writing what it finds to the open delta. A page that is missing or older than the root says is skipped and read again by the next run, a quarantined page keeps the stored files, and no file, version or release record is written twice.
 - `tests/`: offline tests, and the fixtures they read.
 
 ## Tests
