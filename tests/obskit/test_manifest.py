@@ -4,6 +4,7 @@ from hashlib import sha256
 
 import pytest
 
+from obskit import manifest
 from obskit.manifest import (
     Asset,
     Manifest,
@@ -286,7 +287,8 @@ def test_rejects_missing_field():
         loads(without(("complete",)))
 
 
-# The objects whose keys the format fixes. Each key must be there, and no other may be.
+# The objects whose keys the format fixes. No key beyond theirs may appear, and each
+# must be there unless it is listed below as one that may be left out.
 FIXED_OBJECTS = {
     "manifest": (),
     "producer": ("producer",),
@@ -294,17 +296,62 @@ FIXED_OBJECTS = {
     "asset": STATE,
     "table": STATE + ("tables", "projects"),
 }
-EVERY_KEY = [
+# The keys whose fields have a default. A manifest without them still loads, and they
+# take the default. schema_version has a default too, but it is always required.
+OPTIONAL_KEYS = {
+    "manifest": {"series_breaks", "corrections", "overrides"},
+    "asset": {"period", "closed"},
+}
+REQUIRED_KEY = [
     pytest.param(path, key, id=f"{name}-{key}")
     for name, path in FIXED_OBJECTS.items()
     for key in at(wire(), path)
+    if key not in OPTIONAL_KEYS.get(name, ())
 ]
 
 
-@pytest.mark.parametrize(("path", "key"), EVERY_KEY)
+@pytest.mark.parametrize(("path", "key"), REQUIRED_KEY)
 def test_rejects_every_missing_key(path, key):
     with pytest.raises(ManifestError, match=f"missing.*{key}"):
         loads(without(path + (key,)))
+
+
+def test_schema_version_is_required():
+    # Its field has a default, but it is the version gate: a document must state it.
+    with pytest.raises(ManifestError, match="missing.*schema_version"):
+        loads(without(("schema_version",)))
+
+
+def test_optional_keys_may_be_left_out():
+    doc = wire()
+    for key in OPTIONAL_KEYS["manifest"]:
+        del doc[key]
+    for asset in doc["assets"]:
+        for key in OPTIONAL_KEYS["asset"]:
+            del asset[key]
+    text = json.dumps(doc)
+    defaulted = replace(
+        sample(),
+        series_breaks=[],
+        corrections=[],
+        overrides=[],
+        assets=[replace(a, period=None, closed=False) for a in sample().assets],
+    )
+
+    first, second = loads(text), loads(text)
+
+    assert first == defaulted
+    assert first.overrides is not second.overrides
+
+
+@pytest.mark.parametrize("cls", [Manifest, Asset, TableInfo, Watermark])
+def test_a_field_the_reader_does_not_know_is_an_error(monkeypatch, cls):
+    # A field added to a dataclass but not to the reader must not be dropped quietly.
+    name = fields(cls)[-1].name
+    monkeypatch.delitem(manifest._READERS[cls], name)
+
+    with pytest.raises(TypeError, match=f"{cls.__name__}.{name}"):
+        loads(dumps(sample()))
 
 
 @pytest.mark.parametrize("path", list(FIXED_OBJECTS.values()), ids=list(FIXED_OBJECTS))
@@ -340,9 +387,14 @@ def test_rejects_bad_sha(field, sha):
         loads(with_value(DAY + (field,), sha))
 
 
-def test_closed_asset_needs_period():
-    with pytest.raises(ManifestError, match="period"):
-        loads(with_value(DAY + ("period",), None))
+@pytest.mark.parametrize(
+    "text",
+    [with_value(DAY + ("period",), None), without(DAY + ("period",))],
+    ids=["null period", "no period key"],
+)
+def test_closed_asset_needs_period(text):
+    with pytest.raises(ManifestError, match="closed.*period"):
+        loads(text)
 
 
 def test_an_open_asset_may_carry_a_period():
@@ -399,6 +451,9 @@ BAD_VALUES = [
     bad(("assets", 0, "tables", "projects"), 5),
     bad(("assets", 0, "closed"), 0),
     bad(("assets", 0, "period"), 2026),
+    # null is not the same as leaving an optional key out
+    bad(("series_breaks",), None),
+    bad(("assets", 0, "closed"), None),
     # a value outside the allowed set
     bad(("assets", 0, "role"), "private"),
     bad(("assets", 0, "format"), "parquet"),
@@ -423,11 +478,67 @@ def test_rejects_a_value_the_format_rules_out(path, value):
         loads(with_value(path, value))
 
 
-@pytest.mark.parametrize("granularity", ["serial", "day", "month", "instant"])
-def test_accepts_every_granularity(granularity):
-    m = replace(sample(), data_through=Watermark("2026-11", granularity))
+@pytest.mark.parametrize(
+    ("granularity", "value"),
+    [
+        ("serial", "123456"),
+        ("serial", "0"),
+        ("serial", "007"),
+        ("day", "2026-11-02"),
+        ("day", "2028-02-29"),
+        ("month", "2026-11"),
+        ("month", "2026-12"),
+        ("instant", "2026-11-03T01:02:03Z"),
+        ("instant", "2028-02-29T23:59:59Z"),
+    ],
+)
+def test_accepts_a_watermark_value_that_fits_its_granularity(granularity, value):
+    m = replace(sample(), data_through=Watermark(value, granularity))
 
     assert loads(dumps(m)) == m
+
+
+def other_script_digits(digits: str) -> str:
+    """`digits` written as Arabic-Indic digits, which are not the ASCII digits 0-9."""
+    return "".join(chr(0x0660 + int(digit)) for digit in digits)
+
+
+BAD_WATERMARKS = [
+    pytest.param("serial", "", id="serial empty"),
+    pytest.param("serial", "abc", id="serial letters"),
+    pytest.param("serial", "12a", id="serial letter after digits"),
+    pytest.param("serial", "-1", id="serial negative"),
+    pytest.param("serial", "+1", id="serial plus sign"),
+    pytest.param("serial", "1.5", id="serial fraction"),
+    pytest.param("serial", " 1", id="serial leading space"),
+    pytest.param("serial", "1\n", id="serial trailing newline"),
+    pytest.param("serial", other_script_digits("123"), id="serial other digits"),
+    pytest.param("serial", "2026-11-02", id="serial given a day"),
+    pytest.param("day", "2026-11", id="day given a month"),
+    pytest.param("day", "2026", id="day given a year"),
+    pytest.param("day", "2026-11-02T00:00:00Z", id="day given an instant"),
+    pytest.param("day", "2026-02-30", id="day february 30"),
+    pytest.param("day", "2026-13-01", id="day month 13"),
+    pytest.param("day", "20261102", id="day without dashes"),
+    pytest.param("day", "123456", id="day given a serial"),
+    pytest.param("month", "2026", id="month given a year"),
+    pytest.param("month", "2026-11-02", id="month given a day"),
+    pytest.param("month", "2026-13", id="month 13"),
+    pytest.param("month", "2026-00", id="month 0"),
+    pytest.param("instant", "2026-11-02", id="instant given a day"),
+    pytest.param("instant", "2026-11-03T01:02:03", id="instant without Z"),
+    pytest.param("instant", "2026-11-03T24:00:00Z", id="instant hour 24"),
+    pytest.param("instant", "2026-11-31T01:02:03Z", id="instant november 31"),
+    pytest.param("instant", "123456", id="instant given a serial"),
+]
+
+
+@pytest.mark.parametrize(("granularity", "value"), BAD_WATERMARKS)
+def test_rejects_watermark_value_not_matching_granularity(granularity, value):
+    m = replace(sample(), data_through=Watermark(value, granularity))
+
+    with pytest.raises(ManifestError, match="data_through.value"):
+        loads(dumps(m))
 
 
 @pytest.mark.parametrize("history_class", ["append", "events", "snapshot", "derived"])
