@@ -233,19 +233,27 @@ import json, os, subprocess, sys
 
 name, args = os.path.basename(sys.argv[0]), sys.argv[1:]
 log_path = os.environ["STUB_LOG"]
-earlier = 0
+calls = []
 if os.path.exists(log_path):
     with open(log_path, encoding="utf-8") as log:
-        earlier = sum(1 for line in log if json.loads(line)[0] == name)
+        calls = [json.loads(line) for line in log]
 with open(log_path, "a", encoding="utf-8") as log:
     log.write(json.dumps([name, *args]) + "\\n")
-if earlier < int(os.environ.get("STUB_FAIL_FIRST_" + name.upper(), "0")):
-    sys.exit(1)  # the first calls of this command fail, as a flaky API does
-if name == "gh" and args[:2] == ["issue", "list"]:
-    if os.environ.get("STUB_LIST_EXIT", "0") != "0":
+
+
+def earlier(*command):
+    # How many calls of `command` came before this one.
+    return sum(1 for call in calls if call[: len(command)] == list(command))
+
+
+def fail_first(knob, *command):
+    # The first calls of `command`, as many as `knob` says, fail as a flaky API does.
+    if earlier(*command) < int(os.environ.get(knob, "0")):
         print("gh: HTTP 502", file=sys.stderr)
-        sys.exit(int(os.environ["STUB_LIST_EXIT"]))
-    listing = os.environ.get("STUB_ISSUES", "[]")
+        sys.exit(1)
+
+
+def answer(listing):
     if "--jq" in args:  # as gh does with its own jq
         expression = args[args.index("--jq") + 1]
         listing = subprocess.run(
@@ -254,6 +262,26 @@ if name == "gh" and args[:2] == ["issue", "list"]:
         ).stdout
     sys.stdout.write(listing)
     sys.exit(0)
+
+
+if name == "gh" and args[:2] == ["issue", "list"]:
+    if os.environ.get("STUB_LIST_EXIT", "0") != "0":
+        print("gh: HTTP 502", file=sys.stderr)
+        sys.exit(int(os.environ["STUB_LIST_EXIT"]))
+    answer(os.environ.get("STUB_ISSUES", "[]"))
+if name == "gh" and args[:2] == ["run", "list"]:
+    fail_first("STUB_RUN_LIST_FAILS", "gh", "run", "list")
+    runs = json.loads(os.environ.get("STUB_RUNS", "[]"))
+    # A dispatch that reached GitHub is a run that waits: one that succeeded, and one
+    # that failed only on the way back, when STUB_FAILED_DISPATCH_LANDS is set.
+    failing = int(os.environ.get("STUB_DISPATCH_FAILS", "0"))
+    lands = os.environ.get("STUB_FAILED_DISPATCH_LANDS") == "1"
+    for index in range(earlier("gh", "workflow", "run")):
+        if index >= failing or lands:
+            runs.append(dict(databaseId=900 + index, status="queued"))
+    answer(json.dumps(runs))
+if name == "gh" and args[:2] == ["workflow", "run"]:
+    fail_first("STUB_DISPATCH_FAILS", "gh", "workflow", "run")
 sys.exit(int(os.environ.get("STUB_EXIT", "0")))
 """
 needs_jq = pytest.mark.skipif(
@@ -496,6 +524,10 @@ def test_backfill_redispatches_from_a_job_outside_the_group():
     script = one_script("backfill.yml", "redispatch", "gh workflow run")
     assert script.count("gh workflow run") == 1
     assert "gh workflow run backfill.yml -f task=sweep" in script
+    # Every try looks for another backfill run first, and knows this one by its id.
+    assert script.count("gh run list") == 1
+    assert script.index("gh run list") < script.index("gh workflow run")
+    assert '"$GITHUB_RUN_ID"' in script
     token = re.search(r"(?m)^\s+GH_TOKEN:\s*(.*?)\s*$", redispatch)
     assert token and token[1] == "${{ github.token }}"
     assert re.search(r"(?m)^\s+GH_REPO:", redispatch), "no checkout, so no repository"
@@ -527,27 +559,104 @@ def test_nothing_dispatches_from_inside_a_concurrency_group():
             assert entry(body, "concurrency", 4) is None, f"{file}: {name}"
 
 
-def dispatch(tmp_path: Path, job: tuple[str, str], **env: str):
-    """The dispatch script of `job`, run with stand-ins for gh and sleep."""
+DISPATCH = ["gh", "workflow", "run", "backfill.yml", "-f", "task=sweep"]
+LISTING = [
+    *["gh", "run", "list", "--repo", "py-observatory/data", "--workflow"],
+    *["backfill.yml", "--limit", "20", "--json", "databaseId,status"],
+    *["--jq", '.[] | select(.status != "completed") | .databaseId'],
+]
+WAIT = ["sleep", "20"]
+# The backfill runs that GitHub lists when there is no other chain: this one (its id is
+# GITHUB_RUN_ID in run_shell), and two that have completed.
+ALONE = [
+    {"databaseId": 12345, "status": "in_progress"},
+    {"databaseId": 12001, "status": "completed"},
+    {"databaseId": 12002, "status": "completed"},
+]
+
+
+def dispatch(
+    tmp_path: Path, job: tuple[str, str], runs: list[dict] = ALONE, **env: str
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    """The dispatch script of `job`, run with stand-ins for gh and sleep, where GitHub
+    lists `runs` as the backfill's runs, and the dispatches that reached it."""
     script = one_script(*job, "gh workflow run")
-    return run_step(tmp_path, script, stubs=("gh", "sleep"), **env)
+    return run_step(
+        tmp_path, script, stubs=("gh", "sleep"), STUB_RUNS=json.dumps(runs), **env
+    )
 
 
+@needs_jq
 @pytest.mark.parametrize("job", sorted(DISPATCH_JOBS), ids=lambda job: job[1])
 def test_a_dispatch_is_tried_up_to_three_times(tmp_path, job):
-    """A dispatch that fails once must not end a chain of some 78 sweeps."""
-    command = ["gh", "workflow", "run", "backfill.yml", "-f", "task=sweep"]
-    # How many calls of gh fail first, then the exit code, the calls of gh and of sleep.
+    """A dispatch that fails once must not end a chain of some 78 sweeps. Each try
+    looks for another backfill run first, and finds none but this one."""
+    # How many dispatches fail first, then the exit code, the tries and the waits.
     cases = {0: (0, 1, 0), 1: (0, 2, 1), 2: (0, 3, 2), 3: (1, 3, 2), 9: (1, 3, 2)}
     for failing, (status, tries, waits) in cases.items():
         done, calls = dispatch(
-            tmp_path / str(failing), job, STUB_FAIL_FIRST_GH=str(failing)
+            tmp_path / str(failing), job, STUB_DISPATCH_FAILS=str(failing)
         )
         assert done.returncode == status, (failing, done.stderr)
-        assert [call for call in calls if call[0] == "gh"] == [command] * tries, failing
+        gh = [call for call in calls if call[0] == "gh"]
+        assert gh == [LISTING, DISPATCH] * tries, failing
         sleeps = [call for call in calls if call[0] == "sleep"]
         assert len(sleeps) == waits, (failing, "none after the last try")
         assert all(len(call) == 2 and 0 < int(call[1]) <= 60 for call in sleeps), sleeps
+
+
+@needs_jq
+@pytest.mark.parametrize("job", sorted(DISPATCH_JOBS), ids=lambda job: job[1])
+def test_a_dispatch_leaves_the_chain_to_another_run(tmp_path, job):
+    """Another backfill run that has not completed carries the chain on, so nothing is
+    dispatched, which would start a second chain, and the step succeeds."""
+    for status in ("queued", "pending", "waiting", "in_progress"):
+        other = {"databaseId": 12346, "status": status}
+
+        done, calls = dispatch(tmp_path / status, job, [*ALONE, other])
+
+        assert done.returncode == 0, (status, done.stderr)
+        assert calls == [LISTING], status
+        assert "12346" in done.stdout, status
+
+
+@needs_jq
+@pytest.mark.parametrize("job", sorted(DISPATCH_JOBS), ids=lambda job: job[1])
+def test_a_dispatch_that_github_took_is_never_made_twice(tmp_path, job):
+    """gh says that the dispatch failed, but GitHub took it. The next try finds the run
+    that it made, and leaves the chain to it."""
+    done, calls = dispatch(
+        tmp_path, job, STUB_DISPATCH_FAILS="1", STUB_FAILED_DISPATCH_LANDS="1"
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert calls == [LISTING, DISPATCH, WAIT, LISTING]
+
+
+@needs_jq
+@pytest.mark.parametrize("job", sorted(DISPATCH_JOBS), ids=lambda job: job[1])
+def test_a_failed_listing_is_a_failed_try(tmp_path, job):
+    """A listing that fails says nothing about other runs, so it is never taken for "no
+    other run": it is a try that failed."""
+    done, calls = dispatch(tmp_path / "once", job, STUB_RUN_LIST_FAILS="1")
+
+    assert done.returncode == 0, done.stderr
+    assert calls == [LISTING, WAIT, LISTING, DISPATCH]
+
+    done, calls = dispatch(tmp_path / "always", job, STUB_RUN_LIST_FAILS="9")
+
+    assert done.returncode == 1
+    assert calls == [LISTING, WAIT, LISTING, WAIT, LISTING], "and no dispatch"
+
+
+@pytest.mark.parametrize("job", sorted(DISPATCH_JOBS), ids=lambda job: job[1])
+def test_a_dispatch_without_its_run_id_fails(tmp_path, job):
+    """Without its own id, the step would take its own run for another one and end the
+    chain without a word."""
+    done, calls = dispatch(tmp_path, job, GITHUB_RUN_ID="")
+
+    assert done.returncode != 0
+    assert calls == []
 
 
 def test_a_hung_dispatch_fails_its_step_before_its_job_times_out():

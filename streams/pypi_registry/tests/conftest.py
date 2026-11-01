@@ -14,3 +14,12 @@ def close_connections() -> Iterator[None]:
     yield
     while OPENED:
         OPENED.pop().close()
+
+
+@pytest.fixture(autouse=True)
+def no_sqlite_tmpdir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test with no SQLITE_TMPDIR, and put back what was there when it ends.
+    `main` sets it for the rest of the process, which would carry it into later
+    tests."""
+    monkeypatch.setenv("SQLITE_TMPDIR", "")  # so that the original is put back
+    monkeypatch.delenv("SQLITE_TMPDIR")

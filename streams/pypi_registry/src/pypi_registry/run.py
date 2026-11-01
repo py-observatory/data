@@ -1026,9 +1026,10 @@ def main(argv: list[str] | None = None) -> int:
     py-observatory/data when that is not set. It makes one GitHub client, whose
     writes are paced, for every call of the run, and works in a new directory in the
     folder that `--workdir` names (./work by default), which is removed afterwards.
-    It prints the report as JSON. Every error propagates. A sweep waits
-    SWEEP_INTERVAL seconds between requests, and a run waits for as long as the kit's
-    `Http` does by default.
+    SQLite's temporary files go in that folder too, unless SQLITE_TMPDIR is set. It
+    prints the report as JSON. Every error propagates. A sweep waits SWEEP_INTERVAL
+    seconds between requests, and a run waits for as long as the kit's `Http` does by
+    default.
 
     `run` returns 0. `sweep` returns 3, when it has swept some projects and others
     are left, to say that it is to be run again, and 0 otherwise. A sweep that reads
@@ -1086,6 +1087,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     work = args.workdir.absolute()
     work.mkdir(exist_ok=True)
+    # SQLite writes its temporary files, VACUUM's copy of a whole database among them,
+    # to SQLITE_TMPDIR, and otherwise to /var/tmp or /tmp, which may be on another disk.
+    # Set before any SQLite work, it keeps them on the work's disk, and so in the free
+    # disk that a month close logs. A folder that is set already is kept.
+    os.environ.setdefault("SQLITE_TMPDIR", str(work.resolve()))
     with tempfile.TemporaryDirectory(prefix="run-", dir=work) as workdir:
         if args.command == "sweep":
             report = sweep(

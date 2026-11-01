@@ -21,6 +21,13 @@ name: backfill
 # cancelled while it waited, so that the chain goes on, and reports the rest. A sweep that
 # it dispatches may in turn replace a tick that waits in the group. That is benign: the
 # next tick catches up.
+#
+# There is never more than one chain. Before each try at dispatching a sweep, a job looks
+# for another backfill run that has not completed, and leaves the chain to it if there is
+# one. To stop the chain, disable this workflow (`gh workflow disable backfill.yml`).
+# Cancelling a run whose sweep is still waiting does not stop it, because the last job
+# then dispatches a new sweep. To resume, enable the workflow (`gh workflow enable
+# backfill.yml`) and dispatch it once.
 
 on:
   workflow_dispatch:
@@ -111,17 +118,34 @@ jobs:
       actions: write
     steps:
       # A dispatch that fails once would end a chain of some 78 sweeps, so it is tried up to
-      # three times. The step gives up before the job does, so that a hung call fails the
-      # step, and the report job below sees a failure and not a cancelled job.
+      # three times. Each try first looks for another backfill run that has not completed.
+      # One that is there carries the chain on, so nothing is dispatched, which would start
+      # a second chain. Looking before every try also keeps a dispatch that GitHub took but
+      # reported as failed from being made twice. A listing that fails proves nothing, so it
+      # is a failed try. A missing run id, without which this run would be taken for
+      # another, fails the step at once. The step gives up before the job does, so that a
+      # hung call fails the step, and the report job below sees a failure and not a
+      # cancelled job.
       - name: Dispatch the next sweep
         timeout-minutes: 4
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          : "${GITHUB_RUN_ID:?}"
           for attempt in 1 2 3; do
-            if gh workflow run backfill.yml -f task=sweep; then
-              exit 0
+            if listed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow backfill.yml \
+              --limit 20 --json databaseId,status \
+              --jq '.[] | select(.status != "completed") | .databaseId'); then
+              others=$(printf '%s\n' "$listed" | grep -vx -e "$GITHUB_RUN_ID" -e '' || true)
+              if [ -n "$others" ]; then
+                echo "Another backfill run carries the chain on, so no sweep is dispatched:"
+                printf '%s\n' "$others"
+                exit 0
+              fi
+              if gh workflow run backfill.yml -f task=sweep; then
+                exit 0
+              fi
             fi
             echo "Dispatch $attempt of 3 failed." >&2
             if [ "$attempt" -lt 3 ]; then
@@ -157,6 +181,7 @@ jobs:
         timeout-minutes: 1
         with:
           persist-credentials: false
+      # The same tries as the redispatch job, which look for another backfill run first.
       - name: Dispatch the sweep that was replaced while it waited
         id: dispatch
         if: needs.sweep.result == 'cancelled' && needs.sweep.outputs.started != 'true'
@@ -165,9 +190,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          : "${GITHUB_RUN_ID:?}"
           for attempt in 1 2 3; do
-            if gh workflow run backfill.yml -f task=sweep; then
-              exit 0
+            if listed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow backfill.yml \
+              --limit 20 --json databaseId,status \
+              --jq '.[] | select(.status != "completed") | .databaseId'); then
+              others=$(printf '%s\n' "$listed" | grep -vx -e "$GITHUB_RUN_ID" -e '' || true)
+              if [ -n "$others" ]; then
+                echo "Another backfill run carries the chain on, so no sweep is dispatched:"
+                printf '%s\n' "$others"
+                exit 0
+              fi
+              if gh workflow run backfill.yml -f task=sweep; then
+                exit 0
+              fi
             fi
             echo "Dispatch $attempt of 3 failed." >&2
             if [ "$attempt" -lt 3 ]; then

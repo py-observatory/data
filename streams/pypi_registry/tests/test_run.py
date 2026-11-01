@@ -1,6 +1,7 @@
 import dataclasses
 import hashlib
 import json
+import os
 import platform
 import sqlite3
 import struct
@@ -1083,3 +1084,36 @@ def test_main_works_in_the_folder_that_workdir_names(tmp_path, monkeypatch, comm
         tmp_path / "work",
     ]
     assert not any(path.exists() for path in workdirs)
+
+
+@pytest.mark.parametrize("command", ["run", "sweep"])
+def test_main_gives_sqlite_the_workdir_for_its_temporary_files(
+    tmp_path, monkeypatch, command
+):
+    # VACUUM writes a whole copy of the month's part to SQLite's temporary folder, and
+    # /var/tmp or /tmp may be on another disk than the work. In the folder that
+    # --workdir names, it shares the work's disk, and the free disk that is logged.
+    seen: list[str | None] = []
+
+    def record(gh, http, workdir, **options) -> RunReport:
+        seen.append(os.environ.get("SQLITE_TMPDIR"))
+        return RunReport(0, 0, 0, 0, 0, 0, 0, 0, [])
+
+    monkeypatch.setattr("pypi_registry.run.run_once", record)
+    monkeypatch.setattr("pypi_registry.run.sweep", record)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
+    disk = tmp_path / "mnt"
+    disk.mkdir()
+
+    assert main([command, "--workdir", str(disk / "work")]) == 0
+
+    # It is set before the run starts, and so before any SQLite work.
+    assert seen == [str((disk / "work").resolve())]
+
+    # A folder that is set already is kept.
+    monkeypatch.setenv("SQLITE_TMPDIR", str(tmp_path / "chosen"))
+
+    assert main([command, "--workdir", str(disk / "work")]) == 0
+
+    assert seen[-1] == str(tmp_path / "chosen")
