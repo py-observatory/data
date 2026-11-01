@@ -1,0 +1,71 @@
+name: tick
+
+# The daily run of the pypi-registry stream, every six hours. A run reads what changed on
+# PyPI since the last one and publishes it to the pypi-registry-current release. A normal
+# run takes 30 to 40 minutes, and one that has much to read stops starting projects after
+# five hours (18,000 s), which leaves the rest of the job's 330 minutes to publish.
+#
+# Run it by hand with `bootstrap` to build the stream's first state. That is accepted only
+# for a stream that has never published. `override_reason` publishes although a publish
+# gate failed, and the manifest logs the reason.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: Build the first state (only for a stream that has never published)
+        type: boolean
+        default: false
+      override_reason:
+        description: Publish although a gate failed, for this reason (the manifest logs it)
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  pypi-registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+      issues: write
+    # The tick and the sweep both publish pypi-registry-current, so they run one at a
+    # time. A run that is waiting is never started over one that is running.
+    concurrency:
+      group: stream-pypi-registry
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --locked --package pypi-registry
+      - name: Run the registry
+        # A hung run should end as a failed step, which `failure()` below matches, and not
+        # as a job that timed out, which GitHub may count as cancelled. The step gives up
+        # ten minutes before the job does, which is time enough to open the issue.
+        timeout-minutes: 320
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          OVERRIDE_REASON: ${{ inputs.override_reason }}
+        run: |
+          args=()
+          if [ "$BOOTSTRAP" = "true" ]; then
+            args+=(--bootstrap)
+          fi
+          if [ -n "$OVERRIDE_REASON" ]; then
+            args+=(--override-reason "$OVERRIDE_REASON")
+          fi
+          uv run --package pypi-registry python -m pypi_registry run "${args[@]}"
+      - if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh pypi-registry failure
+      - if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh pypi-registry success

@@ -1,0 +1,57 @@
+name: smoke
+
+# The kit's weekly smoke test. It publishes to the kit-smoke-current release through the
+# kit, reads the release back and checks the sha256 of what it read, so a change in how
+# GitHub answers shows up on a stream that holds nothing of value.
+#
+# Run it by hand once with `bootstrap`, to create kit-smoke-current. Until then the weekly
+# run fails, as every stream fails that has no release and is not asked to bootstrap.
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: Create kit-smoke-current (only for a stream that has never published)
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+    concurrency:
+      group: stream-kit-smoke
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv sync --locked
+      - name: Smoke test
+        # A hung run ends as a failed step, five minutes before the job (see tick.yml).
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+        run: |
+          args=()
+          if [ "$BOOTSTRAP" = "true" ]; then
+            args+=(--bootstrap)
+          fi
+          uv run python -m obskit.smoke "${args[@]}"
+      - if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh kit-smoke failure
+      - if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh kit-smoke success
