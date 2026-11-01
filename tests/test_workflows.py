@@ -32,7 +32,21 @@ PUBLISH_JOBS = {
     ("backfill.yml", "sweep"),
     ("smoke.yml", "smoke"),
 }
+REPORT_JOB = ("backfill.yml", "report")
+# What each job with permissions of its own is granted. A job that is not here has the
+# top level's, which is nothing or `contents: read`.
+PERMISSIONS = {
+    ("tick.yml", "pypi-registry"): {"contents": "write", "issues": "write"},
+    ("backfill.yml", "sweep"): {"contents": "write", "issues": "write"},
+    ("backfill.yml", "redispatch"): {"actions": "write"},
+    REPORT_JOB: {"contents": "read", "issues": "write"},
+    ("smoke.yml", "smoke"): {"contents": "write", "issues": "write"},
+}
 REGISTRY_GROUP = {"group": "stream-pypi-registry", "cancel-in-progress": "false"}
+SWEEP_COMMAND = [
+    *["uv", "run", "--package", "pypi-registry", "python", "-m", "pypi_registry"],
+    *["sweep", "--max-seconds", "15000"],
+]
 RUN_URL = "https://github.com/py-observatory/data/actions/runs/12345"
 
 
@@ -129,6 +143,20 @@ def mapping(section: str, key: str, indent: int) -> dict[str, str] | str | None:
     return {row[1]: row[2] for row in rows if row}
 
 
+def sequence(section: str, key: str, indent: int) -> list[str] | None:
+    """A key whose value is a list of scalars, in flow style (`[a, b]`) or block style.
+    A scalar value comes back as a list of one, a missing key as None."""
+    found = entry(section, key, indent)
+    if found is None:
+        return None
+    inline, body = found
+    if inline.startswith("["):
+        return [item.strip() for item in inline.strip("[] ").split(",") if item.strip()]
+    if inline:
+        return [inline]
+    return re.findall(r"(?m)^\s+- (\S+)", body)
+
+
 def steps(job: str) -> list[str]:
     """The text of each step of a job (they come last in a job's text)."""
     return ["- " + part for part in re.split(r"(?m)^      - ", job)[1:]]
@@ -162,14 +190,29 @@ def one_script(file: str, name: str, mentions: str) -> str:
     return script
 
 
+def step_limit(file: str, job: str, mentions: str) -> int:
+    """The `timeout-minutes` of the one step of a job whose text contains `mentions`."""
+    [step] = [s for s in steps(job_of(file, job)) if mentions in s]
+    found = re.search(r"(?m)^(?: {8}|- )timeout-minutes:\s*(\d+)\s*(?:#.*)?$", step)
+    assert found, f"{file}: the step with {mentions!r} has no timeout-minutes"
+    return int(found[1])
+
+
 # --- stand-ins for uv and gh, and a way to run shell against them ---
 
 STUB = """#!{python}
 import json, os, subprocess, sys
 
 name, args = os.path.basename(sys.argv[0]), sys.argv[1:]
-with open(os.environ["STUB_LOG"], "a", encoding="utf-8") as log:
+log_path = os.environ["STUB_LOG"]
+earlier = 0
+if os.path.exists(log_path):
+    with open(log_path, encoding="utf-8") as log:
+        earlier = sum(1 for line in log if json.loads(line)[0] == name)
+with open(log_path, "a", encoding="utf-8") as log:
     log.write(json.dumps([name, *args]) + "\\n")
+if earlier < int(os.environ.get("STUB_FAIL_FIRST_" + name.upper(), "0")):
+    sys.exit(1)  # the first calls of this command fail, as a flaky API does
 if name == "gh" and args[:2] == ["issue", "list"]:
     if os.environ.get("STUB_LIST_EXIT", "0") != "0":
         print("gh: HTTP 502", file=sys.stderr)
@@ -219,13 +262,14 @@ def run_shell(
 
 
 def run_step(
-    tmp_path: Path, script: str, **env: str
+    tmp_path: Path, script: str, *, stubs: tuple[str, ...] = ("uv",), **env: str
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
-    """Run a step's script as the runner does (`bash -e`), with a stand-in for uv."""
+    """Run a step's script as the runner does (`bash -e`), with a stand-in for each
+    command of `stubs`."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     file = tmp_path / "step.sh"
     file.write_text(script, encoding="utf-8")
-    return run_shell(tmp_path, ["bash", "-e", str(file)], ("uv",), **env)
+    return run_shell(tmp_path, ["bash", "-e", str(file)], stubs, **env)
 
 
 # --- the workflows as a whole ---
@@ -265,7 +309,7 @@ def test_no_gh_release_outside_kit():
 
 def test_every_job_has_timeout():
     jobs = all_jobs()
-    assert len(jobs) >= 5
+    assert len(jobs) >= 6
     for file, name, body in jobs:
         value = scalar(body, "timeout-minutes", 4)
         assert value is not None, f"{file}: job {name} has no timeout-minutes"
@@ -273,11 +317,30 @@ def test_every_job_has_timeout():
 
 
 def test_job_timeouts_leave_room_after_the_run_budget():
-    """The run stops starting projects after 18,000 s and the sweep after 16,200 s,
-    and then compresses, uploads and publishes."""
+    """A hung run is ended by the limit of its step, which is a few minutes shorter than
+    its job's so that the step fails and the failure issue is opened (a job that times
+    out may count as cancelled). So the limits that apply are the steps'.
+
+    A tick stops starting projects after 18,000 s (300 minutes), which leaves 27 of its
+    327. A sweep always runs to its deadline, and after it only the project in hand, the
+    apply and the publish remain. The publish compresses a state of about 2 GB late in
+    the backfill, at 4 MB/s on a Mac and slower on a runner. So the sweep is given
+    15,000 s (250 minutes) of a step of 297, which leaves 47.
+    """
     assert scalar(job_of("tick.yml", "pypi-registry"), "timeout-minutes", 4) == "330"
     assert scalar(job_of("backfill.yml", "sweep"), "timeout-minutes", 4) == "300"
     assert scalar(job_of("smoke.yml", "smoke"), "timeout-minutes", 4) == "15"
+
+    assert step_limit("tick.yml", "pypi-registry", "pypi_registry run") == 327
+    assert step_limit("backfill.yml", "sweep", "pypi_registry sweep") == 297
+    assert step_limit("smoke.yml", "smoke", "obskit.smoke") == 12
+
+    script = one_script("backfill.yml", "sweep", "pypi_registry sweep")
+    [seconds] = re.findall(r"--max-seconds (\d+)", script)
+    room = (
+        step_limit("backfill.yml", "sweep", "pypi_registry sweep") - int(seconds) / 60
+    )
+    assert room >= 45, f"only {room:.0f} minutes are left after the sweep's deadline"
 
 
 def test_actions_pinned_by_sha():
@@ -324,24 +387,24 @@ def test_top_level_permissions_are_minimal():
 
 
 def test_only_the_jobs_that_need_a_permission_have_it():
-    writers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    seen = set()
     for file, name, body in all_jobs():
         granted = mapping(body, "permissions", 4)
-        if granted is None:  # the job has what the top level gives it
+        if (file, name) not in PERMISSIONS:  # the job has what the top level gives it
+            assert granted is None, f"{file}: {name} has permissions of its own"
             continue
-        assert isinstance(granted, dict), f"{file}: {name}: {granted!r}"
-        for scope, level in granted.items():
-            assert (scope, level) in {
-                ("contents", "write"),
-                ("issues", "write"),
-                ("actions", "write"),
-            }, f"{file}: {name} asks for {scope}: {level}"
-            writers[scope].add((file, name))
-    assert writers["contents"] == PUBLISH_JOBS
-    assert writers["issues"] == PUBLISH_JOBS  # each opens and closes its issue
-    assert writers["actions"] == {("backfill.yml", "redispatch")}
-    redispatch = job_of("backfill.yml", "redispatch")
-    assert mapping(redispatch, "permissions", 4) == {"actions": "write"}
+        assert granted == PERMISSIONS[file, name], f"{file}: {name}: {granted!r}"
+        seen.add((file, name))
+    assert seen == set(PERMISSIONS)
+    # The table is what the checks above hold the files to, so hold it to the point of
+    # it: `contents: write` for the jobs that publish and `actions: write` for the
+    # dispatch, and for no other.
+    writing = {
+        job for job, got in PERMISSIONS.items() if got.get("contents") == "write"
+    }
+    assert writing == PUBLISH_JOBS
+    dispatching = {job for job, got in PERMISSIONS.items() if "actions" in got}
+    assert dispatching == {("backfill.yml", "redispatch")}
 
 
 def test_registry_jobs_share_concurrency_group():
@@ -365,6 +428,15 @@ def test_smoke_job_has_its_own_concurrency_group():
     }
 
 
+def test_only_the_stream_jobs_join_a_concurrency_group():
+    """A job that queues in the group replaces the one that is waiting there, so the
+    jobs that only dispatch or report stay out of it."""
+    in_a_group = {
+        (file, name) for file, name, body in all_jobs() if entry(body, "concurrency", 4)
+    }
+    assert in_a_group == PUBLISH_JOBS
+
+
 def test_no_workflow_has_a_group_of_its_own_for_all_its_jobs():
     """A group at the top of a workflow holds every job of it, including any job
     that is meant to be outside."""
@@ -378,7 +450,7 @@ def test_backfill_redispatches_from_a_job_outside_the_group():
     group would cancel the tick that waits behind it, for as long as the sweeps go
     on. So the dispatch is a job of its own, after the sweep job has left the group."""
     jobs = split_jobs(workflows()["backfill.yml"])[1]
-    assert list(jobs) == ["sweep", "redispatch"]
+    assert list(jobs) == ["sweep", "redispatch", "report"]
     sweep, redispatch = jobs["sweep"], jobs["redispatch"]
 
     assert "gh workflow run" not in sweep
@@ -387,9 +459,9 @@ def test_backfill_redispatches_from_a_job_outside_the_group():
     assert scalar(redispatch, "if", 4) == "needs.sweep.outputs.continue == 'true'"
     assert scalar(sweep, "outputs", 4) == ""
     assert scalar(sweep, "continue", 6) == "${{ steps.sweep.outputs.continue }}"
-    assert one_script("backfill.yml", "redispatch", "gh workflow run") == (
-        "gh workflow run backfill.yml -f task=sweep"
-    )
+    script = one_script("backfill.yml", "redispatch", "gh workflow run")
+    assert script.count("gh workflow run") == 1
+    assert "gh workflow run backfill.yml -f task=sweep" in script
     token = re.search(r"(?m)^\s+GH_TOKEN:\s*(.*?)\s*$", redispatch)
     assert token and token[1] == "${{ github.token }}"
     assert re.search(r"(?m)^\s+GH_REPO:", redispatch), "no checkout, so no repository"
@@ -400,6 +472,78 @@ def test_nothing_dispatches_from_inside_a_concurrency_group():
     for file, name, body in all_jobs():
         if "gh workflow run" in body:
             assert entry(body, "concurrency", 4) is None, f"{file}: {name}"
+
+
+def dispatch(tmp_path: Path, **env: str):
+    """The redispatch job's script, run with stand-ins for gh and sleep."""
+    script = one_script("backfill.yml", "redispatch", "gh workflow run")
+    return run_step(tmp_path, script, stubs=("gh", "sleep"), **env)
+
+
+def test_redispatch_tries_the_dispatch_up_to_three_times(tmp_path):
+    """A dispatch that fails once must not end a chain of some 78 sweeps."""
+    command = ["gh", "workflow", "run", "backfill.yml", "-f", "task=sweep"]
+    # How many calls of gh fail first, then the exit code, the calls of gh and of sleep.
+    cases = {0: (0, 1, 0), 1: (0, 2, 1), 2: (0, 3, 2), 3: (1, 3, 2), 9: (1, 3, 2)}
+    for failing, (status, tries, waits) in cases.items():
+        done, calls = dispatch(tmp_path / str(failing), STUB_FAIL_FIRST_GH=str(failing))
+        assert done.returncode == status, (failing, done.stderr)
+        assert [call for call in calls if call[0] == "gh"] == [command] * tries, failing
+        sleeps = [call for call in calls if call[0] == "sleep"]
+        assert len(sleeps) == waits, (failing, "none after the last try")
+        assert all(len(call) == 2 and 0 < int(call[1]) <= 60 for call in sleeps), sleeps
+
+
+def test_a_hung_dispatch_fails_its_step_before_its_job_times_out():
+    """The report job runs for a redispatch that failed, and a job that times out may
+    count as cancelled."""
+    job = int(scalar(job_of("backfill.yml", "redispatch"), "timeout-minutes", 4) or 0)
+    assert step_limit("backfill.yml", "redispatch", "gh workflow run") < job
+
+
+def test_report_covers_the_ways_the_chain_stops_silently():
+    """A sweep that fails reports through its own step. These are the other ways in which
+    the chain ends without a sweep saying so: the next sweep cannot be dispatched, a
+    sweep is cancelled while it waits for the group (a run that queues replaces the one
+    that waits) and a sweep hits the timeout of its job."""
+    report = job_of(*REPORT_JOB)
+    assert sequence(report, "needs", 4) == ["sweep", "redispatch"]
+    assert scalar(report, "if", 4) == (
+        "always() && (needs.sweep.result == 'cancelled' "
+        "|| needs.redispatch.result == 'failure')"
+    )
+    assert mapping(report, "permissions", 4) == {"contents": "read", "issues": "write"}
+    assert scalar(report, "timeout-minutes", 4) == "5"
+    assert entry(report, "concurrency", 4) is None, "a job that queues replaces a tick"
+    checkout, reporting = steps(report)
+    assert "actions/checkout" in checkout
+    assert re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", checkout)
+    assert one_script(*REPORT_JOB, "rolling-issue.sh") == (
+        "scripts/rolling-issue.sh pypi-registry-backfill failure"
+    )
+    assert "if:" not in reporting, "the condition of the job decides"
+    token = re.search(r"(?m)^\s+GH_TOKEN:\s*(.*?)\s*$", reporting)
+    assert token and token[1] == "${{ github.token }}"
+
+
+def test_report_runs_for_a_chain_that_stopped_without_a_report_of_its_own():
+    condition = scalar(job_of(*REPORT_JOB), "if", 4) or ""
+    assert re.fullmatch(r"[\w\s().&|=']+", condition), "only what GitHub evaluates"
+
+    def runs(sweep: str, redispatch: str) -> bool:
+        """The condition as Python, for the results of the two jobs."""
+        python = condition.replace("always()", "True")
+        python = python.replace("&&", " and ").replace("||", " or ")
+        python = python.replace("needs.sweep.result", repr(sweep))
+        python = python.replace("needs.redispatch.result", repr(redispatch))
+        return eval(python, {"__builtins__": {}})
+
+    # (the result of the sweep job, of the redispatch job): does the report run?
+    assert not runs("success", "success"), "the next sweep was dispatched"
+    assert not runs("success", "skipped"), "the sweep is done, and the chain ends well"
+    assert not runs("failure", "skipped"), "a sweep that fails reports for itself"
+    assert runs("success", "failure"), "the next sweep could not be dispatched"
+    assert runs("cancelled", "skipped"), "replaced while it waited, or timed out"
 
 
 def test_sweep_exit_codes(tmp_path):
@@ -415,9 +559,17 @@ def test_sweep_exit_codes(tmp_path):
         )
         assert done.returncode == status, (code, done.stderr)
         assert output.read_text() == ("continue=true\n" if again else ""), code
-        [call] = calls
-        assert call[:3] == ["uv", "run", "--package"]
-        assert call[3:] == ["pypi-registry", "python", "-m", "pypi_registry", "sweep"]
+        assert calls == [SWEEP_COMMAND], code
+
+
+def test_sweep_passes_its_time_budget(tmp_path):
+    """15,000 s is 250 minutes, which leaves the rest of the step to publish."""
+    script = one_script("backfill.yml", "sweep", "pypi_registry sweep")
+    output = tmp_path / "output"
+    output.write_text("")
+    _, calls = run_step(tmp_path, script, GITHUB_OUTPUT=str(output))
+    [call] = calls
+    assert call[call.index("sweep") :] == ["sweep", "--max-seconds", "15000"]
 
 
 def test_tick_passes_bootstrap_and_a_reason_only_when_asked(tmp_path):
@@ -500,12 +652,13 @@ def test_triggers():
 
 
 def test_every_stream_job_reports_to_the_rolling_issue():
-    """A run that fails opens (or adds to) the stream's issue, and a tick or a smoke
-    run that succeeds closes it. A sweep never closes it: a good sweep says nothing
-    about whether the daily run is well."""
+    """A run that fails opens (or adds to) the issue of its stream, and one that
+    succeeds closes it. The backfill has an issue of its own, and not the tick's: a good
+    tick says nothing about a sweep chain that stopped, and a good sweep says nothing
+    about whether the daily run is well. A sweep that exits with 0 or 3 is a success."""
     expected = {
         ("tick.yml", "pypi-registry"): ("pypi-registry", ["failure", "success"]),
-        ("backfill.yml", "sweep"): ("pypi-registry", ["failure"]),
+        ("backfill.yml", "sweep"): ("pypi-registry-backfill", ["failure", "success"]),
         ("smoke.yml", "smoke"): ("kit-smoke", ["failure", "success"]),
     }
     for (file, name), (stream, outcomes) in expected.items():
@@ -526,13 +679,16 @@ def test_every_stream_job_reports_to_the_rolling_issue():
 
 
 def test_checkouts_do_not_keep_the_token():
-    """Nothing here pushes, so the token the jobs hold is not left in .git/config."""
+    """Nothing here pushes, so the token that a job holds is not left in .git/config."""
+    holders = PUBLISH_JOBS | {REPORT_JOB}
     for file, name, body in all_jobs():
         for step in steps(body):
-            if "actions/checkout" in step and (file, name) in PUBLISH_JOBS:
+            if "actions/checkout" in step and (file, name) in holders:
                 assert re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", step), (
                     f"{file}: {name}"
                 )
+        if (file, name) in holders:  # so that the loop above looks at something
+            assert "actions/checkout" in body, f"{file}: {name} has no checkout"
 
 
 def test_workflows_run_the_locked_environment():
@@ -658,6 +814,27 @@ def test_rolling_issue_uses_the_stream_in_the_title_and_the_label(tmp_path):
     [listed] = gh_calls(calls, "issue", "list")
     assert flag(listed, "--label") == "stream:kit-smoke"
     assert flag(listed, "--state") == "open"
+
+
+@needs_jq
+def test_rolling_issues_of_the_tick_and_the_backfill_are_separate(tmp_path):
+    """The tick's issue is open, and a backfill that fails is not that: it opens its own,
+    and a backfill that succeeds leaves the tick's alone."""
+    ticks = [{"number": 7, "title": TITLE}]
+
+    failed, failed_calls = rolling_issue(
+        tmp_path / "failure", ticks, "pypi-registry-backfill", "failure"
+    )
+    passed, passed_calls = rolling_issue(
+        tmp_path / "success", ticks, "pypi-registry-backfill", "success"
+    )
+
+    assert failed.returncode == 0 and passed.returncode == 0
+    [created] = gh_calls(failed_calls, "issue", "create")
+    assert flag(created, "--title") == "[pypi-registry-backfill] scheduled run failed"
+    assert flag(created, "--label") == "stream:pypi-registry-backfill"
+    assert not gh_calls(failed_calls, "issue", "comment")
+    assert not gh_calls(passed_calls, "issue", "close")
 
 
 @needs_jq

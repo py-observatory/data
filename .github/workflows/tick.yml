@@ -3,7 +3,8 @@ name: tick
 # The daily run of the pypi-registry stream, every six hours. A run reads what changed on
 # PyPI since the last one and publishes it to the pypi-registry-current release. A normal
 # run takes 30 to 40 minutes, and one that has much to read stops starting projects after
-# five hours (18,000 s), which leaves the rest of the job's 330 minutes to publish.
+# five hours (18,000 s). The step that runs it gives up after 327 minutes, which leaves 27
+# to finish the project in hand, compress the state and publish. The job's own limit is 330.
 #
 # Run it by hand with `bootstrap` to build the stream's first state. That is accepted only
 # for a stream that has never published. `override_reason` publishes although a publish
@@ -46,8 +47,8 @@ jobs:
       - name: Run the registry
         # A hung run should end as a failed step, which `failure()` below matches, and not
         # as a job that timed out, which GitHub may count as cancelled. The step gives up
-        # ten minutes before the job does, which is time enough to open the issue.
-        timeout-minutes: 320
+        # three minutes before the job does, which is time enough to open the issue.
+        timeout-minutes: 327
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BOOTSTRAP: ${{ inputs.bootstrap }}

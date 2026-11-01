@@ -1,15 +1,22 @@
 name: backfill
 
 # The two-week sweep of the pypi-registry stream, which reads the page of every project that
-# no run has read in full. A sweep reads as many pages as fit in 16,200 s (about 12,960,
-# at one request every 1.25 s), so the roughly 930,000 pages take about 72 sweeps one after
-# another. It runs when it is dispatched, and each sweep that leaves projects behind
-# dispatches the next one. Start it once by hand.
+# no run has read in full. A sweep stops starting projects after 15,000 s, which is about
+# 12,000 pages at one request every 1.25 s, so the roughly 930,000 pages take about 78
+# sweeps one after another. It runs when it is dispatched, and each sweep that leaves
+# projects behind dispatches the next one. Start it once by hand, after the registry's
+# bootstrap.
 #
 # `sweep` exits with 3 when it read some projects and others are left, and with 0 when it
 # is done, or when it read nothing, which is a page that stays unusable: the chain ends
-# there and does not go round for ever. Any other code is a failure. The chain stops, and
-# the failure issue opens. Dispatch the workflow again by hand once the cause is gone.
+# there and does not go round for ever. Both mean that the chain is well, and a sweep that
+# ends so closes the backfill's failure issue, which is its own and not the tick's. Any
+# other code is a failure: the chain stops and the issue opens. Dispatch the workflow
+# again by hand once the cause is gone.
+#
+# The chain can also stop without a sweep saying so. The next sweep may fail to be
+# dispatched, a sweep may be cancelled while it waits for the group, and a sweep may hit
+# the timeout of its job. The last job reports those.
 
 on:
   workflow_dispatch:
@@ -26,8 +33,10 @@ permissions: {}
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    # The sweep stops starting projects after 270 minutes (16,200 s), and then compresses
-    # the state and publishes it.
+    # The sweep stops starting projects after 250 minutes (15,000 s, passed below). Then it
+    # finishes the project in hand, applies the changes and publishes, which compresses a
+    # state of about 2 GB late in the backfill. The step gives up after 297 minutes, which
+    # leaves 47 for that.
     timeout-minutes: 300
     permissions:
       contents: write
@@ -46,13 +55,16 @@ jobs:
       - run: uv sync --locked --package pypi-registry
       - id: sweep
         name: Sweep
-        # As in tick.yml: a hung sweep ends as a failed step, ten minutes before the job.
-        timeout-minutes: 290
+        # A hung sweep should end as a failed step, which `failure()` below matches, and not
+        # as a job that timed out, which GitHub may count as cancelled. The step gives up
+        # three minutes before the job does, which is time enough to open the issue.
+        timeout-minutes: 297
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           code=0
-          uv run --package pypi-registry python -m pypi_registry sweep || code=$?
+          uv run --package pypi-registry python -m pypi_registry sweep \
+            --max-seconds 15000 || code=$?
           if [ "$code" -eq 3 ]; then
             echo "continue=true" >> "$GITHUB_OUTPUT"
           elif [ "$code" -ne 0 ]; then
@@ -61,7 +73,11 @@ jobs:
       - if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/rolling-issue.sh pypi-registry failure
+        run: scripts/rolling-issue.sh pypi-registry-backfill failure
+      - if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh pypi-registry-backfill success
 
   # The next sweep is dispatched from a job of its own, after the sweep job has left the
   # group above. A group holds one running job and one waiting job, and a job that queues
@@ -77,7 +93,42 @@ jobs:
     permissions:
       actions: write
     steps:
-      - env:
+      # A dispatch that fails once would end a chain of some 78 sweeps, so it is tried up to
+      # three times. The step gives up before the job does, so that a hung call fails the
+      # step, and the report job below sees a failure and not a cancelled job.
+      - name: Dispatch the next sweep
+        timeout-minutes: 4
+        env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh workflow run backfill.yml -f task=sweep
+        run: |
+          for attempt in 1 2 3; do
+            if gh workflow run backfill.yml -f task=sweep; then
+              exit 0
+            fi
+            echo "Dispatch $attempt of 3 failed." >&2
+            if [ "$attempt" -lt 3 ]; then
+              sleep 20
+            fi
+          done
+          exit 1
+
+  # The ways in which the chain stops without a sweep saying so: the next sweep could not be
+  # dispatched, a sweep was cancelled while it waited (a run that queues in the group
+  # replaces the one that waits there), and a sweep hit the timeout of its job. A sweep that
+  # fails reports through its own step above, and this job is skipped then.
+  report:
+    needs: [sweep, redispatch]
+    if: always() && (needs.sweep.result == 'cancelled' || needs.redispatch.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh pypi-registry-backfill failure

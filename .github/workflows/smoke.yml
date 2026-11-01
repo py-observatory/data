@@ -36,8 +36,8 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - run: uv sync --locked
       - name: Smoke test
-        # A hung run ends as a failed step, five minutes before the job (see tick.yml).
-        timeout-minutes: 10
+        # A hung run ends as a failed step, three minutes before the job (see tick.yml).
+        timeout-minutes: 12
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BOOTSTRAP: ${{ inputs.bootstrap }}
