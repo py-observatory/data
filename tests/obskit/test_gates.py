@@ -73,6 +73,20 @@ SEALED = asset(
 BASE = asset(
     "pypi-registry-base-2026-11.db.zst", tag=MONTH, period="2026-11", closed=True
 )
+STATE_DB = asset(
+    STATE,
+    tables={
+        "meta": TableInfo(6, "snapshot"),
+        "files_current": TableInfo(1000, "snapshot"),
+        "files": TableInfo(1200, "append"),
+        "events": TableInfo(40, "events"),
+        "rollup": TableInfo(7, "derived"),
+        "swept": TableInfo(0, "append"),
+    },
+)
+DELTA_NOV_2 = asset(
+    OPEN_DELTA, period="2026-11-02", tables={"files": TableInfo(120, "append")}
+)
 
 
 def manifest(
@@ -135,12 +149,20 @@ def test_cursor_backwards_fails(was, now):
         ("100", "101"),
         ("9", "10"),  # more as a number, less as text
         (None, "5"),
-        ("5", None),
         (None, None),
     ],
 )
 def test_cursor_not_backwards_passes(was, now):
     assert check(manifest([], cursor=was), manifest([], cursor=now)) == []
+
+
+@pytest.mark.parametrize("was", ["1000", "5", "abc"])
+def test_cursor_lost_fails(was):
+    failures = check(manifest([], cursor=was), manifest([], cursor=None))
+
+    assert rules(failures) == ["cursor"]
+    assert "missing" in failures[0].detail
+    assert was in failures[0].detail
 
 
 @pytest.mark.parametrize(("was", "now"), NOT_DIGITS)
@@ -261,6 +283,24 @@ def test_closed_asset_missing_fails(remaining):
     assert rules(failures) == ["closed-kept"]
     assert SEALED.name in failures[0].detail
     assert SEALED.tag in failures[0].detail
+
+
+def test_closed_asset_listed_as_open_fails():
+    failures = check(manifest([SEALED]), manifest([replace(SEALED, closed=False)]))
+
+    assert rules(failures) == ["closed-kept"]
+    assert SEALED.name in failures[0].detail
+    assert "no longer closed" in failures[0].detail
+
+
+def test_closed_asset_that_changed_and_is_listed_as_open_is_one_failure():
+    changed = rewritten(SEALED, closed=False)
+
+    failures = check(manifest([SEALED]), manifest([changed]))
+
+    assert rules(failures) == ["closed-kept"]
+    assert changed.asset_sha256 in failures[0].detail
+    assert "no longer closed" in failures[0].detail
 
 
 def test_closed_assets_kept_and_new_ones_added_pass():
@@ -430,15 +470,18 @@ def test_open_delta_of_the_same_day_is_compared():
 
     assert rules(failures) == ["rows"]
     assert "2026-11-02" in failures[0].detail
+    assert "from 500 rows to 499" in failures[0].detail
 
 
-def test_asset_in_only_one_manifest_is_not_compared():
-    delta = asset(
-        OPEN_DELTA, period="2026-11-02", tables={"files": TableInfo(9, "append")}
-    )
+@pytest.mark.parametrize("now", [120, 121, 5000])
+def test_open_delta_of_the_same_day_that_holds_or_grows_passes(now):
+    after = replace(DELTA_NOV_2, tables={"files": TableInfo(now, "append")})
 
-    assert check(manifest([delta]), manifest([])) == []
-    assert check(manifest([]), manifest([delta])) == []
+    assert check(manifest([DELTA_NOV_2]), manifest([after])) == []
+
+
+def test_asset_new_to_the_manifest_is_not_compared():
+    assert check(manifest([]), manifest([DELTA_NOV_2])) == []
 
 
 def test_changed_closed_asset_is_not_also_reported_as_lost_rows():
@@ -454,13 +497,118 @@ def test_open_asset_that_comes_back_closed_is_still_compared():
     )
     sealed = asset(
         OPEN_DELTA,
-        tag=MONTH,
         period="2026-11-02",
         closed=True,
         tables={"files": TableInfo(90, "append")},
     )
 
     assert rules(check(manifest([open_delta]), manifest([sealed]))) == ["rows"]
+
+
+# An open asset that is not there
+
+# An asset without a period, like the state database, has to come back without one.
+# One that does not has lost every table.
+
+
+@pytest.mark.parametrize(
+    "remaining",
+    [
+        [],
+        [replace(STATE_DB, name="pypi-registry-state-v2.db.zst")],
+        [replace(STATE_DB, period="2026-11")],
+        [replace(STATE_DB, tag=MONTH)],
+    ],
+    ids=["dropped", "renamed", "given a period", "under another tag"],
+)
+def test_state_asset_that_is_not_there_has_lost_every_table(remaining):
+    failures = check(manifest([STATE_DB]), manifest(remaining))
+
+    # meta, files_current, files and events. The derived table is not checked, and the
+    # empty one had nothing to lose.
+    assert rules(failures) == ["rows"] * 4
+    for failure in failures:
+        assert STATE in failure.detail
+        assert "missing" in failure.detail
+    assert not any("rollup" in failure.detail for failure in failures)
+    assert not any("swept" in failure.detail for failure in failures)
+
+
+def test_state_asset_given_a_period_says_which():
+    given = replace(STATE_DB, period="2026-11")
+
+    failures = check(manifest([STATE_DB]), manifest([given]))
+
+    assert "the period 2026-11" in failures[0].detail
+
+
+@pytest.mark.parametrize(
+    "tables",
+    [
+        {"rollup": TableInfo(7, "derived")},
+        {"swept": TableInfo(0, "append")},
+        {},
+    ],
+    ids=["only derived tables", "only empty tables", "no tables"],
+)
+def test_state_asset_dropped_with_nothing_to_lose_passes(tables):
+    prior = manifest([asset(STATE, tables=tables)])
+
+    assert check(prior, manifest([])) == []
+
+
+def test_dropped_asset_may_use_the_allowance_for_a_snapshot_table():
+    prior = holding("snapshot", 3, table="files_current")
+
+    assert check(prior, manifest([]), allowed_shrink={"files_current": 3}) == []
+    lacking = check(prior, manifest([]), allowed_shrink={"files_current": 2})
+    assert rules(lacking) == ["rows"]
+
+
+# An asset with a period, like the open delta, has to come back with that period or a
+# later one, whatever its tables hold.
+
+
+@pytest.mark.parametrize(
+    ("remaining", "said"),
+    [
+        ([], "missing"),
+        ([replace(DELTA_NOV_2, tag=MONTH)], "missing"),
+        ([replace(DELTA_NOV_2, name="pypi-registry-delta-open-v2.db.zst")], "missing"),
+        ([replace(DELTA_NOV_2, period="2026-11-01")], "went back"),
+        ([replace(DELTA_NOV_2, period=None)], "no period"),
+    ],
+    ids=["dropped", "under another tag", "renamed", "earlier period", "no period"],
+)
+def test_open_delta_that_is_missing_or_goes_back_fails(remaining, said):
+    failures = check(manifest([DELTA_NOV_2]), manifest(remaining))
+
+    assert rules(failures) == ["rows"]
+    assert OPEN_DELTA in failures[0].detail
+    assert said in failures[0].detail
+
+
+def test_open_delta_that_is_missing_or_goes_back_fails_whatever_it_holds():
+    bare = replace(DELTA_NOV_2, tables={"rollup": TableInfo(7, "derived")})
+
+    assert rules(check(manifest([bare]), manifest([]))) == ["rows"]
+    earlier = replace(bare, period="2026-11-01")
+    assert rules(check(manifest([bare]), manifest([earlier]))) == ["rows"]
+
+
+@pytest.mark.parametrize(
+    ("was", "now"),
+    [
+        ("2026-11-02", "2026-11-05"),  # days with no run
+        ("2026-11-30", "2026-12-01"),
+        ("2026-12-31", "2027-01-01"),
+    ],
+)
+def test_open_delta_rolled_to_a_later_day_is_not_compared(was, now):
+    before = replace(DELTA_NOV_2, period=was)
+    after = replace(before, period=now, tables={"files": TableInfo(1, "append")})
+
+    assert check(manifest([before]), manifest([after])) == []
 
 
 # Together
