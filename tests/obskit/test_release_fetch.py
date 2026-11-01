@@ -1,5 +1,6 @@
 import dataclasses
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -419,25 +420,33 @@ def test_missing_state_asset_refuses(gh, fake, tmp_path, workdir):
     assert downloads(fake) == [MANIFEST], "every asset is found before any download"
 
 
-class Corrupting:
-    """A transport that passes each request to `fake`, but flips the first byte of
-    every download of the asset `name`."""
+class Rewriting:
+    """A transport that passes each request to `fake`, but replaces the bytes of
+    every download of the asset `name` with `rewrite(bytes)`."""
 
-    def __init__(self, fake: FakeGitHub, name: str) -> None:
+    def __init__(
+        self, fake: FakeGitHub, name: str, rewrite: Callable[[bytes], bytes]
+    ) -> None:
         self.fake = fake
         self.url = DOWNLOADS + name
+        self.rewrite = rewrite
 
     def request(self, method, url, headers, body):
         status, reply_headers, data = self.fake.request(method, url, headers, body)
         if url == self.url:
-            data = bytes([data[0] ^ 0xFF]) + data[1:]
+            data = self.rewrite(data)
         return status, reply_headers, data
+
+
+def flip_first_byte(data: bytes) -> bytes:
+    return bytes([data[0] ^ 0xFF]) + data[1:]
 
 
 def test_downloaded_bytes_are_checked(gh, fake, tmp_path, workdir):
     seed(gh, fake, build(tmp_path, "v1", STATE).files)
     # The listed digest matches the manifest, and the bytes that arrive do not.
-    corrupted = GitHub(REPO, TOKEN, transport=Corrupting(fake, STATE), sleep=no_sleep)
+    corrupting = Rewriting(fake, STATE, flip_first_byte)
+    corrupted = GitHub(REPO, TOKEN, transport=corrupting, sleep=no_sleep)
 
     with pytest.raises(PriorStateError, match=STATE):
         fetch_prior(corrupted, STREAM, workdir, bootstrap=False)
@@ -446,26 +455,80 @@ def test_downloaded_bytes_are_checked(gh, fake, tmp_path, workdir):
 
 
 class Undigested:
-    """A transport that passes each request to `fake`, but lists every asset with a
-    null digest, as GitHub does for an asset that it has no digest for."""
+    """A transport that passes each request to `fake`, but lists the asset `name`
+    with a null digest, as GitHub does for an asset that it has no digest for."""
 
-    def __init__(self, fake: FakeGitHub) -> None:
+    def __init__(self, fake: FakeGitHub, name: str) -> None:
         self.fake = fake
+        self.name = name
 
     def request(self, method, url, headers, body):
         status, reply_headers, data = self.fake.request(method, url, headers, body)
         if "/assets?" in url and status == 200:
-            listed = [{**asset, "digest": None} for asset in json.loads(data)]
+            listed = [
+                {**asset, "digest": None} if asset["name"] == self.name else asset
+                for asset in json.loads(data)
+            ]
             data = json.dumps(listed).encode()
         return status, reply_headers, data
 
 
 def test_an_asset_without_a_digest_is_not_trusted(gh, fake, tmp_path, workdir):
     seed(gh, fake, build(tmp_path, "v1", STATE).files)
-    undigested = GitHub(REPO, TOKEN, transport=Undigested(fake), sleep=no_sleep)
+    undigested = GitHub(REPO, TOKEN, transport=Undigested(fake, STATE), sleep=no_sleep)
 
     with pytest.raises(PriorStateError, match=STATE):
         fetch_prior(undigested, STREAM, workdir, bootstrap=False)
+
+    assert downloads(fake) == [MANIFEST], "no state is downloaded"
+
+
+def test_a_manifest_without_a_digest_is_not_trusted(gh, fake, tmp_path, workdir):
+    seed(gh, fake, build(tmp_path, "v1", STATE).files)
+    undigested = GitHub(
+        REPO, TOKEN, transport=Undigested(fake, MANIFEST), sleep=no_sleep
+    )
+
+    with pytest.raises(PriorStateError, match=MANIFEST):
+        fetch_prior(undigested, STREAM, workdir, bootstrap=False)
+
+    assert downloads(fake) == [], "the manifest is refused before it is downloaded"
+
+
+def test_fetch_prior_refuses_manifest_bytes_not_matching_listing(
+    gh, fake, tmp_path, workdir
+):
+    old = build(tmp_path, "old", STATE)
+    new = build(tmp_path, "new", STATE)
+    # Both publishes' states are in the release, so only the manifest's digest can
+    # tell that the manifest which arrives is not the one listed.
+    seed(
+        gh,
+        fake,
+        {
+            MANIFEST: old.files[MANIFEST],
+            STATE: old.files[STATE],
+            f"swap-next-{STATE}": new.files[STATE],
+        },
+    )
+    other = new.files[MANIFEST].read_bytes()
+    substituting = Rewriting(fake, MANIFEST, lambda _: other)
+    substituted = GitHub(REPO, TOKEN, transport=substituting, sleep=no_sleep)
+
+    with pytest.raises(PriorStateError, match=MANIFEST):
+        fetch_prior(substituted, STREAM, workdir, bootstrap=False)
+
+    assert downloads(fake) == [MANIFEST], "no state is downloaded"
+
+
+def test_fetch_prior_refuses_foreign_manifest(gh, fake, tmp_path, workdir):
+    published = build(tmp_path, "v1", STATE)
+    foreign = dataclasses.replace(published.manifest, stream="other")
+    published.files[MANIFEST].write_text(dumps(foreign), encoding="utf-8")
+    seed(gh, fake, published.files)
+
+    with pytest.raises(PriorStateError, match="other"):
+        fetch_prior(gh, STREAM, workdir, bootstrap=False)
 
     assert downloads(fake) == [MANIFEST], "no state is downloaded"
 
