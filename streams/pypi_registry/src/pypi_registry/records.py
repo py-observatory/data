@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 # strip_emails stays importable from this module, where it was first defined.
-from pypi_registry.emails import (
+from obskit.emails import (
     holds_address,
     is_mail_link,
     strip_emails,

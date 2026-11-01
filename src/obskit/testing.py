@@ -1,5 +1,7 @@
-"""Fakes for tests. FakeGitHub is the GitHub releases API and FakeHttp is a set of web
-pages that obskit.http reads, both held in memory."""
+"""Fakes for tests, and texts for tests to share. FakeGitHub is the GitHub releases API
+and FakeHttp is a set of web pages that obskit.http reads, both held in memory. The
+lists at the end are the texts that the tests of obskit.emails share with the tests of
+each stream that uses it."""
 
 import itertools
 import json
@@ -414,3 +416,91 @@ class FakeHttp:
             if entry.remaining == 0:
                 del entries[0]
         return entry.status, dict(entry.headers), entry.body
+
+
+# ---- Texts for the tests of obskit.emails, and of every stream that uses it.
+#
+# They are the forms of an email address that count as one, texts that look like an
+# address and are not one, and texts made to be slow to scrub. They are plain lists, and
+# this module imports no test framework: a test that parametrizes over HOSTILE_TEXTS
+# wraps each pair in `pytest.param(text, id=name)`.
+
+# Each of these is one whole address. The at is `@`, `%40` or `at` in a pair of
+# brackets, and a dot of the domain is `.` or `dot` in a pair of brackets.
+ADDRESS_FORMS = [
+    "jane%40x.org",
+    "JANE%40X.ORG",
+    "jane [at] x [dot] org",
+    "jane[at]x[dot]org",
+    "jane [ at ] x [ dot ] org",
+    "jane(at)x.org",
+    "jane (AT) mail (DOT) x (DOT) org",
+    "jane {at} x {dot} co {dot} uk",
+    "jane <at> x <dot> org",
+    "jane@x [dot] org",
+    # White space of any kind may stand around the brackets and inside them.
+    "jane [at] example\n[dot] com",
+    "jane [at] example\r\n[dot] com",
+    "jane\xa0[at]\xa0x\xa0[dot]\xa0org",
+    "jane [\nat\n] x [\xa0dot\xa0] org",
+]
+
+# Texts with an address that a line break or no-break spaces run through, each with what
+# is left of it once the address is taken out.
+WHITE_SPACE_TEXTS = [
+    (
+        "Copyright (c) 2020 Jane Doe <jane [at] example\n[dot] com>",
+        "Copyright (c) 2020 Jane Doe",
+    ),
+    (
+        "Copyright (c) 2020 Jane Doe <jane [at] example\r\n[dot] com>",
+        "Copyright (c) 2020 Jane Doe",
+    ),
+    ("broken, mail jane\xa0[at]\xa0x\xa0[dot]\xa0org", "broken, mail"),
+]
+
+# A `%40` with no name before it, as in the URL of a scoped npm package.
+NPM_URL = "https://www.npmjs.com/package/%40scope%2Fname"
+
+# None of these holds an address, so each is kept as it is.
+NOT_ADDRESSES = [
+    # Plain words cannot be told from prose.
+    "jane at x dot org",
+    "look at numpy dot product",
+    "jane AT x DOT org",
+    "Meet us [at] PyCon",  # no domain
+    "x [dot] org",  # no at
+    NPM_URL,
+]
+
+# Each of these can make a naive regular expression do work in proportion to the square
+# of the length, or worse: 20,000 characters took one a second or more, so 50,000 take
+# it several seconds. The code under test takes a few milliseconds, and the limit is a
+# second.
+LONG = 50_000
+
+# Each of these is a text and the name that a test report gives it.
+HOSTILE_TEXTS = [
+    # Two short texts come first. A pattern that can read one of them in more than one
+    # way takes seconds over it, as its work doubles or more with each repeat, so each
+    # fails within seconds when its safeguard is gone. Under such a pattern some of the
+    # long texts after them would never end, so these run first.
+    ("a@x" + " [dot]  " * 12, "a few bracketed dots two blanks apart"),
+    ("a@" + "b." * 24, "a few single letters after an at sign"),
+    ("a" * LONG, "one long word"),
+    (" " * LONG, "spaces"),
+    ("<" + "@" * LONG, "bracket then at signs"),
+    ("< " * (LONG // 2), "brackets and spaces"),
+    ("a@" * (LONG // 2), "repeated at signs"),
+    ("a@" + "b." * (LONG // 2), "domain of single letters"),
+    ("a." * (LONG // 2) + "@", "dotted word then at sign"),
+    (",".join(["a"] * (LONG // 2)), "commas"),
+    ("[at]" * (LONG // 4), "bracketed ats"),
+    ("a [at] " * (LONG // 7), "names and bracketed ats"),
+    ("a%40" * (LONG // 4), "names and encoded ats"),
+    ("a [at] " + "b [dot] " * (LONG // 8), "domain of bracketed dots"),
+    ("a(at)" + "b." * (LONG // 2), "bracketed at then single letters"),
+    ("[" * LONG, "opening brackets"),
+    ("[ " * (LONG // 2), "opening brackets and spaces"),
+    ("a [at]\n" * (LONG // 7), "names and bracketed ats, a line each"),
+]

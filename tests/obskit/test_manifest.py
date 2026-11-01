@@ -1,9 +1,12 @@
 import json
+import platform
 from dataclasses import FrozenInstanceError, fields, replace
+from datetime import UTC, datetime, timedelta, timezone
 from hashlib import sha256
 
 import pytest
 
+import obskit
 from obskit import manifest
 from obskit.manifest import (
     Asset,
@@ -12,7 +15,9 @@ from obskit.manifest import (
     TableInfo,
     Watermark,
     dumps,
+    instant,
     loads,
+    producer,
 )
 
 STATE = ("assets", 0)
@@ -677,3 +682,74 @@ NOT_MANIFESTS = [
 def test_rejects_text_that_is_not_a_manifest(text):
     with pytest.raises(ManifestError):
         loads(text)
+
+
+def test_producer_reads_the_workflow_environment(monkeypatch):
+    monkeypatch.setenv("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1234567890")
+
+    assert producer("py-observatory/data") == {
+        "repo": "py-observatory/data",
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+        "run_id": "1234567890",
+        "obskit": obskit.__version__,
+        "python": platform.python_version(),
+    }
+
+
+def test_producer_has_no_commit_or_run_outside_a_workflow(monkeypatch):
+    monkeypatch.delenv("GITHUB_SHA", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+
+    made = producer("py-observatory/data")
+
+    assert (made["repo"], made["commit"], made["run_id"]) == (
+        "py-observatory/data",
+        "",
+        "",
+    )
+
+
+def test_a_producer_is_one_that_loads_accepts(monkeypatch):
+    # What a run writes must be what the next run reads, or the stream could not go on
+    # from its own last manifest.
+    monkeypatch.setenv("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1234567890")
+    m = replace(sample(), producer=producer("py-observatory/data"))
+
+    assert loads(dumps(m)) == m
+
+
+def test_instant_refuses_a_naive_time():
+    with pytest.raises(ValueError, match="name its zone"):
+        instant(datetime(2026, 11, 3, 1, 2, 3))
+
+
+@pytest.mark.parametrize(
+    ("moment", "written"),
+    [
+        pytest.param(
+            datetime(2026, 11, 3, 1, 2, 3, tzinfo=UTC), "2026-11-03T01:02:03Z", id="utc"
+        ),
+        pytest.param(
+            datetime(2026, 11, 3, 1, 2, 3, 999_999, tzinfo=UTC),
+            "2026-11-03T01:02:03Z",
+            id="cut to the second, not rounded",
+        ),
+        pytest.param(
+            datetime(2026, 11, 3, 2, 2, 3, tzinfo=timezone(timedelta(hours=1))),
+            "2026-11-03T01:02:03Z",
+            id="another zone",
+        ),
+        pytest.param(
+            datetime(2026, 11, 2, 23, 30, tzinfo=timezone(timedelta(hours=-5))),
+            "2026-11-03T04:30:00Z",
+            id="a zone that moves the day",
+        ),
+    ],
+)
+def test_instant_is_utc_to_the_second(moment, written):
+    assert instant(moment) == written
+    # A manifest accepts it as the time that it was made.
+    m = replace(sample(), generated_at=instant(moment))
+    assert loads(dumps(m)) == m

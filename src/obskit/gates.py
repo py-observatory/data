@@ -2,8 +2,9 @@
 
 `check` compares the manifest of the last publish with the one about to go out, and
 returns every way that the new one falls short. A failure blocks the publish unless a
-person gives a reason to override it. This module only finds the failures: the
-stream's run applies the block and the override.
+person gives a reason to override it. This module finds the failures, and defines the
+`GateError` that a run raises to stop: the stream's run applies the block and the
+override.
 """
 
 import re
@@ -21,6 +22,16 @@ class GateFailure:
 
     rule: str  # cursor, data_through, closed-kept or rows
     detail: str  # what changed, in words for a person
+
+
+class GateError(RuntimeError):
+    """What the run would publish fails a check, so nothing was published to the
+    current release. `failures` lists each failure."""
+
+    def __init__(self, failures: list[GateFailure]) -> None:
+        self.failures = list(failures)
+        listed = "; ".join(f"{failure.rule}: {failure.detail}" for failure in failures)
+        super().__init__(f"nothing was published, because the run fails: {listed}")
 
 
 def check(

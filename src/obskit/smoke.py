@@ -19,7 +19,6 @@ that differs from the publish is reported and returns 1.
 import argparse
 import json
 import os
-import platform
 import sqlite3
 import sys
 import tempfile
@@ -27,9 +26,8 @@ from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
-import obskit
 from obskit.github import GitHub
-from obskit.manifest import Manifest, Watermark
+from obskit.manifest import Manifest, Watermark, producer
 from obskit.release import fetch_prior, prepare_asset, publish_current
 from obskit.tags import current_tag
 from obskit.zst import sha256_file
@@ -62,19 +60,6 @@ def _write_state(db: Path, counter: int) -> None:
         con.commit()
 
 
-def _producer(repo: str) -> dict[str, str]:
-    """Who made a publish: the repository, the commit and the workflow run (GITHUB_SHA
-    and GITHUB_RUN_ID, empty outside a workflow), and the versions of obskit and
-    Python."""
-    return {
-        "repo": repo,
-        "commit": os.environ.get("GITHUB_SHA", ""),
-        "run_id": os.environ.get("GITHUB_RUN_ID", ""),
-        "obskit": obskit.__version__,
-        "python": platform.python_version(),
-    }
-
-
 def run(gh: GitHub, workdir: Path, *, bootstrap: bool) -> int:
     """One smoke test in the empty directory `workdir`. Returns 0 when the release
     read back is what was published, and 1 when it differs.
@@ -97,7 +82,7 @@ def run(gh: GitHub, workdir: Path, *, bootstrap: bool) -> int:
     )
     manifest = Manifest(
         stream=STREAM,
-        producer=_producer(gh.repo),
+        producer=producer(gh.repo),
         generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         complete=True,
         coverage={},

@@ -8,7 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from email_texts import ADDRESSES, HOSTILE_TEXTS, NOT_ADDRESSES, WHITE_SPACE_TEXTS
+from obskit.testing import (
+    ADDRESS_FORMS,
+    HOSTILE_TEXTS,
+    NOT_ADDRESSES,
+    WHITE_SPACE_TEXTS,
+)
 from pypi_registry.simple import (
     ACCEPT,
     ROOT_URL,
@@ -430,7 +435,7 @@ def test_yanked_forms(changes, drop, yanked, reason):
     assert (info.yanked, info.yanked_reason) == (yanked, reason)
 
 
-@pytest.mark.parametrize("address", ["jane@x.org", "<jane@x.org>", *ADDRESSES])
+@pytest.mark.parametrize("address", ["jane@x.org", "<jane@x.org>", *ADDRESS_FORMS])
 def test_a_yank_reason_that_is_only_an_address_leaves_the_file_yanked_with_no_reason(
     address,
 ):
@@ -438,7 +443,7 @@ def test_a_yank_reason_that_is_only_an_address_leaves_the_file_yanked_with_no_re
     assert (info.yanked, info.yanked_reason) == (True, None)
 
 
-@pytest.mark.parametrize("address", ["jane@x.org", *ADDRESSES])
+@pytest.mark.parametrize("address", ["jane@x.org", *ADDRESS_FORMS])
 def test_a_yank_reason_loses_an_address_of_any_form(address):
     info = parsed_file({"yanked": f"broken, mail {address}"})
     assert (info.yanked, info.yanked_reason) == (True, "broken, mail")
@@ -457,7 +462,9 @@ def test_a_yank_reason_that_only_looks_like_an_address_is_kept(text):
     assert parsed_file({"yanked": text}).yanked_reason == text
 
 
-@pytest.mark.parametrize("text", HOSTILE_TEXTS)
+@pytest.mark.parametrize(
+    "text", [pytest.param(text, id=name) for text, name in HOSTILE_TEXTS]
+)
 def test_reading_a_yank_reason_takes_time_in_proportion_to_its_length(text):
     raw = body(page_document({"files": [file_entry({"yanked": text})]}))
     started = time.perf_counter()

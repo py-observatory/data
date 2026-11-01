@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import TypeGuard
 from urllib.parse import quote
 
-from pypi_registry.emails import without_addresses
+from obskit.emails import without_addresses
 from pypi_registry.names import (
     canonical_name,
     canonical_version,

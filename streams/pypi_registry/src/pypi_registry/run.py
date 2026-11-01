@@ -62,7 +62,6 @@ that went on would publish over a month that its releases cannot restore.
 import argparse
 import json
 import os
-import platform
 import shutil
 import sqlite3
 import sys
@@ -75,11 +74,19 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-import obskit
-from obskit.gates import GateFailure, check
+from obskit.gates import GateError, GateFailure, check
 from obskit.github import GitHub
 from obskit.http import Http
-from obskit.manifest import Asset, Manifest, ManifestError, Watermark, dumps, loads
+from obskit.manifest import (
+    Asset,
+    Manifest,
+    ManifestError,
+    Watermark,
+    dumps,
+    instant,
+    loads,
+    producer,
+)
 from obskit.release import (
     PriorStateError,
     add_create_once,
@@ -151,16 +158,6 @@ class StaleRootError(RuntimeError):
     """The Simple API root is older than the state: its serial is below the cursor."""
 
 
-class GateError(RuntimeError):
-    """What the run would publish fails a check, so nothing was published to the
-    current release. `failures` lists each failure."""
-
-    def __init__(self, failures: list[GateFailure]) -> None:
-        self.failures = list(failures)
-        listed = "; ".join(f"{failure.rule}: {failure.detail}" for failure in failures)
-        super().__init__(f"nothing was published, because the run fails: {listed}")
-
-
 @dataclass(frozen=True)
 class RunReport:
     """What a run did.
@@ -184,14 +181,6 @@ class RunReport:
     swept: int
     remaining: int
     gate_failures: list[GateFailure]
-
-
-def _instant(now: datetime) -> str:
-    """`now` as a manifest writes a time, in UTC to the second. Raises ValueError for a
-    time that names no zone, which could be any of them."""
-    if now.tzinfo is None:
-        raise ValueError(f"the time of a run must name its zone, and {now} does not")
-    return now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _stream_toml() -> dict:
@@ -605,20 +594,6 @@ def _prepare_current(workdir: Path, today: date) -> tuple[list[Path], list[Asset
     return [state[0], delta[0]], [state[1], delta[1]]
 
 
-def _producer(repo: str) -> dict[str, str]:
-    """Who made a publish: the repository published to, which `main` takes from
-    GITHUB_REPOSITORY, the commit and the workflow run (GITHUB_SHA and GITHUB_RUN_ID),
-    and the versions of obskit and Python. The commit and the run are empty outside a
-    workflow."""
-    return {
-        "repo": repo,
-        "commit": os.environ.get("GITHUB_SHA", ""),
-        "run_id": os.environ.get("GITHUB_RUN_ID", ""),
-        "obskit": obskit.__version__,
-        "python": platform.python_version(),
-    }
-
-
 def _manifest(
     repo: str,
     prior: Manifest | None,
@@ -637,7 +612,7 @@ def _manifest(
     series breaks, corrections and overrides go on from the prior manifest."""
     return Manifest(
         stream=STREAM,
-        producer=_producer(repo),
+        producer=producer(repo),
         generated_at=moment,
         complete=coverage["remaining"] == 0 and coverage["unswept"] == 0,
         coverage=coverage,
@@ -836,7 +811,7 @@ def run_once(
     """
     deadline = clock() + max_seconds
     requests = http.requests
-    moment = _instant(now)
+    moment = instant(now)
     today = now.astimezone(UTC).date()
     prior = fetch_prior(gh, STREAM, workdir, bootstrap=bootstrap)
     if prior is None:
@@ -981,7 +956,7 @@ def sweep(
     """
     deadline = clock() + max_seconds
     requests = http.requests
-    moment = _instant(now)
+    moment = instant(now)
     today = now.astimezone(UTC).date()
     prior = fetch_prior(gh, STREAM, workdir, bootstrap=False)
     if prior is None:

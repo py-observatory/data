@@ -6,16 +6,21 @@ raises ManifestError for an unknown key, a missing key or a bad value. One allow
 a key whose field has a default may be left out and takes that default, so a field
 added later with a default does not break the manifests already published.
 `schema_version` is always required, because it says what the rest of the text means.
-`dumps` writes every key.
+`dumps` writes every key. `producer` and `instant` make the values that every stream
+gives `producer` and `generated_at`.
 """
 
 import json
+import os
+import platform
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from functools import partial
 from typing import TYPE_CHECKING
+
+import obskit
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -88,6 +93,28 @@ def dumps(m: Manifest) -> str:
     """The manifest as JSON with sorted keys, a 2-space indent and a trailing newline,
     so equal manifests give identical text."""
     return json.dumps(asdict(m), sort_keys=True, indent=2) + "\n"
+
+
+def instant(now: datetime) -> str:
+    """`now` as a manifest writes a time, in UTC to the second. Raises ValueError for a
+    time that names no zone, which could be any of them."""
+    if now.tzinfo is None:
+        raise ValueError(f"the time of a run must name its zone, and {now} does not")
+    return now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def producer(repo: str) -> dict[str, str]:
+    """Who made a publish: the repository published to, which a stream's `main` takes
+    from GITHUB_REPOSITORY, the commit and the workflow run (GITHUB_SHA and
+    GITHUB_RUN_ID), and the versions of obskit and Python. The commit and the run are
+    empty outside a workflow."""
+    return {
+        "repo": repo,
+        "commit": os.environ.get("GITHUB_SHA", ""),
+        "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+        "obskit": obskit.__version__,
+        "python": platform.python_version(),
+    }
 
 
 def _bad(where: str, key: str, expected: str, value: object) -> ManifestError:
