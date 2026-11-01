@@ -6,7 +6,8 @@ never replaced, so two rules hold for every record:
 
 - It has no README text. It has facts of the README instead: a fingerprint, the length
   in bytes, the number of words and the format.
-- It has no email address. The names of people are kept.
+- It has no email address, written plainly or hidden as in `jane [at] x [dot] org`.
+  The names of people are kept.
 
 A reply is data from outside. It is read as JSON and never run, and a value of the wrong
 shape raises ValueError: a guess at a value would be stored as a fact. Keys that this
@@ -15,10 +16,16 @@ module does not name are ignored, because the API gains keys over time.
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+# strip_emails stays importable from this module, where it was first defined.
+from pypi_registry.emails import (
+    holds_address,
+    is_mail_link,
+    strip_emails,
+    without_addresses,
+)
 from pypi_registry.names import canonical_version
 from pypi_registry.simple import _refuse
 
@@ -68,24 +75,6 @@ RECORD_COLUMNS: tuple[str, ...] = (
 # What a message calls the document that a record is made from.
 _WHAT = "a release's JSON"
 
-# `<name@host>`: brackets with an address in them and nothing else that is a bracket.
-# The text before the first @ cannot hold an @, so each bracket is read in one pass. A
-# text of many `<` and `@` would otherwise be read again from each of them.
-_BRACKETED_ADDRESS = re.compile(r"<[^<>@]*@[^<>]*>")
-
-# An email address: a name of letters, digits and `._%+-`, an `@`, and a domain that
-# ends in a dot and two letters or more. `\w` takes the letters of every script, so an
-# address in another script goes whole and leaves no part of itself behind.
-#
-# The lookbehind makes a match start where a name starts. Without it, every letter of a
-# long word is tried as a start, the word is read to its end from each, and a text of
-# 50,000 letters and no address takes several seconds.
-_ADDRESS = r"(?<![\w.%+-])[\w.%+-]+@[\w.-]+\.[^\W\d_]{2,}"
-_HAS_ADDRESS = re.compile(_ADDRESS)
-# An address with the brackets around it and the spaces before it. The first lookbehind
-# is for the same reason as the one above, for a long run of spaces.
-_REMOVAL = re.compile(rf"(?<![ \t])[ \t]*(?:<\s*{_ADDRESS}\s*>|{_ADDRESS})")
-
 
 @dataclass(frozen=True)
 class ReadmeFacts:
@@ -125,51 +114,6 @@ def readme_facts(description: str | None, content_type: str | None) -> ReadmeFac
     )
 
 
-def strip_emails(value: str | None) -> str | None:
-    """The names in a field of people, with every email address taken out.
-
-    A field such as `author_email` holds `Name <address>` entries or bare addresses,
-    separated by commas. An address in brackets goes, and so does any word that holds an
-    `@`. The text of each entry that is left is trimmed of spaces and quotes, an entry
-    with nothing left is dropped, and the rest are joined with ", ". With nothing left
-    the result is None. It never holds an `@`.
-    """
-    if value is None:
-        return None
-    names = []
-    for entry in _BRACKETED_ADDRESS.sub(" ", value).split(","):
-        words = [word for word in entry.split() if "@" not in word]
-        name = " ".join(words).strip(" \"'")
-        if name:
-            names.append(name)
-    return ", ".join(names) or None
-
-
-def _without_addresses(text: str | None) -> str | None:
-    """`text` with every email address taken out, with the brackets around it and the
-    spaces before it, and then trimmed. A text with no address comes back as it was.
-    None comes back for a text that is empty or that nothing is left of.
-
-    Taking an address out can join the text on either side into another address:
-    `me@<a@b.cc>x.org` leaves `me@x.org`. Only a text written to do that looks like
-    this, so it is dropped whole, and what comes back never holds an address. Taking
-    out what is left would make the work grow with how deeply a text nests.
-    """
-    if text is None:
-        return None
-    cleaned, removed = _REMOVAL.subn("", text)
-    if removed:
-        text = cleaned.strip()
-        if _HAS_ADDRESS.search(text):
-            return None
-    return text or None
-
-
-def _is_mail_link(url: str) -> bool:
-    """Whether `url` is a `mailto:` link. A scheme is not case sensitive."""
-    return url.lstrip().lower().startswith("mailto:")
-
-
 def _compact(value: object, *, sort_keys: bool = False) -> str:
     """`value` as JSON with no space and no escape of a character outside ASCII."""
     return json.dumps(
@@ -195,7 +139,7 @@ def _required_text(info: dict, key: str) -> str:
 
 def _free_text(info: dict, key: str) -> str | None:
     """The string at `key` of `info`, with any email address taken out of it."""
-    return _without_addresses(_optional_text(info, key))
+    return without_addresses(_optional_text(info, key))
 
 
 def _link(info: dict, key: str) -> str | None:
@@ -204,7 +148,7 @@ def _link(info: dict, key: str) -> str | None:
     out of `git+ssh://git@github.com/foo/bar.git` leaves `git+ssh:///foo/bar.git`,
     which points nowhere, and a record is never replaced."""
     url = _optional_text(info, key)
-    if url is None or _is_mail_link(url) or _HAS_ADDRESS.search(url):
+    if url is None or is_mail_link(url) or holds_address(url):
         return None
     return url or None
 
@@ -234,9 +178,7 @@ def _project_urls(info: dict) -> str | None:
     kept = {
         label: url
         for label, url in value.items()
-        if not (
-            _is_mail_link(url) or _HAS_ADDRESS.search(label) or _HAS_ADDRESS.search(url)
-        )
+        if not (is_mail_link(url) or holds_address(label) or holds_address(url))
     }
     return _compact(kept, sort_keys=True) if kept else None
 
@@ -302,9 +244,10 @@ def release_record(
     go through `strip_emails`. The summary, licence, keywords, platform and yank reason
     lose any email address they hold. A home page or download URL is None when it is a
     `mailto:` link or holds an address, and a project URL is left out when it is a mail
-    link or when its link or label holds an address. Requirements are kept as they are:
-    `name @ url` and a VCS URL are not contact addresses. A text that nothing is left of
-    is None.
+    link or when its link or label holds an address. An address may have `%40` or `at`
+    in brackets for its `@`, and `dot` in brackets for a dot of its domain. Requirements
+    are kept as they are: `name @ url` and a VCS URL are not contact addresses. A text
+    that nothing is left of is None.
 
     Lists are compact JSON, and so are the project URLs, with their keys in order. An
     empty list or object is None. `uploaded_at` is the earliest upload time of a file,
@@ -356,7 +299,7 @@ def release_record(
         "readme_words": facts.words,
         "readme_content_type": facts.content_type,
         "yanked": yanked,
-        "yanked_reason": _without_addresses(yanked_reason),
+        "yanked_reason": without_addresses(yanked_reason),
         "source": "json-api",
         "observed_at": observed_at,
     }

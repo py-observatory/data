@@ -12,6 +12,14 @@ from typing import Any, cast
 
 import pytest
 
+from email_texts import (
+    ADDRESSES,
+    HOSTILE_TEXTS,
+    NOT_ADDRESSES,
+    NPM_URL,
+    WHITE_SPACE_TEXTS,
+)
+from pypi_registry.emails import holds_address
 from pypi_registry.records import (
     README_PREFIX_BYTES,
     RECORD_COLUMNS,
@@ -219,6 +227,8 @@ def test_strip_emails_bare_address_only():
             "Jörg Müller <jörg@example.org>, 李雷 <lilei@example.cn>",
             "Jörg Müller, 李雷",
         ),
+        # An address goes whole when a line break runs through it.
+        ("Jane Doe <jane [at] example\n[dot] com>", "Jane Doe"),
     ],
 )
 def test_strip_emails_forms(value, expected):
@@ -245,6 +255,27 @@ def test_strip_emails_forms(value, expected):
 def test_strip_emails_never_leaves_an_at_sign(value):
     result = strip_emails(value)
     assert result is None or "@" not in result
+
+
+@pytest.mark.parametrize("address", ADDRESSES)
+def test_strip_emails_takes_out_an_address_of_any_form(address):
+    assert strip_emails(address) is None
+    assert strip_emails(f"<{address}>") is None
+    assert strip_emails(f"Jane Doe <{address}>") == "Jane Doe"
+    assert strip_emails(f"Jane Doe {address}") == "Jane Doe"
+    assert strip_emails(f"Jane ({address})") == "Jane"
+    assert strip_emails(f"Jane<{address}>Doe") == "Jane Doe"
+    assert strip_emails(f"Jane Doe <{address}>, Bob {address}") == "Jane Doe, Bob"
+
+
+@pytest.mark.parametrize("text", NOT_ADDRESSES)
+def test_strip_emails_keeps_a_name_that_only_looks_like_an_address(text):
+    assert strip_emails(text) == text
+
+
+@pytest.mark.parametrize(("text", "kept"), WHITE_SPACE_TEXTS)
+def test_strip_emails_takes_out_an_address_with_white_space_of_any_kind(text, kept):
+    assert strip_emails(text) == kept
 
 
 # ---- the record's columns
@@ -540,6 +571,22 @@ def test_release_record_person_fields():
     assert record["maintainer_email_names"] is None
 
 
+@pytest.mark.parametrize("address", ADDRESSES)
+def test_release_record_person_fields_lose_an_address_of_any_form(address):
+    record = record_of(
+        {
+            "author": f"Jane Doe <{address}>",
+            "author_email": f"Jane Doe <{address}>, Bob {address}",
+            "maintainer": address,
+            "maintainer_email": f"Bob ({address})",
+        }
+    )
+    assert record["author"] == "Jane Doe"
+    assert record["author_email_names"] == "Jane Doe, Bob"
+    assert record["maintainer"] is None
+    assert record["maintainer_email_names"] == "Bob"
+
+
 def test_release_record_scrubs_emails_from_free_text():
     record = record_of(
         {
@@ -568,6 +615,50 @@ def test_release_record_scrubs_every_free_text_column(column):
     assert record[column] == "see for more"
 
 
+@pytest.mark.parametrize("column", FREE_TEXT_COLUMNS)
+@pytest.mark.parametrize("address", ADDRESSES)
+def test_release_record_takes_an_address_of_any_form_out_of_free_text(column, address):
+    assert record_of({column: f"see {address} for more"})[column] == "see for more"
+    assert record_of({column: f"Copyright Jane <{address}>"})[column] == (
+        "Copyright Jane"
+    )
+    assert record_of({column: address})[column] is None
+
+
+@pytest.mark.parametrize("column", FREE_TEXT_COLUMNS)
+@pytest.mark.parametrize(("text", "kept"), WHITE_SPACE_TEXTS)
+def test_release_record_takes_out_an_address_with_white_space_of_any_kind(
+    column, text, kept
+):
+    assert record_of({column: text})[column] == kept
+
+
+@pytest.mark.parametrize("column", FREE_TEXT_COLUMNS)
+@pytest.mark.parametrize("text", NOT_ADDRESSES)
+def test_release_record_keeps_free_text_that_only_looks_like_an_address(column, text):
+    assert record_of({column: text})[column] == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "jane [at) x.org",
+        "jane (at] x.org",
+        "jane {at> x.org",
+        "jane <at} x.org",
+        "jane%40x [dot) org",
+        # The word is not alone in its brackets.
+        "jane [at home] x.org",
+        "jane [that] x.org",
+    ],
+)
+def test_a_word_that_is_not_alone_in_a_matching_pair_of_brackets_makes_no_address(
+    text,
+):
+    assert record_of({"summary": text})["summary"] == text
+    assert strip_emails(text) == text
+
+
 @pytest.mark.parametrize("column", URL_COLUMNS)
 @pytest.mark.parametrize(
     ("url", "expected"),
@@ -591,6 +682,28 @@ def test_release_record_drops_a_page_or_a_download_that_holds_an_address(
     assert record_of({column: url})[column] == expected
 
 
+@pytest.mark.parametrize("column", URL_COLUMNS)
+@pytest.mark.parametrize("address", ADDRESSES)
+def test_release_record_drops_a_page_or_a_download_with_an_address_of_any_form(
+    column, address
+):
+    assert record_of({column: address})[column] is None
+    url = f"https://example.org/contact?to={address}"
+    assert record_of({column: url})[column] is None
+
+
+def test_release_record_keeps_a_url_with_a_percent_40_and_no_name_before_it():
+    record = record_of(
+        {
+            "home_page": NPM_URL,
+            "download_url": NPM_URL,
+            "project_urls": {"npm": NPM_URL},
+        }
+    )
+    assert (record["home_page"], record["download_url"]) == (NPM_URL, NPM_URL)
+    assert json.loads(record["project_urls"]) == {"npm": NPM_URL}
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -610,6 +723,8 @@ def test_release_record_drops_a_page_or_a_download_that_holds_an_address(
             "Copyright 2020 Jane\nAll rights reserved.",
         ),
         ("one  two  jane@x.org  three", "one  two  three"),
+        # A line break before an address stays, so taking it out never joins two lines.
+        ("one\njane@x.org two", "one\n two"),
         # An address in any script goes whole, and leaves no part of itself behind: a
         # Latin name with a diaeresis, a domain with one, and a Cyrillic top-level domain.
         ("contact jörg@example.org", "contact"),
@@ -666,6 +781,19 @@ def test_release_record_project_urls_drop_contact_entries():
     )
 
 
+@pytest.mark.parametrize("address", ADDRESSES)
+def test_release_record_project_urls_drop_an_entry_with_an_address_of_any_form(
+    address,
+):
+    docs = {"Docs": "https://docs.example.org/"}
+    in_label = {address: "https://example.org/jane", **docs}
+    in_url = {"Contact": f"https://example.org/contact?to={address}", **docs}
+    for urls in (in_label, in_url):
+        assert record_of({"project_urls": urls})["project_urls"] == (
+            '{"Docs":"https://docs.example.org/"}'
+        )
+
+
 def test_release_record_project_urls_with_only_contact_entries_become_none():
     assert (
         record_of({"project_urls": {"Contact": "mailto:jane@x.org"}})["project_urls"]
@@ -698,6 +826,25 @@ def test_no_field_of_a_record_keeps_an_address_whatever_the_text():
         "mailto:",
         "é",
         "рф",  # Cyrillic
+        "me%40",
+        "me [at] ",
+        "jane%40x.org",
+        "jane [at] x [dot] org",
+        "%40",
+        "[at]",
+        "(at)",
+        "{at}",
+        "<at>",
+        "[dot]",
+        "(dot)",
+        "{dot}",
+        "<dot>",
+        "AT",
+        "Dot",
+        "[",
+        "]",
+        "(",
+        ")",
     ]
     chooser = random.Random(20261101)
     people = ("author", "author_email", "maintainer", "maintainer_email")
@@ -709,6 +856,7 @@ def test_no_field_of_a_record_keeps_an_address_whatever_the_text():
         record = record_of(changes)
         for column in SCRUBBED_COLUMNS:
             assert not ADDRESS.search(record[column] or ""), (column, text)
+            assert not holds_address(record[column] or ""), (column, text)
         for column in (
             "author",
             "author_email_names",
@@ -716,8 +864,10 @@ def test_no_field_of_a_record_keeps_an_address_whatever_the_text():
             "maintainer_email_names",
         ):
             assert "@" not in (record[column] or ""), (column, text)
+            assert not holds_address(record[column] or ""), (column, text)
         for label, url in json.loads(record["project_urls"]).items():
             assert not ADDRESS.search(label) and not ADDRESS.search(url), text
+            assert not holds_address(label) and not holds_address(url), text
             assert not url.lower().startswith("mailto:"), text
 
 
@@ -886,35 +1036,8 @@ def test_release_record_values_are_plain_data_that_sqlite_binds_by_column():
 
 # ---- a hostile text takes no longer than its length
 
-# Each of these makes a naive regular expression do work in proportion to the square of
-# the length: 20,000 characters took one a second or more, so 50,000 take it several
-# seconds. The code under test takes a few milliseconds, and the limit is a second.
-LONG = 50_000
 
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "a" * LONG,
-        " " * LONG,
-        "<" + "@" * LONG,
-        "< " * (LONG // 2),
-        "a@" * (LONG // 2),
-        "a@" + "b." * (LONG // 2),
-        "a." * (LONG // 2) + "@",
-        ",".join(["a"] * (LONG // 2)),
-    ],
-    ids=[
-        "one long word",
-        "spaces",
-        "bracket then at signs",
-        "brackets and spaces",
-        "repeated at signs",
-        "domain of single letters",
-        "dotted word then at sign",
-        "commas",
-    ],
-)
+@pytest.mark.parametrize("text", HOSTILE_TEXTS)
 def test_scrubbing_takes_time_in_proportion_to_the_text(text):
     started = time.perf_counter()
     record_of(

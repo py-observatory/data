@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import TypeGuard
 from urllib.parse import quote
 
+from pypi_registry.emails import without_addresses
 from pypi_registry.names import (
     canonical_name,
     canonical_version,
@@ -67,7 +68,7 @@ class FileInfo:
     upload_time: str | None  # as the page writes it
     requires_python: str | None  # as the page writes it, never parsed
     yanked: bool
-    yanked_reason: str | None  # None for a file that is not yanked or has no reason
+    yanked_reason: str | None  # with no email address; None if not yanked or no reason
     has_metadata: bool  # the file's core metadata is served beside it
     has_provenance: bool  # the file has a provenance (attestation) link
 
@@ -191,11 +192,14 @@ def _read_status(document: dict, what: str) -> tuple[str, str | None]:
 def _read_yanked(value: object, path: str, what: str) -> tuple[bool, str | None]:
     """Whether a file is yanked, and why. PEP 691 gives a bool, or else a non-empty
     string, which means yanked and is the reason. The empty string is refused: PEP 691
-    would read it as not yanked, and PEP 592's HTML form as yanked with no reason."""
+    would read it as not yanked, and PEP 592's HTML form as yanked with no reason.
+
+    A person wrote the reason, so it loses any email address, as a release's does. A
+    reason that nothing is left of is None, and the file is still yanked."""
     if isinstance(value, bool):
         return value, None
     if isinstance(value, str) and value:
-        return True, value
+        return True, without_addresses(value)
     raise _refuse(what, path, "a boolean or a non-empty reason string", value)
 
 
