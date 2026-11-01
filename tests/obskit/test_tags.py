@@ -69,10 +69,21 @@ def test_tag_shapes(tag, expected):
         ("v2026-11-02\n", False),
         ("catalog-v2026-11-02", False),
         ("pypi-registry-current", False),
+        # The catalog has no year release, though every other stream does.
+        ("catalog-year-2026", False),
     ],
 )
 def test_catalog_tags(tag, expected):
     assert accepted("catalog", tag) is expected
+
+
+def test_catalog_tag_error_names_only_the_catalogs_shapes():
+    with pytest.raises(TagError) as caught:
+        check_tag("catalog", "catalog-year-2026")
+
+    message = str(caught.value)
+    assert "catalog-current, catalog-month-YYYY-MM or vYYYY-MM-DD" in message
+    assert "year" not in message.replace("catalog-year-2026", "")
 
 
 @pytest.mark.parametrize(

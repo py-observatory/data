@@ -53,13 +53,20 @@ def _schema_sql(db: Path) -> list[str]:
         ]
 
 
-def consolidate(inputs: list[Path], dst: Path) -> dict[str, int]:
+def consolidate(
+    inputs: list[Path], dst: Path, *, remove_inputs: bool = False
+) -> dict[str, int]:
     """Merge databases that share one schema into the new database `dst`.
 
     Returns the row count of each table, which equals its sum over `inputs`. Raises
     FileExistsError if `dst` exists (it is left alone), ValueError for no inputs or
     for schemas that differ, and sqlite3.IntegrityError when a key repeats or the
     merge loses a row. Once the build starts, any failure removes `dst`.
+
+    With `remove_inputs`, each input is deleted as soon as its rows are merged, so
+    that the disk never holds every input and the whole result at once. The inputs
+    are counted before any is deleted, so the check of the merged counts is the
+    same. An input that was deleted stays deleted when a later step fails.
     """
     if not inputs:
         raise ValueError("consolidate needs at least one input database")
@@ -88,6 +95,8 @@ def consolidate(inputs: list[Path], dst: Path) -> dict[str, int]:
                     con.execute(f"INSERT INTO main.{quoted} SELECT * FROM src.{quoted}")
                 con.execute("COMMIT")
                 con.execute("DETACH DATABASE src")
+                if remove_inputs:
+                    path.unlink()
             counts = _counts(con)
             if counts != expected:
                 differ = "; ".join(

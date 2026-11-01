@@ -300,6 +300,8 @@ def test_fetch_prior_downloads_and_expands_state(gh, fake, tmp_path, workdir):
     assert prior == manifest
     assert expanded(workdir, STATE) == b"state\n" * 1000
     assert expanded(workdir, DELTA) == b"delta\n" * 1000
+    # Unlike fetch_assets, it keeps the downloads: a run copies these very bytes into
+    # a create-once release.
     assert (workdir / STATE).read_bytes() == state_file.read_bytes()
     assert (workdir / DELTA).read_bytes() == delta_file.read_bytes()
     assert downloads(fake) == [MANIFEST, STATE, DELTA]
@@ -725,7 +727,9 @@ def test_fetch_assets_verifies_and_expands(gh, fake, tmp_path, workdir):
             assert path.read_bytes() == month.files[name].read_bytes()
         else:
             assert path.read_bytes() == f"{name}\n".encode() * 1000
-            assert (workdir / name).read_bytes() == month.files[name].read_bytes()
+    # A download goes once its expansion checks, so that a month of them does not
+    # take the disk twice over. The JSON is its own expansion, and stays.
+    assert contents(workdir) == sorted(path.name for path in paths)
     # Each release is looked up once, and only the assets asked for are downloaded,
     # each once. Nothing is written.
     tags = [url for method, url, _ in fake.calls if "/releases/tags/" in url]

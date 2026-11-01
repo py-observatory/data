@@ -119,7 +119,9 @@ def fetch_prior(
 
     Each state asset that the manifest puts in `<stream>-current` is downloaded to
     `workdir/<name>` and expanded to `workdir/<name without .zst>`, and both files are
-    checked against the manifest. The release itself is never changed.
+    checked against the manifest. Both stay: a run copies the downloaded bytes into a
+    create-once release, where compressing again could give other bytes. The release
+    itself is never changed.
 
     Returns None only when `bootstrap` is set and GitHub answers HTTP 404 for
     `<stream>-current`. Raises PriorStateError when that release is missing without
@@ -150,7 +152,7 @@ def fetch_prior(
     # Find every asset before downloading any, so that a missing one fails fast.
     sources = [_find_source(asset, listed) for asset in state]
     for asset, source in zip(state, sources, strict=True):
-        _fetch_asset(gh, asset, source, workdir)
+        _fetch_asset(gh, asset, source, workdir, keep_download=True)
     return manifest
 
 
@@ -160,8 +162,10 @@ def fetch_assets(gh: GitHub, assets: list[Asset], workdir: Path) -> list[Path]:
 
     Each asset is downloaded to `workdir/<name>` and expanded to `workdir/<name
     without .zst>`, and both files are checked against the entry, as `fetch_prior`
-    checks the state. A file that is not a `.zst` is checked as it is, and its own
-    path is returned. No release is changed.
+    checks the state. Then the download is deleted, before the next asset is
+    fetched: a month close fetches a month of deltas, and would otherwise hold each
+    one twice. A file that is not a `.zst` is checked as it is, and its own path is
+    returned. No release is changed.
 
     Every asset is found, by its tag and its name, before any is downloaded. Raises
     PriorStateError when a tag has no release (GitHub answers 404), when a release
@@ -194,7 +198,7 @@ def fetch_assets(gh: GitHub, assets: list[Asset], workdir: Path) -> list[Path]:
             )
         sources.append(source)
     return [
-        _fetch_asset(gh, asset, source, workdir)
+        _fetch_asset(gh, asset, source, workdir, keep_download=False)
         for asset, source in zip(assets, sources, strict=True)
     ]
 
@@ -281,14 +285,17 @@ def add_create_once(gh: GitHub, stream: str, tag: str, files: list[Path]) -> lis
 
     Before any request, it raises TagError unless `tag` is a tag of `stream`, and
     ValueError for the stream's `-current` tag, which is swapped and never
-    create-once. Before uploading, it raises AssetLimitError if the release would
-    hold MAX_ASSETS assets, and warns from WARN_ASSETS.
+    create-once, and for no files, which would still create the release. Before
+    uploading, it raises AssetLimitError if the release would hold MAX_ASSETS assets,
+    and warns from WARN_ASSETS.
     """
     check_tag(stream, tag)
     if tag == current_tag(stream):
         raise ValueError(
             f"{tag} is swapped on each publish, so it is never create-once"
         )
+    if not files:
+        raise ValueError(f"there is nothing to add to {tag}")
     _check_names(files)
     digests = {path.name: sha256_file(path) for path in files}
     try:
@@ -528,15 +535,18 @@ def _find_source(asset: Asset, listed: dict[str, dict]) -> dict:
     )
 
 
-def _fetch_asset(gh: GitHub, asset: Asset, source: dict, workdir: Path) -> Path:
+def _fetch_asset(
+    gh: GitHub, asset: Asset, source: dict, workdir: Path, *, keep_download: bool
+) -> Path:
     """Download the release asset `source`, which holds the manifest entry `asset`,
     and return the path of the checked file that it expands to.
 
     The download goes to `workdir/<name>` and must have the entry's `asset_sha256`. A
     `.zst` is expanded to `workdir/<name without .zst>`, which must have the entry's
-    `db_sha256`; any other file is checked against `db_sha256` as it is. Both files
-    are written afresh every time: a file already in `workdir` may be a partial one
-    left by a failed run, so it is never reused.
+    `db_sha256`, and the download is then deleted unless `keep_download` is set; any
+    other file is checked against `db_sha256` as it is. Both files are written afresh
+    every time: a file already in `workdir` may be a partial one left by a failed
+    run, so it is never reused.
     """
     packed = workdir / asset.name
     gh.download(source, packed)
@@ -555,4 +565,6 @@ def _fetch_asset(gh: GitHub, asset: Asset, source: dict, workdir: Path) -> Path:
             f"{asset.name} in {asset.tag} expands to sha256 {got}, but the manifest "
             f"gives it the db_sha256 {asset.db_sha256}"
         )
+    if expanded != packed and not keep_download:
+        packed.unlink()
     return expanded

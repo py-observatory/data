@@ -232,6 +232,61 @@ def test_consolidate_vacuums_the_result(tmp_path):
     assert page_count(out) == page_count(packed)
 
 
+def test_consolidate_keeps_its_inputs_by_default(tmp_path):
+    a = make_db(tmp_path / "a.db", SCHEMA, t=[(1, "a1")])
+    b = make_db(tmp_path / "b.db", SCHEMA, t=[(2, "b2")])
+    before = {path: path.read_bytes() for path in (a, b)}
+
+    consolidate([a, b], tmp_path / "out.db")
+
+    assert {path: path.read_bytes() for path in (a, b)} == before
+
+
+def test_consolidate_can_remove_each_input_once_merged(tmp_path):
+    inputs = [
+        make_db(tmp_path / f"day-{day}.db", SCHEMA, t=[(day, "a"), (day + 3, "b")])
+        for day in range(3)
+    ]
+    out = tmp_path / "out.db"
+
+    assert consolidate(inputs, out, remove_inputs=True) == {"t": 6}
+
+    assert list(tmp_path.iterdir()) == [out]
+    with closing(sqlite3.connect(out)) as con:
+        assert con.execute("SELECT k FROM t ORDER BY k").fetchall() == [
+            (k,) for k in range(6)
+        ]
+
+
+def test_consolidate_removes_only_the_inputs_merged_before_a_failure(tmp_path):
+    a = make_db(tmp_path / "a.db", SCHEMA, t=[(1, "x"), (2, "y")])
+    b = make_db(tmp_path / "b.db", SCHEMA, t=[(2, "z"), (3, "w")])
+    out = tmp_path / "out.db"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        consolidate([a, b], out, remove_inputs=True)
+
+    # a was merged, and is gone for good: whoever retries fetches it again. b's merge
+    # failed, so b is left. The result is removed, as after any failure.
+    assert not a.exists()
+    assert b.exists()
+    assert list(tmp_path.glob("out.db*")) == []
+
+
+def test_consolidate_checks_counts_when_it_removes_inputs(tmp_path):
+    # Both inputs merge without an error and are removed, and the check of the
+    # counts still has what they held, because it counts them before removing any.
+    schema = "CREATE TABLE t (k INTEGER PRIMARY KEY ON CONFLICT IGNORE, v TEXT)"
+    a = make_db(tmp_path / "a.db", schema, t=[(1, "x")])
+    b = make_db(tmp_path / "b.db", schema, t=[(1, "y")])
+    out = tmp_path / "out.db"
+
+    with pytest.raises(sqlite3.IntegrityError, match=r"t: 1 rows, expected 2"):
+        consolidate([a, b], out, remove_inputs=True)
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_consolidate_a_month_of_inputs(tmp_path):
     # More inputs than SQLite lets one connection attach at once (10 by default).
     inputs = [

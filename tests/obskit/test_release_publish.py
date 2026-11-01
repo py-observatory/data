@@ -667,6 +667,14 @@ def test_create_once_refuses_foreign_tag(gh, fake, tmp_path):
     assert fake.calls == []
 
 
+def test_create_once_refuses_an_empty_list(gh, fake):
+    # With nothing to add, it would still create the release.
+    with pytest.raises(ValueError, match="nothing to add"):
+        add_create_once(gh, STREAM, MONTH, [])
+
+    assert fake.calls == []
+
+
 def fill(fake: FakeGitHub, created: dict, count: int) -> None:
     """Give the release `created` `count` small assets, sent straight to the fake so
     that no write pacing is involved."""
