@@ -39,9 +39,11 @@ PERMISSIONS = {
     ("tick.yml", "pypi-registry"): {"contents": "write", "issues": "write"},
     ("backfill.yml", "sweep"): {"contents": "write", "issues": "write"},
     ("backfill.yml", "redispatch"): {"actions": "write"},
-    REPORT_JOB: {"contents": "read", "issues": "write"},
+    REPORT_JOB: {"actions": "write", "contents": "read", "issues": "write"},
     ("smoke.yml", "smoke"): {"contents": "write", "issues": "write"},
 }
+# The jobs that dispatch a sweep: the next one, and one replaced while it waited.
+DISPATCH_JOBS = {("backfill.yml", "redispatch"), REPORT_JOB}
 REGISTRY_GROUP = {"group": "stream-pypi-registry", "cancel-in-progress": "false"}
 SWEEP_COMMAND = [
     *["uv", "run", "--package", "pypi-registry", "python", "-m", "pypi_registry"],
@@ -199,6 +201,29 @@ def step_limit(file: str, job: str, mentions: str) -> int:
     found = re.search(r"(?m)^(?: {8}|- )timeout-minutes:\s*(\d+)\s*(?:#.*)?$", step)
     assert found, f"{file}: the step with {mentions!r} has no timeout-minutes"
     return int(found[1])
+
+
+def step_if(step: str) -> str | None:
+    """The `if:` of a step, or None when it has none."""
+    found = re.search(r"(?m)^(?: {8}|- )if:\s*(.*?)\s*$", step)
+    return found[1] if found else None
+
+
+def evaluate(condition: str, values: dict[str, object]) -> bool:
+    """The `if:` of a job or a step, as Python, for `values`: the value of each status
+    function (`always()`, `success()`, `failure()`) and each context value (such as
+    `needs.sweep.result`) by its name. A context value that is not given is null, as an
+    output that was never set is. A condition with no status function is taken with
+    `success() &&` before it, as GitHub takes it."""
+    assert re.fullmatch(r"[\w\s().&|=!']+", condition), "only what GitHub evaluates"
+    if not re.search(r"\b(?:always|success|failure|cancelled)\(\)", condition):
+        condition = f"success() && ({condition})"
+    python = condition.replace("&&", " and ").replace("||", " or ")
+    python = re.sub(r"\b\w+\(\)", lambda call: repr(values[call[0]]), python)
+    python = re.sub(
+        r"\b(?:needs|steps)\.[\w.]+", lambda name: repr(values.get(name[0])), python
+    )
+    return eval(python, {"__builtins__": {}})
 
 
 # --- stand-ins for uv and gh, and a way to run shell against them ---
@@ -403,13 +428,17 @@ def test_only_the_jobs_that_need_a_permission_have_it():
     assert seen == set(PERMISSIONS)
     # The table is what the checks above hold the files to, so hold it to the point of
     # it: `contents: write` for the jobs that publish and `actions: write` for the
-    # dispatch, and for no other.
+    # jobs that dispatch, and for no other.
     writing = {
         job for job, got in PERMISSIONS.items() if got.get("contents") == "write"
     }
     assert writing == PUBLISH_JOBS
     dispatching = {job for job, got in PERMISSIONS.items() if "actions" in got}
-    assert dispatching == {("backfill.yml", "redispatch")}
+    assert dispatching == DISPATCH_JOBS
+    dispatches = {
+        (file, name) for file, name, body in all_jobs() if "gh workflow" in body
+    }
+    assert dispatches == DISPATCH_JOBS
 
 
 def test_registry_jobs_share_concurrency_group():
@@ -473,25 +502,47 @@ def test_backfill_redispatches_from_a_job_outside_the_group():
     assert not re.search(r"uses:\s*actions/checkout", redispatch)
 
 
+def test_a_sweep_says_in_its_first_step_that_it_started(tmp_path):
+    """A sweep that a newer run replaced while it waited for the group runs no step, so
+    it never says that it started. That is how the report job tells it from a sweep
+    that was cancelled while it ran."""
+    sweep = job_of("backfill.yml", "sweep")
+    first = steps(sweep)[0]
+    assert re.search(r"(?m)^(?: {8}|- )id:\s*started\s*$", first)
+    assert scalar(sweep, "started", 6) == "${{ steps.started.outputs.started }}"
+    [script] = run_scripts(first)
+    output = tmp_path / "output"
+    output.write_text("")
+
+    done, calls = run_step(tmp_path / "run", script, GITHUB_OUTPUT=str(output))
+
+    assert done.returncode == 0, done.stderr
+    assert output.read_text() == "started=true\n"
+    assert calls == []
+
+
 def test_nothing_dispatches_from_inside_a_concurrency_group():
     for file, name, body in all_jobs():
         if "gh workflow run" in body:
             assert entry(body, "concurrency", 4) is None, f"{file}: {name}"
 
 
-def dispatch(tmp_path: Path, **env: str):
-    """The redispatch job's script, run with stand-ins for gh and sleep."""
-    script = one_script("backfill.yml", "redispatch", "gh workflow run")
+def dispatch(tmp_path: Path, job: tuple[str, str], **env: str):
+    """The dispatch script of `job`, run with stand-ins for gh and sleep."""
+    script = one_script(*job, "gh workflow run")
     return run_step(tmp_path, script, stubs=("gh", "sleep"), **env)
 
 
-def test_redispatch_tries_the_dispatch_up_to_three_times(tmp_path):
+@pytest.mark.parametrize("job", sorted(DISPATCH_JOBS), ids=lambda job: job[1])
+def test_a_dispatch_is_tried_up_to_three_times(tmp_path, job):
     """A dispatch that fails once must not end a chain of some 78 sweeps."""
     command = ["gh", "workflow", "run", "backfill.yml", "-f", "task=sweep"]
     # How many calls of gh fail first, then the exit code, the calls of gh and of sleep.
     cases = {0: (0, 1, 0), 1: (0, 2, 1), 2: (0, 3, 2), 3: (1, 3, 2), 9: (1, 3, 2)}
     for failing, (status, tries, waits) in cases.items():
-        done, calls = dispatch(tmp_path / str(failing), STUB_FAIL_FIRST_GH=str(failing))
+        done, calls = dispatch(
+            tmp_path / str(failing), job, STUB_FAIL_FIRST_GH=str(failing)
+        )
         assert done.returncode == status, (failing, done.stderr)
         assert [call for call in calls if call[0] == "gh"] == [command] * tries, failing
         sleeps = [call for call in calls if call[0] == "sleep"]
@@ -504,6 +555,20 @@ def test_a_hung_dispatch_fails_its_step_before_its_job_times_out():
     count as cancelled."""
     job = int(scalar(job_of("backfill.yml", "redispatch"), "timeout-minutes", 4) or 0)
     assert step_limit("backfill.yml", "redispatch", "gh workflow run") < job
+
+
+def test_report_steps_give_up_before_the_report_job_does():
+    """A dispatch that hangs fails its step, and the step that opens the issue runs
+    after it, so every step of the report job has a limit, and together they leave
+    room within the job's."""
+    job = int(scalar(job_of(*REPORT_JOB), "timeout-minutes", 4) or 0)
+    report = steps(job_of(*REPORT_JOB))
+    mentions = ["actions/checkout", "gh workflow run", "rolling-issue.sh"]
+    assert all(any(text in step for step in report) for text in mentions)
+    assert len(report) == len(mentions)
+    limits = [step_limit(*REPORT_JOB, text) for text in mentions]
+    assert all(0 < limit < job for limit in limits), limits
+    assert sum(limits) < job, limits
 
 
 def test_a_failed_close_of_the_issue_cannot_skip_the_redispatch():
@@ -528,45 +593,80 @@ def test_report_covers_the_ways_the_chain_stops_silently():
     """A sweep that fails reports through its own step. These are the other ways in which
     the chain ends without a sweep saying so: the next sweep cannot be dispatched, a
     sweep is cancelled while it waits for the group (a run that queues replaces the one
-    that waits) and a sweep hits the timeout of its job."""
+    that waits) and a sweep is cancelled while it runs, as one that hits the timeout of
+    its job may be. A sweep replaced while it waited is dispatched again, as the
+    redispatch job dispatches the next one, and the issue opens if that fails."""
     report = job_of(*REPORT_JOB)
     assert sequence(report, "needs", 4) == ["sweep", "redispatch"]
     assert scalar(report, "if", 4) == (
         "always() && (needs.sweep.result == 'cancelled' "
         "|| needs.redispatch.result == 'failure')"
     )
-    assert mapping(report, "permissions", 4) == {"contents": "read", "issues": "write"}
+    assert mapping(report, "permissions", 4) == PERMISSIONS[REPORT_JOB]
     assert scalar(report, "timeout-minutes", 4) == "5"
     assert entry(report, "concurrency", 4) is None, "a job that queues replaces a tick"
-    checkout, reporting = steps(report)
+    checkout, dispatching, opening = steps(report)
     assert "actions/checkout" in checkout
     assert re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", checkout)
+    assert re.search(r"(?m)^(?: {8}|- )id:\s*dispatch\s*$", dispatching)
+    tries = [
+        one_script(*job, "gh workflow run").rstrip() for job in sorted(DISPATCH_JOBS)
+    ]
+    assert tries[0] == tries[1], "the same tries as the redispatch job"
+    assert re.search(r"(?m)^\s+GH_REPO:\s*\$\{\{ github\.repository \}\}$", dispatching)
     assert one_script(*REPORT_JOB, "rolling-issue.sh") == (
         "scripts/rolling-issue.sh pypi-registry-backfill failure"
     )
-    assert "if:" not in reporting, "the condition of the job decides"
-    token = re.search(r"(?m)^\s+GH_TOKEN:\s*(.*?)\s*$", reporting)
-    assert token and token[1] == "${{ github.token }}"
+    assert "rolling-issue.sh" in opening
+    for step in (dispatching, opening):
+        token = re.search(r"(?m)^\s+GH_TOKEN:\s*(.*?)\s*$", step)
+        assert token and token[1] == "${{ github.token }}", step
+
+
+def report_does(
+    sweep: str, started: str | None, redispatch: str, *, dispatch_works: bool = True
+) -> tuple[bool, bool]:
+    """What the report job does, as (dispatches a sweep, opens the issue), for the
+    results of the sweep and redispatch jobs, the sweep's `started` output (None when
+    it was never set) and whether a dispatch works. A job that does not run does
+    neither. Its checkout succeeds."""
+    report = job_of(*REPORT_JOB)
+    _, dispatching, opening = steps(report)
+    needs = {
+        "needs.sweep.result": sweep,
+        "needs.sweep.outputs.started": started,
+        "needs.redispatch.result": redispatch,
+    }
+    if not evaluate(scalar(report, "if", 4) or "", {**needs, "always()": True}):
+        return False, False
+    before = {"success()": True, "failure()": False}
+    dispatches = evaluate(step_if(dispatching) or "", {**needs, **before})
+    outcome = ("success" if dispatch_works else "failure") if dispatches else "skipped"
+    failed = outcome == "failure"
+    after = {"success()": not failed, "failure()": failed}
+    opens = evaluate(
+        step_if(opening) or "", {**needs, **after, "steps.dispatch.outcome": outcome}
+    )
+    return dispatches, opens
 
 
 def test_report_runs_for_a_chain_that_stopped_without_a_report_of_its_own():
-    condition = scalar(job_of(*REPORT_JOB), "if", 4) or ""
-    assert re.fullmatch(r"[\w\s().&|=']+", condition), "only what GitHub evaluates"
-
-    def runs(sweep: str, redispatch: str) -> bool:
-        """The condition as Python, for the results of the two jobs."""
-        python = condition.replace("always()", "True")
-        python = python.replace("&&", " and ").replace("||", " or ")
-        python = python.replace("needs.sweep.result", repr(sweep))
-        python = python.replace("needs.redispatch.result", repr(redispatch))
-        return eval(python, {"__builtins__": {}})
-
-    # (the result of the sweep job, of the redispatch job): does the report run?
-    assert not runs("success", "success"), "the next sweep was dispatched"
-    assert not runs("success", "skipped"), "the sweep is done, and the chain ends well"
-    assert not runs("failure", "skipped"), "a sweep that fails reports for itself"
-    assert runs("success", "failure"), "the next sweep could not be dispatched"
-    assert runs("cancelled", "skipped"), "replaced while it waited, or timed out"
+    # (the result of the sweep job, its `started`, the result of the redispatch job):
+    # (does the report dispatch a sweep, does it open the issue)
+    nothing = (False, False)
+    assert report_does("success", "true", "success") == nothing, "next one dispatched"
+    assert report_does("success", "true", "skipped") == nothing, "done, and all is well"
+    assert report_does("failure", "true", "skipped") == nothing, "it reports for itself"
+    assert report_does("success", "true", "failure") == (False, True), "not dispatched"
+    # Cancelled while it ran: by its job's timeout, or by hand.
+    assert report_does("cancelled", "true", "skipped") == (False, True)
+    # Replaced while it waited, so it never started: it is dispatched again, and the
+    # issue opens only if every try fails. An output that was never set is null, or
+    # an empty string.
+    for unset in (None, ""):
+        assert report_does("cancelled", unset, "skipped") == (True, False)
+        failing = report_does("cancelled", unset, "skipped", dispatch_works=False)
+        assert failing == (True, True)
 
 
 def test_sweep_exit_codes(tmp_path):
@@ -712,16 +812,39 @@ def test_every_stream_job_reports_to_the_rolling_issue():
 
 
 def test_checkouts_do_not_keep_the_token():
-    """Nothing here pushes, so the token that a job holds is not left in .git/config."""
-    holders = PUBLISH_JOBS | {REPORT_JOB}
+    """Nothing here pushes, so no checkout leaves the job's token in .git/config, not
+    even the test job's read-only one, which a pull request's code could read."""
+    checked_out = set()
     for file, name, body in all_jobs():
         for step in steps(body):
-            if "actions/checkout" in step and (file, name) in holders:
+            if "actions/checkout" in step:
                 assert re.search(r"(?m)^\s+persist-credentials:\s*false\s*$", step), (
                     f"{file}: {name}"
                 )
-        if (file, name) in holders:  # so that the loop above looks at something
-            assert "actions/checkout" in body, f"{file}: {name} has no checkout"
+                checked_out.add((file, name))
+    # So that the loop above looks at something: every job that runs the repository's
+    # code or scripts checks it out.
+    assert checked_out == PUBLISH_JOBS | {REPORT_JOB, ("test.yml", "test")}
+
+
+def test_the_build_is_pinned():
+    """A month close that fails after adding the month's part is run again, and the
+    retry must build the same bytes, which takes the same zstd and SQLite. Those come
+    with the Python that uv installs, so `.python-version` names a patch release, and
+    every setup-uv step pins uv to one version, the same everywhere."""
+    python = (ROOT / ".python-version").read_text(encoding="utf-8")
+    assert re.fullmatch(r"3\.[0-9]+\.[0-9]+\n", python), python
+    pins = {}
+    for file, name, body in all_jobs():
+        for step in steps(body):
+            if "astral-sh/setup-uv" in step:
+                pinned = mapping(step, "with", 8)
+                assert isinstance(pinned, dict), f"{file}: {name}: no `with`"
+                assert "version" in pinned, f"{file}: {name}: uv is not pinned"
+                pins[file, name] = pinned["version"]
+    assert {file for file, _ in pins} == set(EXPECTED), "each workflow sets up uv"
+    [version] = set(pins.values())
+    assert re.fullmatch(r'"[0-9]+\.[0-9]+\.[0-9]+"', version), version
 
 
 def test_workflows_run_the_locked_environment():

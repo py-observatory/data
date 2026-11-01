@@ -15,8 +15,12 @@ name: backfill
 # again by hand once the cause is gone.
 #
 # The chain can also stop without a sweep saying so. The next sweep may fail to be
-# dispatched, a sweep may be cancelled while it waits for the group, and a sweep may hit
-# the timeout of its job. The last job reports those.
+# dispatched, a sweep may be cancelled while it waits for the group (a run that queues
+# there replaces the one that waits), and a sweep may be cancelled while it runs, as one
+# that hits the timeout of its job may be. The last job dispatches again a sweep that was
+# cancelled while it waited, so that the chain goes on, and reports the rest. A sweep that
+# it dispatches may in turn replace a tick that waits in the group. That is benign: the
+# next tick catches up.
 
 on:
   workflow_dispatch:
@@ -47,11 +51,20 @@ jobs:
       cancel-in-progress: false
     outputs:
       continue: ${{ steps.sweep.outputs.continue }}
+      started: ${{ steps.started.outputs.started }}
     steps:
+      # First, so that a sweep that ran at all says so. One that a newer run replaced while
+      # it waited for the group runs no step, so it leaves `started` unset: that is how the
+      # report job below tells it from a sweep that was cancelled while it ran.
+      - name: Note that the sweep started
+        id: started
+        run: echo "started=true" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
       - run: uv sync --locked --package pypi-registry
       - id: sweep
         name: Sweep
@@ -119,22 +132,52 @@ jobs:
 
   # The ways in which the chain stops without a sweep saying so: the next sweep could not be
   # dispatched, a sweep was cancelled while it waited (a run that queues in the group
-  # replaces the one that waits there), and a sweep hit the timeout of its job. A sweep that
-  # fails reports through its own step above, and this job is skipped then. That is why the
-  # step that closes the issue after a good sweep may not fail the job: the sweep job would
-  # fail, the dispatch would be skipped, and this job would stay skipped too.
+  # replaces the one that waits there), and a sweep was cancelled while it ran, as one that
+  # hits the timeout of its job may be. A sweep that fails reports through its own step
+  # above, and this job is skipped then. That is why the step that closes the issue after a
+  # good sweep may not fail the job: the sweep job would fail, the dispatch would be
+  # skipped, and this job would stay skipped too.
+  #
+  # A sweep that was cancelled while it waited never set `started`. It is dispatched again,
+  # with the same tries as the next sweep is, and the issue opens only if no try works.
+  # Every other stop opens the issue.
   report:
     needs: [sweep, redispatch]
     if: always() && (needs.sweep.result == 'cancelled' || needs.redispatch.result == 'failure')
     runs-on: ubuntu-latest
+    # Each step gives up before the job does, and together they leave room within it, so
+    # that a dispatch that hangs fails its step and the issue still opens after it.
     timeout-minutes: 5
     permissions:
+      actions: write
       contents: read
       issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 1
         with:
           persist-credentials: false
-      - env:
+      - name: Dispatch the sweep that was replaced while it waited
+        id: dispatch
+        if: needs.sweep.result == 'cancelled' && needs.sweep.outputs.started != 'true'
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for attempt in 1 2 3; do
+            if gh workflow run backfill.yml -f task=sweep; then
+              exit 0
+            fi
+            echo "Dispatch $attempt of 3 failed." >&2
+            if [ "$attempt" -lt 3 ]; then
+              sleep 20
+            fi
+          done
+          exit 1
+      - name: Open the backfill's issue
+        if: failure() || steps.dispatch.outcome == 'skipped'
+        timeout-minutes: 1
+        env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh pypi-registry-backfill failure
