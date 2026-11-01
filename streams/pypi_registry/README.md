@@ -46,7 +46,9 @@ A run publishes to `GITHUB_REPOSITORY` (`py-observatory/data` when it is not set
 uv run --package pypi-registry python -m pypi_registry run
 ```
 
-`--bootstrap` builds the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. `--max-seconds` is how long after its start a run stops starting projects (18,000 by default), and the projects that it does not reach are read by the next run.
+`--bootstrap` builds the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. It does not override a failed month close: when the month that ended, rebuilt from its base copy and its deltas, differs from the state, the run stops whatever the reason, because publishing would build on a month that its releases cannot restore. `--max-seconds` is how long after its start a run stops starting projects (18,000 by default), and the projects that it does not reach are read by the next run.
+
+A bootstrap that adds the month's base copy and then fails before it publishes cannot simply be run again. A second bootstrap refuses a `pypi-registry-current` release that the first one left, even a half-made one. Without one, a second bootstrap in the same month stops with CreateOnceError on `pypi-registry-state-base-YYYY-MM.db.zst`, because the state that it builds is new bytes. The way back is a manual reset with the owner: delete the half-made `pypi-registry-current` release, if there is one, and that base copy, and record the deletions in a dated entry in `RETENTION.md`. Waiting for the next month keeps the base copy, as the next month's has another name, but a half-made `pypi-registry-current` must still go.
 
 ## Tests
 

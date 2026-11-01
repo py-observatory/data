@@ -18,19 +18,23 @@ the stored cursor, which is a stale copy, before it writes anything. Then:
 4. It writes the manifest, checks it against the prior one with the publish gates, and
    swaps the state, the open delta and the manifest into the current release.
 
-The assets of a month's release are never replaced, so a rollover adds only what the
-published state alone decides. The sealed delta and the base copy are the files that
-the last run published, byte for byte: compressing again gives the same bytes only
-with the same zstd and SQLite, which can change between two attempts. The month's
-manifest takes nothing from the run. So a run that stops after a rollover, and runs
-again, adds the same files, which are kept as they are.
+The assets of a month's release are never replaced. The sealed delta and the base copy
+are the files that the last run published, byte for byte: compressing again gives the
+same bytes only with the same zstd and SQLite, which can change between two attempts.
+The month's part is built afresh from the month's deltas, and the month's manifest
+takes nothing from the run but the part's entry. So a run that stops after a rollover
+and runs again adds the same files only when it has the same zstd and SQLite. With
+another build its part is other bytes, and it stops with CreateOnceError for a person
+to look at.
 
 Errors are not caught, and a run that fails publishes nothing to the current release.
 
 The gates hold back a publish that has less history than the last one, and one that
 removes more than MAX_REMOVALS projects at once: a removal is for good, and a name that
 comes back is a new project. A held publish goes out only when a person gives a reason,
-and the manifest keeps a log of each such override.
+and the manifest keeps a log of each such override. A month that its base copy and its
+deltas do not rebuild is not held in that way: no reason overrides it, because a run
+that went on would publish over a month that its releases cannot restore.
 """
 
 import argparse
@@ -275,9 +279,10 @@ def _month_manifest(
     """The manifest of a month that has ended, as its file and its entry.
 
     It is the prior manifest, which describes the state as the month ended, listing
-    `assets` in place of its own. It takes nothing from the run, so a run that adds
-    it to the release, stops, and runs again makes the same bytes. Raises
-    ManifestError unless it reads back as itself, as the strict reader reads it.
+    `assets` in place of its own. It takes nothing from the run but the entry of the
+    month's part, so a run that stops after adding it and runs again makes the same
+    bytes when it builds the same part. Raises ManifestError unless it reads back as
+    itself, as the strict reader reads it.
     """
     year, number = month
     manifest = replace(prior, assets=assets)
@@ -325,7 +330,8 @@ def _close_month(
 
     Raises PriorStateError when the prior manifest lists no base copy of the month,
     or a copy does not download as its entry says, and GateError when the rebuilt
-    state differs from the state.
+    state differs from the state. No override reason passes that failure: going on
+    would publish over a month that its releases cannot restore.
     """
     year, number = month
     period = f"{year:04d}-{number:02d}"
@@ -350,7 +356,9 @@ def _close_month(
     if differ:
         detail = (
             f"{period} rebuilt from {base.name} and its {len(deltas)} sealed deltas "
-            f"differs from the state in {', '.join(differ)}"
+            f"differs from the state in {', '.join(differ)}. This cannot be "
+            "overridden, because going on would publish over a month that its "
+            "releases cannot restore"
         )
         raise GateError([GateFailure("replay", detail)])
     part_db = workdir / month_part_name(year, number)
@@ -614,8 +622,9 @@ def run_once(
     current release.
 
     Every error propagates, and an error before the publish publishes nothing to the
-    current release. What a rollover already added to a month's release stays, as it
-    is made from the published state alone, and the next run adds the same files.
+    current release. What a rollover already added to a month's release stays. The
+    next run adds the same files when it builds the same month part, which takes the
+    same zstd and SQLite, and otherwise stops with CreateOnceError.
     """
     deadline = clock() + max_seconds
     requests = http.requests

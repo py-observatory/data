@@ -543,8 +543,8 @@ def test_month_close_builds_month_part_and_new_base(tmp_path):
         True,
     )
     # The month's manifest lists the month's assets as the current manifest does.
-    # The rest of it is the last manifest of the month, so it is made from what was
-    # published, and a run that does it again writes the same bytes.
+    # The rest of it is the last manifest of the month, so it takes nothing from the
+    # run but the part's entry, and a run with the same build writes the same bytes.
     month = stream.manifest(NOVEMBER, MANIFEST_NOVEMBER)
     assert month.assets == [entries[name] for name in month_assets]
     assert dataclasses.replace(month, assets=last.assets) == last
@@ -812,7 +812,10 @@ def test_mass_removal_needs_override(tmp_path):
     assert removed.fetchone() == (2_006,)
 
 
-def test_month_close_replay_mismatch_fails(tmp_path):
+@pytest.mark.parametrize(
+    "override_reason", [None, "Checked by hand."], ids=["no reason", "a reason"]
+)
+def test_month_close_replay_mismatch_fails(tmp_path, override_reason):
     stream = Stream(tmp_path)
     stream.run("2026-11-29T06:00:00Z", 100, PROJECTS, bootstrap=True)
     stream.run(
@@ -848,10 +851,19 @@ def test_month_close_replay_mismatch_fails(tmp_path):
     held = stream.github.asset_bytes(CURRENT, MANIFEST)
     stream.github.calls.clear()
 
-    with pytest.raises(GateError, match="projects") as caught:
-        stream.run("2026-12-01T06:00:00Z", 120, {**PROJECTS, "alpha": 11})
+    # A reason does not publish past it, as it does past a gate: what the run
+    # would publish could not be restored from the month's releases.
+    with pytest.raises(GateError, match="cannot be overridden") as caught:
+        stream.run(
+            "2026-12-01T06:00:00Z",
+            120,
+            {**PROJECTS, "alpha": 11},
+            override_reason=override_reason,
+        )
 
-    assert [failure.rule for failure in caught.value.failures] == ["replay"]
+    (failure,) = caught.value.failures
+    assert failure.rule == "replay"
+    assert "differs from the state in projects" in failure.detail
     # Nothing is published, to the current release or to any other: not the seal of
     # 11-30, nor the month's part, nor December's base.
     assert stream.writes() == []
@@ -990,7 +1002,7 @@ def test_failed_processing_publishes_nothing_and_rollover_is_redone(
         stream.run("2026-12-01T06:00:00Z", 120, listed)
 
     # Nothing is published to the current release. What the rollover added to the
-    # months stays: it is made from the published state alone.
+    # months stays: it is made from what was published, and the run's build.
     assert stream.github.asset_bytes(CURRENT, MANIFEST) == held
     rolled = {
         NOVEMBER: sorted(
@@ -1005,8 +1017,9 @@ def test_failed_processing_publishes_nothing_and_rollover_is_redone(
         for name in names
     }
 
-    # A later run, with another run id, does the same rollover again. It finds the
-    # same bytes in place, adds nothing to the months, and publishes.
+    # A later run, with another run id but the same zstd and SQLite, does the same
+    # rollover again. It finds the same bytes in place, adds nothing to the months,
+    # and publishes. With another build it would stop (see the next test).
     monkeypatch.setenv("GITHUB_RUN_ID", "2")
     stream.github.calls.clear()
 
