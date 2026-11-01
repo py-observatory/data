@@ -87,7 +87,8 @@ def diff_root(active: dict[str, int], inactive: dict[str, str], root: Root) -> R
     and `changed` when `active` has it with another serial. A serial that is lower than
     the stored one counts too: a serial that differs is a page worth fetching again. A
     name of `active` that is not listed is `vanished`. A name of `inactive` that is not
-    listed is not reported, because its status is known already.
+    listed is in none of the four lists: it is not new, changed or returned, and only an
+    `active` name can vanish. Whether to look at such a name again is for the run.
     """
     listed = root.projects
     new = listed.keys() - active.keys() - inactive.keys()
@@ -130,10 +131,16 @@ def diff_files(
     so that the stored reason follows the page. The files of a page are told apart by
     filename, as PyPI never reuses one.
 
-    A quarantined project's page lists no files, and that says nothing about the stored
-    ones: diffing it would remove every one. A quarantine is an event, and the stored
-    files are kept, so the run must not diff such a page.
+    Raises ValueError for the page of a quarantined project. That page lists no files,
+    which says nothing about the stored ones, and diffing it would report every one of
+    them as removed. A quarantine is recorded as an event and the stored files are kept,
+    so a caller checks the status first and does not diff such a page.
     """
+    if page.status == "quarantined":
+        raise ValueError(
+            "a quarantined page lists no files, so it must not be diffed: every stored "
+            "file would be reported as removed"
+        )
     now = {info.filename: info for info in page.files}
     added = [now[name] for name in sorted(now.keys() - before.keys())]
     removed = sorted(before.keys() - now.keys())

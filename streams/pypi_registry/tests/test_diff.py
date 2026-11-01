@@ -1,5 +1,6 @@
 import random
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -12,7 +13,9 @@ from pypi_registry.diff import (
     diff_files,
     diff_root,
 )
-from pypi_registry.simple import FileInfo, ProjectPage, Root
+from pypi_registry.simple import FileInfo, ProjectPage, Root, parse_project_page
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def file_info(
@@ -88,7 +91,8 @@ def test_returned_names_are_told_from_the_rest_of_the_root():
 
 
 def test_an_inactive_name_that_is_not_listed_is_not_reported():
-    # Its status is known already, and it is not probed again.
+    # Only an active name can vanish, so a removed or quarantined name that is still
+    # not listed is in none of the four lists. Looking at it again is for the run.
     inactive = {"q": "quarantined", "r": "removed"}
     assert diff_root({}, inactive, Root(100, {})) == EMPTY
 
@@ -273,6 +277,54 @@ def test_diff_files_leaves_its_inputs_as_they_were():
         "demo-1.1.tar.gz": (False, None),
     }
     assert page.files == files
+
+
+@pytest.mark.parametrize(
+    "before",
+    [
+        {},
+        {"demo-1.0.tar.gz": (False, None)},
+        {"demo-1.0.tar.gz": (False, None), "demo-1.1.tar.gz": (True, "broken build")},
+    ],
+    ids=["nothing stored", "one file stored", "two files stored"],
+)
+def test_diff_files_refuses_a_quarantined_page(before):
+    # A quarantined page lists no files, and that says nothing about the stored ones. A
+    # diff would report every stored file as removed, and none of them was.
+    with pytest.raises(ValueError, match="quarantined page"):
+        diff_files(before, page_of(status="quarantined"))
+
+
+def test_diff_files_refuses_the_page_that_is_served_for_a_quarantined_project():
+    # The shape that PyPI serves: a status and a reason, and no files and no versions.
+    page = parse_project_page((FIXTURES / "page-quarantined.json").read_bytes())
+    assert (page.status, page.files, page.versions) == ("quarantined", [], [])
+    before: Stored = {
+        "example-quarantined-1.0.tar.gz": (False, None),
+        "example-quarantined-1.0-py3-none-any.whl": (False, None),
+    }
+    with pytest.raises(ValueError, match="quarantined page"):
+        diff_files(before, page)
+
+
+def test_the_error_for_a_quarantined_page_says_why_it_is_not_diffed():
+    before: Stored = {"demo-1.0.tar.gz": (False, None)}
+    with pytest.raises(ValueError) as caught:
+        diff_files(before, page_of(status="quarantined"))
+    assert str(caught.value) == (
+        "a quarantined page lists no files, so it must not be diffed: every stored "
+        "file would be reported as removed"
+    )
+
+
+@pytest.mark.parametrize("status", ["active", "archived", "deprecated", "frozen"])
+def test_a_page_of_any_other_status_is_diffed(status):
+    # Only a quarantined page withholds its files. A page of another status that lists
+    # none says that the project has none, which is a removal of each stored file.
+    before: Stored = {"demo-1.0.tar.gz": (False, None)}
+    assert diff_files(before, page_of(status=status)) == FileDiff(
+        added=[], removed=["demo-1.0.tar.gz"], yank_changes=[]
+    )
 
 
 # ---- the probe of a name that left the root
