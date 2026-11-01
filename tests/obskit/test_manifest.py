@@ -403,6 +403,25 @@ def test_an_open_asset_may_carry_a_period():
     assert loads(dumps(m)) == m
 
 
+def test_rejects_an_asset_repeated_by_tag_and_name():
+    # As when a stream builds its next manifest from the prior assets plus the new
+    # entries: the state is listed twice, and a reader cannot tell which is meant.
+    older = replace(state_asset(), asset_sha256=digest("older state.db.zst"))
+    text = dumps(with_assets(older, day_asset(), state_asset()))
+
+    with pytest.raises(ManifestError, match=r"state\.db\.zst.*example-current"):
+        loads(text)
+
+
+def test_one_name_may_appear_in_two_releases():
+    copy = replace(
+        state_asset(), tag="example-month-2026-11", period="2026-11", closed=True
+    )
+    m = with_assets(state_asset(), copy)
+
+    assert loads(dumps(m)) == m
+
+
 def test_rejects_schema_version_2():
     with pytest.raises(ManifestError, match="schema_version"):
         loads(with_value(("schema_version",), 2))

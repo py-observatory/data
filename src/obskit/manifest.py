@@ -313,8 +313,19 @@ def _asset(value: object, where: str) -> Asset:
 
 
 def _assets(raw: dict, key: str, where: str) -> list[Asset]:
+    """The assets, each listed once: a release holds one asset of a name, so a second
+    entry for it leaves a reader unable to tell which one is meant."""
     items = _list(raw, key, where)
-    return [_asset(item, f"{where}.{key}[{i}]") for i, item in enumerate(items)]
+    assets = [_asset(item, f"{where}.{key}[{i}]") for i, item in enumerate(items)]
+    seen: set[tuple[str, str]] = set()
+    for i, asset in enumerate(assets):
+        if (asset.tag, asset.name) in seen:
+            raise ManifestError(
+                f"{where}.{key}[{i}] lists {asset.name} of the release {asset.tag} "
+                "again"
+            )
+        seen.add((asset.tag, asset.name))
+    return assets
 
 
 # The reader of each field of each dataclass. A new field needs its entry here, and
@@ -368,8 +379,8 @@ def loads(text: str) -> Manifest:
     schema_version), and any value that breaks the format's rules: the JSON type of
     each field, the allowed roles, formats, granularities and history classes,
     lowercase 64-digit sha256 values, real dates and times in the stated shapes, a
-    watermark value that fits its granularity, a period on every closed asset, and a
-    json asset that repeats its digests.
+    watermark value that fits its granularity, a period on every closed asset, a
+    json asset that repeats its digests, and no two assets with one tag and name.
     """
     try:
         doc = json.loads(text)

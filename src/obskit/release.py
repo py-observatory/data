@@ -163,9 +163,10 @@ def publish_current(
 
     Before any request, it checks the stream id (TagError), that `manifest` reads back
     as itself through the strict reader that the next run uses (ManifestError), and
-    that the manifest's entries for this release are exactly `files`, by name and
-    sha256 (ValueError). A manifest that fails either check would stop every later
-    run. It writes the manifest to `files[0].parent / "manifest.json"`.
+    that the manifest's entries for this release are exactly `files`, each listed
+    once, by name and sha256 (ValueError). A manifest that fails either check would
+    stop every later run. It writes the manifest to `files[0].parent /
+    "manifest.json"`.
 
     The release must exist without `bootstrap`. With it, the release is created when
     GitHub answers 404, and refused when it holds any asset that is not a swap copy
@@ -269,10 +270,14 @@ def _is_swap(name: str) -> bool:
     return name.startswith((_SWAP_NEXT, _SWAP_PREV))
 
 
+def _repeated(names: list[str]) -> list[str]:
+    """The names that occur more than once in `names`, sorted."""
+    return sorted({name for name in names if names.count(name) > 1})
+
+
 def _check_names(files: list[Path]) -> None:
     """Raise ValueError when two of `files` share a name."""
-    names = [path.name for path in files]
-    repeated = sorted({name for name in names if names.count(name) > 1})
+    repeated = _repeated([path.name for path in files])
     if repeated:
         raise ValueError(f"more than one file is named {', '.join(repeated)}")
 
@@ -299,7 +304,8 @@ def _file_digests(files: list[Path], manifest: Manifest, tag: str) -> dict[str, 
 
     Raises ValueError when there is no file, when two share a name, when a name is
     manifest.json or starts with a swap prefix, and when the entries of `manifest`
-    for the release `tag` are not exactly the files with their sha256.
+    for the release `tag` are not exactly the files with their sha256, each listed
+    once.
     """
     if not files:
         raise ValueError("there is nothing to publish")
@@ -313,7 +319,13 @@ def _file_digests(files: list[Path], manifest: Manifest, tag: str) -> dict[str, 
             f"start with {_SWAP_NEXT} or {_SWAP_PREV}"
         )
     digests = {path.name: sha256_file(path) for path in files}
-    entries = {a.name: a.asset_sha256 for a in manifest.assets if a.tag == tag}
+    listed = [asset for asset in manifest.assets if asset.tag == tag]
+    repeated = _repeated([asset.name for asset in listed])
+    if repeated:
+        raise ValueError(
+            f"the manifest lists {', '.join(repeated)} of {tag} more than once"
+        )
+    entries = {asset.name: asset.asset_sha256 for asset in listed}
     differ = sorted(
         name
         for name in entries.keys() | digests.keys()

@@ -532,6 +532,25 @@ def test_publish_refuses_files_that_the_manifest_does_not_list(gh, fake, tmp_pat
     assert writes(fake) == []
 
 
+@pytest.mark.parametrize("reader", ["strict", "lenient"])
+def test_publish_refuses_duplicate_current_entry(
+    gh, fake, tmp_path, monkeypatch, reader
+):
+    # As when a stream builds its next manifest from the prior assets plus the new
+    # entries: the state is listed twice, and only the last entry matches the file.
+    old, new = build(tmp_path, "old"), build(tmp_path, "new")
+    stale = old.manifest.assets[0]
+    repeated = dataclasses.replace(new.manifest, assets=[stale, *new.manifest.assets])
+    if reader == "lenient":
+        # The files check refuses it on its own, should a reader let it through.
+        monkeypatch.setattr(release, "loads", lambda text: repeated)
+
+    with pytest.raises(ValueError, match=STATE):
+        publish_current(gh, STREAM, list(new.files.values()), repeated, bootstrap=True)
+
+    assert fake.calls == []
+
+
 def test_publish_checks_the_stream_id(gh, fake, tmp_path):
     v1 = build(tmp_path, "v1")
 
