@@ -11,6 +11,9 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = ["pytest>=8.4"]
 
+[tool.uv.workspace]
+members = ["streams/pypi_registry"]
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "streams"]
 addopts = "-q"

@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "_last-serial": 25862120,
+    "api-version": "1.4"
+  },
+  "projects": [
+    {"_last-serial": 25862117, "name": "sampleproject"},
+    {"_last-serial": 25500310, "name": "Django"},
+    {"_last-serial": 25100042, "name": "zope.interface"},
+    {"_last-serial": 25400007, "name": "Foo_Bar"},
+    {"_last-serial": 12, "name": "a"}
+  ]
+}

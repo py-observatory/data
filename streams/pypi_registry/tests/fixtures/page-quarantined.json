@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "_last-serial": 25861990,
+    "api-version": "1.4"
+  },
+  "name": "example-quarantined",
+  "project-status": {
+    "reason": "Held while the project is checked for malware",
+    "status": "quarantined"
+  },
+  "versions": [],
+  "files": []
+}

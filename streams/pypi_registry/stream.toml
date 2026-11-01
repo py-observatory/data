@@ -1,0 +1,24 @@
+id = "pypi-registry"
+description = "Every PyPI project: its releases, files, yanks and status, read from PyPI's Simple and JSON APIs."
+
+[[upstreams]]
+name = "PyPI Simple and JSON APIs"
+url = "https://pypi.org/"
+licence = "NOASSERTION"
+terms = "https://policies.python.org/pypi.org/Terms-of-Use/"
+
+# Each table with its history class, which says how the publish gates treat it: an
+# `append` or `events` table never loses rows, and a `snapshot` table may lose only
+# the rows that upstream removals explain.
+[tables]
+meta = "snapshot"
+files_current = "snapshot"
+projects = "append"
+versions_seen = "append"
+files = "append"
+versions = "append"
+release_records = "append"
+serials = "append"
+swept = "append"
+cursors = "append"
+events = "events"
