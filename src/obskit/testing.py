@@ -1,4 +1,5 @@
-"""Fakes for tests. FakeGitHub is the GitHub releases API, held in memory."""
+"""Fakes for tests. FakeGitHub is the GitHub releases API and FakeHttp is a set of web
+pages that obskit.http reads, both held in memory."""
 
 import itertools
 import json
@@ -324,3 +325,72 @@ class FakeGitHub:
                 }
                 return 200, headers, asset.data
         return _problem(404, "Not Found")
+
+
+@dataclass
+class _Entry:
+    status: int
+    headers: dict[str, str]
+    body: bytes
+    remaining: int | None  # requests that this entry will still serve, None for any
+
+
+def _encoded(body: bytes | str | dict) -> bytes:
+    """The bytes of a reply body: a dict as JSON, a str as UTF-8, bytes as they are."""
+    if isinstance(body, dict):
+        return json.dumps(body).encode()
+    if isinstance(body, str):
+        return body.encode()
+    return body
+
+
+class FakeHttp:
+    """The web pages that `obskit.http.Http` reads, held in memory, as a Transport.
+
+    `add` gives a URL one more reply. The replies of one URL are served in the order
+    they were added. A reply added with `times` is dropped once it has been served that
+    often, and one added without it is served for ever, so it hides every reply added
+    after it. A URL with no reply left is a 404 with no body, as a project that PyPI no
+    longer has is. A URL matches as a whole string, query included, and the method and
+    the body of a request make no difference.
+    """
+
+    def __init__(self) -> None:
+        # (url, headers) of every request, in order, those answered 404 included.
+        self.requests: list[tuple[str, dict[str, str]]] = []
+        self._entries: dict[str, list[_Entry]] = {}
+
+    def add(
+        self,
+        url: str,
+        *,
+        status: int = 200,
+        body: bytes | str | dict = b"",
+        headers: dict[str, str] | None = None,
+        times: int | None = None,
+    ) -> None:
+        """Give `url` one more reply, served after the replies already added for it.
+
+        A dict body is encoded as JSON and a str body as UTF-8. The header names are
+        lowercased, as a Transport gives them. The reply is served `times` times, or for
+        ever when `times` is None.
+        """
+        if times is not None and times < 1:
+            raise ValueError(f"times must be at least 1, not {times}")
+        lowered = {name.lower(): value for name, value in (headers or {}).items()}
+        entry = _Entry(status, lowered, _encoded(body), times)
+        self._entries.setdefault(url, []).append(entry)
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | None
+    ) -> _Reply:
+        self.requests.append((url, dict(headers)))
+        entries = self._entries.get(url)
+        if not entries:
+            return 404, {}, b""
+        entry = entries[0]
+        if entry.remaining is not None:
+            entry.remaining -= 1
+            if entry.remaining == 0:
+                del entries[0]
+        return entry.status, dict(entry.headers), entry.body
