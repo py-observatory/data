@@ -4,9 +4,8 @@ import json
 import platform
 import sqlite3
 import struct
-from collections.abc import Sequence
 from contextlib import closing
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -16,31 +15,32 @@ import obskit
 from obskit.gates import GateFailure
 from obskit.github import GitHub
 from obskit.http import Http
-from obskit.manifest import Asset, Manifest, TableInfo, Watermark, dumps, loads
-from obskit.release import CreateOnceError, PriorStateError, fetch_assets
+from obskit.manifest import Asset, TableInfo, Watermark
+from obskit.release import CreateOnceError, PriorStateError
 from obskit.sqlite import table_counts
-from obskit.testing import FakeGitHub, FakeHttp
-from obskit.zst import compress_file, decompress_file, sha256_file
-from pypi_registry.layout import OPEN_DELTA_DB, STATE_DB, base_state_name, delta_name
-from pypi_registry.run import (
-    GateError,
-    RunReport,
-    StaleRootError,
-    main,
-    replay,
-    run_once,
-)
-from pypi_registry.simple import ACCEPT, ROOT_URL, project_url, version_url
-from pypi_registry.store import STATE_SCHEMA, diff_states, open_db
+from obskit.zst import compress_file, sha256_file
+from pypi_registry.run import GateError, RunReport, StaleRootError, main
+from pypi_registry.simple import ACCEPT, ROOT_URL, project_url
 from run_helpers import (
-    OPENED,
-    Clock,
-    Ticking,
+    BASE_DECEMBER,
+    BASE_NOVEMBER,
+    CURRENT,
+    DECEMBER,
+    DELTA,
+    MANIFEST,
+    MANIFEST_NOVEMBER,
+    NOVEMBER,
+    PART_NOVEMBER,
+    REPO,
+    STATE,
+    Stream,
     dist,
     files_of,
+    meta_of,
     page,
     project_rows,
-    release,
+    restored_differences,
+    sealed_name,
     versions_of,
     written,
 )
@@ -51,17 +51,6 @@ OLD = "2026-01-01T00:00:00Z"
 
 # ---- the run: prior state, rollover, apply, manifest, gates and publish
 
-REPO = "py-observatory/data"
-CURRENT = "pypi-registry-current"
-NOVEMBER = "pypi-registry-month-2026-11"
-DECEMBER = "pypi-registry-month-2026-12"
-MANIFEST = "manifest.json"
-STATE = f"{STATE_DB}.zst"
-DELTA = f"{OPEN_DELTA_DB}.zst"
-BASE_NOVEMBER = "pypi-registry-state-base-2026-11.db.zst"
-BASE_DECEMBER = "pypi-registry-state-base-2026-12.db.zst"
-PART_NOVEMBER = "pypi-registry-2026-11.db.zst"
-MANIFEST_NOVEMBER = "manifest-2026-11.json"
 # The projects that the runs below start from, with their serials.
 PROJECTS = {"alpha": 10, "beta": 20, "gamma": 30}
 # What a manifest says of the stream's upstream: stream.toml's entry.
@@ -84,140 +73,6 @@ DELTA_TABLES = (
 )
 
 
-def sealed_name(day: str) -> str:
-    """The asset of the sealed delta of `day`, given as YYYY-MM-DD."""
-    return f"{delta_name(date.fromisoformat(day))}.zst"
-
-
-def no_sleep(seconds: float) -> None:
-    """GitHub's retries and pacing wait for nothing in a test."""
-
-
-def root(serial: int, projects: dict[str, int]) -> dict:
-    """The Simple API root as PyPI serves it, listing `projects` with their serials. It
-    carries `meta.api-version` and `meta._last-serial`, which the parser requires."""
-    return {
-        "meta": {"api-version": "1.4", "_last-serial": serial},
-        "projects": [
-            {"name": name, "_last-serial": serial} for name, serial in projects.items()
-        ],
-    }
-
-
-class Stream:
-    """The runs of the stream, on one fake GitHub and one fake PyPI.
-
-    Each run has a work directory of its own, as each run has a new runner, so all that
-    a run leaves to the next goes through the releases. The GitHub client is one for
-    the whole test, as `main` makes one for a process.
-    """
-
-    def __init__(self, tmp_path: Path) -> None:
-        self.tmp_path = tmp_path
-        self.github = FakeGitHub(REPO)
-        self.gh = GitHub(REPO, "t0ken", transport=self.github, sleep=no_sleep)
-        self.pypi = FakeHttp()
-        self.clock = Clock()
-        self.http = Http(
-            transport=Ticking(self.pypi, self.clock),
-            sleep=self.clock.sleep,
-            clock=self.clock,
-        )
-        self.runs = 0
-        self.made = 0  # files made by the helpers below, each in a folder of its own
-
-    def run(
-        self,
-        at: str,
-        serial: int,
-        projects: dict[str, int],
-        *,
-        pages: Sequence[dict] = (),
-        releases: Sequence[tuple[str, str]] = (),
-        bootstrap: bool = False,
-        override_reason: str | None = None,
-        max_seconds: float = 18_000,
-    ) -> RunReport:
-        """A run at `at`, a UTC time, that reads a root at `serial` listing `projects`.
-
-        The root and each of `pages` are served once, the pages at their projects'
-        URLs, and so is the release record of each (name, version) of `releases`. Any
-        other page is a 404, as a project that PyPI does not have is.
-        """
-        self.pypi.add(ROOT_URL, body=root(serial, projects), times=1)
-        for body in pages:
-            self.pypi.add(project_url(body["name"]), body=body, times=1)
-        for name, version in releases:
-            self.pypi.add(
-                version_url(name, version), body=release(name, version), times=1
-            )
-        self.runs += 1
-        workdir = self.tmp_path / f"run-{self.runs}"
-        workdir.mkdir()
-        return run_once(
-            self.gh,
-            self.http,
-            workdir,
-            now=datetime.fromisoformat(at),
-            bootstrap=bootstrap,
-            override_reason=override_reason,
-            max_seconds=max_seconds,
-            clock=self.clock,
-        )
-
-    def folder(self, label: str) -> Path:
-        self.made += 1
-        path = self.tmp_path / label / str(self.made)
-        path.mkdir(parents=True)
-        return path
-
-    def manifest(self, tag: str = CURRENT, name: str = MANIFEST) -> Manifest:
-        return loads(self.github.asset_bytes(tag, name).decode())
-
-    def entries(self) -> dict[str, Asset]:
-        """The assets that the current manifest lists, by name."""
-        return {asset.name: asset for asset in self.manifest().assets}
-
-    def assets(self, tag: str) -> list[str]:
-        """The names of the assets of the release `tag`, sorted."""
-        release = self.github.release(tag)
-        return sorted(asset["name"] for asset in release["assets"]) if release else []
-
-    def expand(self, tag: str, name: str) -> Path:
-        """The database of the asset `name` of `tag`, expanded into a file."""
-        packed = self.folder("published") / name
-        packed.write_bytes(self.github.asset_bytes(tag, name))
-        db = packed.with_suffix("")
-        decompress_file(packed, db)
-        return db
-
-    def open(self, tag: str, name: str) -> sqlite3.Connection:
-        """The database of the asset `name` of `tag`, opened to read."""
-        conn = sqlite3.connect(f"{self.expand(tag, name).as_uri()}?mode=ro", uri=True)
-        OPENED.append(conn)
-        return conn
-
-    def writes(self) -> list[tuple[str, str]]:
-        """The requests to GitHub that change something, in order."""
-        return [
-            (method, url) for method, url, _ in self.github.calls if method != "GET"
-        ]
-
-    def replace_asset(self, tag: str, name: str, path: Path) -> None:
-        """Put the file at `path` in place of the asset `name` of `tag`, as a hand edit
-        would."""
-        release = self.gh.release_by_tag(tag)
-        held = {asset["name"]: asset for asset in self.gh.assets(release)}
-        self.gh.delete(held[name])
-        self.gh.upload(release, name, path)
-
-    def replace_manifest(self, manifest: Manifest) -> None:
-        """Put `manifest` in place of the current release's manifest.json."""
-        path = self.folder("edited") / MANIFEST
-        path.write_text(dumps(manifest), encoding="utf-8")
-        self.replace_asset(CURRENT, MANIFEST, path)
-
-
 def upload_names(stream: Stream) -> list[str]:
     """The names of the assets uploaded, in order."""
     return [
@@ -225,10 +80,6 @@ def upload_names(stream: Stream) -> list[str]:
         for method, url, _ in stream.github.calls
         if method == "POST" and url.startswith("https://uploads.github.com/")
     ]
-
-
-def meta_of(state: sqlite3.Connection) -> dict[str, str]:
-    return dict(state.execute("SELECT key, value FROM meta").fetchall())
 
 
 def test_bootstrap_publishes_state_base_and_manifest(tmp_path, monkeypatch):
@@ -569,31 +420,6 @@ def test_month_close_builds_month_part_and_new_base(tmp_path):
         [*month_assets, MANIFEST_NOVEMBER, BASE_DECEMBER]
     )
     assert entries[DELTA].period == "2026-12-01"
-
-
-def restored_differences(stream: Stream, *, with_open_delta: bool = True) -> list[str]:
-    """Rebuild the current state from the releases alone, as a restore would: the base
-    copy of the open delta's month, then the month's sealed deltas in day order and
-    the open delta, replayed as the runs applied them. Returns the tables in which the
-    result differs from the published state."""
-    entries = stream.entries()
-    day = date.fromisoformat(entries[DELTA].period)
-    base = entries[f"{base_state_name(day.year, day.month)}.zst"]
-    sealed = sorted(
-        (
-            asset
-            for asset in entries.values()
-            if asset.tag == base.tag and asset.name.startswith("pypi-registry-delta-")
-        ),
-        key=lambda asset: asset.period,
-    )
-    asked = [base, *sealed, entries[DELTA], entries[STATE]]
-    base_db, *deltas, state_db = fetch_assets(
-        stream.gh, asked, stream.folder("restore")
-    )
-    replay(base_db, deltas if with_open_delta else deltas[:-1])
-    with closing(open_db(base_db, STATE_SCHEMA)) as restored:
-        return diff_states(restored, state_db)
 
 
 def test_restore_month_base_plus_deltas_equals_current(tmp_path):

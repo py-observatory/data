@@ -18,6 +18,18 @@ the stored cursor, which is a stale copy, before it writes anything. Then:
 4. It writes the manifest, checks it against the prior one with the publish gates, and
    swaps the state, the open delta and the manifest into the current release.
 
+`sweep` is the other run. A bootstrap stores every project of the root without reading
+its page, so every project starts unswept, and the daily run reads a page only when its
+project changes. The sweep reads the page of each project that is not swept yet, in
+full, a time budget at a time, and is run again until none is left. It takes the same
+steps as `run_once`, except that it reads no root: it goes on from the state as it is,
+rolls over, reads the unswept projects (`_sweep_projects`), and then applies the delta,
+writes the manifest, checks the gates and publishes in the same way (`_resume` and
+`_publish` are the start and the end of both). With no root it has no serial to record,
+so it writes no serial and no cursor, and its manifest keeps the `data_through` and the
+`cursor` of the run before it. It writes no event either: it reads a page as it is now,
+and nothing says when a file was added or a status changed.
+
 The assets of a month's release are never replaced. The sealed delta and the base copy
 are the files that the last run published, byte for byte: compressing again gives the
 same bytes only with the same zstd and SQLite, which can change between two attempts.
@@ -78,7 +90,16 @@ from pypi_registry.layout import (
     month_part_name,
     plan_rollover,
 )
-from pypi_registry.process import INACTIVE, get_root, process_projects
+from pypi_registry.process import (
+    INACTIVE,
+    Context,
+    ProcessReport,
+    bootstrap_at,
+    get_page,
+    get_root,
+    process_projects,
+    process_unswept,
+)
 from pypi_registry.store import (
     DELTA_SCHEMA,
     STATE_SCHEMA,
@@ -93,12 +114,20 @@ from pypi_registry.store import (
 # lost its names and a burst of 404s must not be published unread.
 MAX_REMOVALS = 1_000
 
+# What `main` returns for a sweep that is to be run again, so that the workflow that
+# runs it can dispatch the next. Any other non-zero code is a failure.
+SWEEP_AGAIN = 3
+
 # The repository that `main` publishes to when GITHUB_REPOSITORY does not say.
 _REPOSITORY = "py-observatory/data"
 _STREAM_TOML = Path(__file__).resolve().parents[2] / "stream.toml"
 # The assets that carry the state and the open delta in the current release.
 _STATE_ASSET = f"{STATE_DB}.zst"
 _DELTA_ASSET = f"{OPEN_DELTA_DB}.zst"
+# The condition on a project's status that picks the projects that are neither removed
+# nor quarantined: the ones that the sweep reads and that the coverage counts. Its marks
+# are filled with INACTIVE.
+_ACTIVE = f"status NOT IN ({', '.join('?' * len(INACTIVE))})"
 
 
 class StaleRootError(RuntimeError):
@@ -120,9 +149,11 @@ class RunReport:
     """What a run did.
 
     The counts of projects and versions are those of `ProcessReport`, and a bootstrap,
-    which processes no project, has none. `requests` counts the requests to PyPI, the
-    retries among them. `gate_failures` lists the failures that a person overrode, and
-    is empty when no gate failed.
+    which processes no project, has none. A sweep counts only `versions_fetched`,
+    `swept` and `remaining`: it does not sort projects into new, changed, vanished and
+    returned, and its `remaining` is the number of projects that are still unswept.
+    `requests` counts the requests to PyPI, the retries among them. `gate_failures`
+    lists the failures that a person overrode, and is empty when no gate failed.
     """
 
     new: int
@@ -207,6 +238,41 @@ def _carried(prior: Manifest) -> tuple[Asset, Asset]:
             "is not a day, so the day that it is open for is not known"
         )
     return listed[_STATE_ASSET], delta
+
+
+@dataclass(frozen=True)
+class _Resume:
+    """Where the prior state stands, for a run that goes on from it.
+
+    `carried` is the entries of the state and of the open delta in the prior manifest.
+    `cursor` is the serial of the root that the state last read, and `applied` is the
+    highest `seq` that the state has applied.
+    """
+
+    carried: tuple[Asset, Asset]
+    cursor: int
+    applied: int
+
+
+def _resume(prior: Manifest, workdir: Path) -> _Resume:
+    """Check the state that `fetch_prior` left in `workdir` for the prior manifest
+    `prior`, and read where it stands. Every run that goes on from a published state
+    starts here, the sweep as well as the daily run.
+
+    Raises PriorStateError unless `prior` lists the state and the open delta (see
+    `_carried`). Both databases are opened without making them (`open_db` raises
+    FileNotFoundError or ValueError for one that is missing or not of its schema), so a
+    state that is not there is an error and never an empty one. Raises ValueError when
+    the state lacks its cursor or its applied_seq.
+    """
+    carried = _carried(prior)
+    with (
+        closing(open_db(workdir / STATE_DB, STATE_SCHEMA)) as state,
+        closing(open_db(workdir / OPEN_DELTA_DB, DELTA_SCHEMA)),
+    ):
+        cursor = int(_meta(state, "cursor"))
+        applied = int(_meta(state, "applied_seq"))
+    return _Resume(carried, cursor, applied)
 
 
 def _reuse(workdir: Path, entry: Asset, name: str) -> Path:
@@ -432,10 +498,8 @@ def _coverage(state: sqlite3.Connection, remaining: int) -> dict:
     `unswept` split them by whether their page has been read in full. `remaining`
     counts the projects that the run left to the next one, and `bootstrap_at` is when
     the state was first built."""
-    marks = ", ".join("?" * len(INACTIVE))
     projects, swept = state.execute(
-        "SELECT count(*), coalesce(sum(swept), 0) FROM projects "
-        f"WHERE status NOT IN ({marks})",
+        f"SELECT count(*), coalesce(sum(swept), 0) FROM projects WHERE {_ACTIVE}",
         INACTIVE,
     ).fetchone()
     return {
@@ -445,6 +509,26 @@ def _coverage(state: sqlite3.Connection, remaining: int) -> dict:
         "remaining": remaining,
         "bootstrap_at": _meta(state, "bootstrap_at"),
     }
+
+
+def _apply_run(
+    state: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    *,
+    applied: int,
+    remaining: int,
+) -> tuple[int, dict]:
+    """Commit what a run wrote to its open delta, `conn`, and apply it to `state`.
+
+    `applied` is the highest `seq` that the state had applied when the run began, so
+    the rows above it are the run's. Returns the number of `removed` events among them,
+    and what the state covers once they are applied (see `_coverage`), where `remaining`
+    is the projects that the run left to the next one.
+    """
+    conn.commit()
+    removals = _removals(conn, after_seq=applied)
+    _apply(state, conn)
+    return removals, _coverage(state, remaining)
 
 
 def _prepare_current(workdir: Path, today: date) -> tuple[list[Path], list[Asset]]:
@@ -485,22 +569,24 @@ def _manifest(
     prior: Manifest | None,
     assets: list[Asset],
     *,
-    serial: int,
+    data_through: Watermark,
+    cursor: str | None,
     coverage: dict,
     moment: str,
 ) -> Manifest:
-    """The manifest of a publish made at `moment` from the root at `serial`. The data
-    reaches as far as that root, which is the cursor too. The run is complete when it
-    left no project to the next one. The logs of series breaks, corrections and
-    overrides go on from the prior manifest."""
+    """The manifest of a publish made at `moment`. `data_through` and `cursor` say how
+    far the data reaches and which root was read last. A run that read a root gives its
+    serial for both, and one that read none, like the sweep, gives those of the prior
+    manifest. The run is complete when it left no project to the next one. The logs of
+    series breaks, corrections and overrides go on from the prior manifest."""
     return Manifest(
         stream=STREAM,
         producer=_producer(repo),
         generated_at=moment,
         complete=coverage["remaining"] == 0,
         coverage=coverage,
-        data_through=Watermark(str(serial), "serial"),
-        cursor=str(serial),
+        data_through=data_through,
+        cursor=cursor,
         licences=_stream_toml()["upstreams"],
         assets=assets,
         series_breaks=list(prior.series_breaks) if prior else [],
@@ -542,6 +628,71 @@ def _gate(
     return replace(manifest, overrides=[*manifest.overrides, entry]), failures
 
 
+def _publish(
+    gh: GitHub,
+    workdir: Path,
+    prior: Manifest,
+    added: list[Asset],
+    *,
+    today: date,
+    moment: str,
+    data_through: Watermark,
+    cursor: str | None,
+    coverage: dict,
+    files_removed: int,
+    removals: int,
+    override_reason: str | None,
+) -> list[GateFailure]:
+    """Publish the state that a run left in `workdir`: the end of every run that goes
+    on from a published state, the sweep's as well as the daily run's.
+
+    It compresses the state and the open delta, writes the manifest (see `_manifest`)
+    from them, the closed assets of `prior` and the `added` entries of the rollover,
+    checks it against `prior` (see `_gate`), and swaps the files and the manifest into
+    the current release. Returns the failures that `override_reason` overrode, and
+    raises GateError for any that it did not, before anything is published.
+    """
+    files, current = _prepare_current(workdir, today)
+    closed = [asset for asset in prior.assets if asset.closed]
+    manifest = _manifest(
+        gh.repo,
+        prior,
+        [*current, *closed, *added],
+        data_through=data_through,
+        cursor=cursor,
+        coverage=coverage,
+        moment=moment,
+    )
+    manifest, failures = _gate(
+        prior,
+        manifest,
+        files_removed=files_removed,
+        removals=removals,
+        override_reason=override_reason,
+        moment=moment,
+    )
+    publish_current(gh, STREAM, files, manifest, bootstrap=False)
+    return failures
+
+
+def _report(
+    processed: ProcessReport, *, requests: int, failures: list[GateFailure]
+) -> RunReport:
+    """The report of a run that processed projects: the counts of `processed`, the
+    `requests` that it made and the gate `failures` that were overridden."""
+    return RunReport(
+        new=processed.new,
+        changed=processed.changed,
+        vanished=processed.vanished,
+        returned=processed.returned,
+        versions_fetched=processed.versions_fetched,
+        requests=requests,
+        swept=processed.swept,
+        remaining=processed.remaining,
+        gate_failures=failures,
+    )
+
+
 def _bootstrap(
     gh: GitHub, http: Http, workdir: Path, *, moment: str, today: date, requests: int
 ) -> RunReport:
@@ -579,7 +730,8 @@ def _bootstrap(
         gh.repo,
         None,
         [*current, base[1]],
-        serial=root.serial,
+        data_through=Watermark(str(root.serial), "serial"),
+        cursor=str(root.serial),
         coverage=coverage,
         moment=moment,
     )
@@ -635,76 +787,191 @@ def run_once(
         return _bootstrap(
             gh, http, workdir, moment=moment, today=today, requests=requests
         )
-    carried = _carried(prior)
-    state_db, delta_db = workdir / STATE_DB, workdir / OPEN_DELTA_DB
-    with (
-        closing(open_db(state_db, STATE_SCHEMA)) as state,
-        closing(open_db(delta_db, DELTA_SCHEMA)),
-    ):
-        cursor = int(_meta(state, "cursor"))
-        applied = int(_meta(state, "applied_seq"))
+    resume = _resume(prior, workdir)
     root = get_root(http)
-    if root.serial < cursor:
+    if root.serial < resume.cursor:
         raise StaleRootError(
-            f"the root's serial {root.serial} is below the stored cursor {cursor}, so "
-            "it is a stale copy, and nothing was written"
+            f"the root's serial {root.serial} is below the stored cursor "
+            f"{resume.cursor}, so it is a stale copy, and nothing was written"
         )
-    added = _roll_over(gh, workdir, prior, carried, today)
+    added = _roll_over(gh, workdir, prior, resume.carried, today)
     with (
-        closing(open_db(state_db, STATE_SCHEMA)) as state,
-        closing(open_db(delta_db, DELTA_SCHEMA)) as conn,
+        closing(open_db(workdir / STATE_DB, STATE_SCHEMA)) as state,
+        closing(open_db(workdir / OPEN_DELTA_DB, DELTA_SCHEMA)) as conn,
     ):
         # A new day's delta is numbered on from what the state has applied, and
         # today's goes on after its own last row.
-        delta = Delta(conn, moment, first_seq=applied + 1)
+        delta = Delta(conn, moment, first_seq=resume.applied + 1)
         processed = process_projects(
             state, delta, http, root, deadline=deadline, clock=clock
         )
         delta.cursor(root.serial, moment)
-        conn.commit()
-        removals = _removals(conn, after_seq=applied)
-        _apply(state, conn)
-        coverage = _coverage(state, processed.remaining)
-    files, current = _prepare_current(workdir, today)
-    closed = [asset for asset in prior.assets if asset.closed]
-    manifest = _manifest(
-        gh.repo,
+        removals, coverage = _apply_run(
+            state, conn, applied=resume.applied, remaining=processed.remaining
+        )
+    failures = _publish(
+        gh,
+        workdir,
         prior,
-        [*current, *closed, *added],
-        serial=root.serial,
-        coverage=coverage,
+        added,
+        today=today,
         moment=moment,
-    )
-    manifest, failures = _gate(
-        prior,
-        manifest,
+        data_through=Watermark(str(root.serial), "serial"),
+        cursor=str(root.serial),
+        coverage=coverage,
         files_removed=processed.files_removed,
         removals=removals,
         override_reason=override_reason,
+    )
+    return _report(processed, requests=http.requests - requests, failures=failures)
+
+
+def _sweep_projects(
+    state: sqlite3.Connection,
+    delta: Delta,
+    http: Http,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+) -> ProcessReport:
+    """Read the page of each project that is not swept yet, in full, until `clock()`
+    reaches `deadline`, writing what it finds to `delta`.
+
+    The projects are the ones that are neither removed nor quarantined and that no run
+    has read in full, taken by name. Each page goes through `process.process_unswept`,
+    which writes the files that the state lacks, the versions, the release records of
+    the versions with a file from after the bootstrap, and a swept row that carries the
+    status of the page. That is all that is written. There is no event, because the
+    page is read as it is now, and nothing says when it changed. There is no serial,
+    because no root is read: a project keeps the serial that it has, so a daily run that
+    later finds it changed reads its page again, and writes only what the page has
+    gained since.
+
+    A page that cannot be used is skipped, with nothing written, and its project stays
+    unswept:
+
+    - a page that is not there (404 or 410). The daily run probes the project when the
+      root stops listing it, and records its removal then;
+    - a quarantined page, which lists no files and so says nothing of the ones that the
+      state holds. The daily run probes the project in the same way, and records the
+      quarantine;
+    - a page whose serial is below the stored one, which is an old copy of the page.
+
+    The next sweep asks for each of them again. A project is processed whole or not at
+    all: the deadline is checked between projects. The state is read and never written,
+    and the delta is not committed. `remaining` counts the projects that are still
+    unswept, those that the deadline cut off and those that were skipped.
+    """
+    ctx = Context(state, delta, http, bootstrap_at(state))
+    unswept = state.execute(
+        "SELECT name, incarnation, last_serial FROM projects "
+        f"WHERE swept = 0 AND {_ACTIVE} ORDER BY name",
+        INACTIVE,
+    ).fetchall()
+    for name, incarnation, stored_serial in unswept:
+        if clock() >= deadline:
+            break
+        _, page = get_page(http, name)
+        if page is None or page.status == "quarantined" or page.serial < stored_serial:
+            continue
+        process_unswept(ctx, name, incarnation, page)
+    return ProcessReport(
+        new=0,
+        changed=0,
+        vanished=0,
+        returned=0,
+        versions_fetched=ctx.versions_fetched,
+        swept=ctx.swept,
+        remaining=len(unswept) - ctx.swept,
+        files_removed=0,
+    )
+
+
+def sweep(
+    gh: GitHub,
+    http: Http,
+    workdir: Path,
+    *,
+    now: datetime,
+    max_seconds: float = 16_200,
+    clock: Callable[[], float] = time.monotonic,
+) -> RunReport:
+    """One sweep of the stream at `now`, in the empty directory `workdir`.
+
+    It goes on from the last publish as a run does that is not a bootstrap, and reads no
+    root, so it takes the state as it is. The stream must have published already, and
+    its manifest must list the state and the open delta (PriorStateError): the sweep
+    never builds a first state. It rolls over (see `_roll_over`), reads the page of each
+    project that is not swept yet until `max_seconds` from its start on `clock` have
+    passed (see `_sweep_projects`), and applies the delta to the state. It then writes
+    the manifest, checks it with the gates, and swaps the state, the open delta and the
+    manifest into the current release, as `run_once` does. The manifest keeps the
+    `data_through` and the `cursor` of the prior one, because no root was read, and it
+    is complete when no project is left unswept.
+
+    The report's `swept` is the number of projects that this sweep read, and its
+    `remaining` is the number that are still unswept. Each sweep reads what it has the
+    time for, and the next goes on, so the sweep is run again while `remaining` is not
+    0 (see `main`).
+
+    A gate failure raises GateError. The sweep takes no override reason: a held publish
+    is overridden by the daily run, which does. Every other error propagates as well,
+    and an error before the publish publishes nothing to the current release, so the
+    work of that sweep is lost, and the next one does it again.
+    """
+    deadline = clock() + max_seconds
+    requests = http.requests
+    moment = _instant(now)
+    today = now.astimezone(UTC).date()
+    prior = fetch_prior(gh, STREAM, workdir, bootstrap=False)
+    if prior is None:
+        raise PriorStateError(
+            f"{gh.repo} has no published state to sweep: a stream's first state is the "
+            "bootstrap of the daily run"
+        )
+    resume = _resume(prior, workdir)
+    added = _roll_over(gh, workdir, prior, resume.carried, today)
+    with (
+        closing(open_db(workdir / STATE_DB, STATE_SCHEMA)) as state,
+        closing(open_db(workdir / OPEN_DELTA_DB, DELTA_SCHEMA)) as conn,
+    ):
+        delta = Delta(conn, moment, first_seq=resume.applied + 1)
+        processed = _sweep_projects(state, delta, http, deadline=deadline, clock=clock)
+        removals, coverage = _apply_run(
+            state, conn, applied=resume.applied, remaining=processed.remaining
+        )
+    failures = _publish(
+        gh,
+        workdir,
+        prior,
+        added,
+        today=today,
         moment=moment,
+        data_through=prior.data_through,
+        cursor=prior.cursor,
+        coverage=coverage,
+        files_removed=processed.files_removed,
+        removals=removals,
+        override_reason=None,
     )
-    publish_current(gh, STREAM, files, manifest, bootstrap=False)
-    return RunReport(
-        new=processed.new,
-        changed=processed.changed,
-        vanished=processed.vanished,
-        returned=processed.returned,
-        versions_fetched=processed.versions_fetched,
-        requests=http.requests - requests,
-        swept=processed.swept,
-        remaining=processed.remaining,
-        gate_failures=failures,
-    )
+    return _report(processed, requests=http.requests - requests, failures=failures)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the stream from the command line: `python -m pypi_registry run`.
+    """Run the stream from the command line: `python -m pypi_registry run` or
+    `python -m pypi_registry sweep`.
 
     It needs GITHUB_TOKEN, and publishes to GITHUB_REPOSITORY, or to
     py-observatory/data when that is not set. It makes one GitHub client, whose
     writes are paced, for every call of the run, and works in a new directory under
-    ./work, which is removed afterwards. It prints the report as JSON and returns 0.
-    Every error propagates.
+    ./work, which is removed afterwards. It prints the report as JSON. Every error
+    propagates.
+
+    `run` returns 0. `sweep` returns 3, when it has swept some projects and others
+    are left, to say that it is to be run again, and 0 otherwise. A sweep that reads
+    nothing while projects are left has met only pages that it cannot use, which a
+    sweep that followed at once would meet as well, so it returns 0 and ends the chain
+    that runs it again.
     """
     parser = argparse.ArgumentParser(
         prog="python -m pypi_registry", description="The pypi-registry stream."
@@ -729,6 +996,17 @@ def main(argv: list[str] | None = None) -> int:
         default=18_000,
         help="stop starting projects after this many seconds (default: 18000)",
     )
+    sweeping = commands.add_parser(
+        "sweep",
+        help="read the page of each project that no run has read in full, and publish "
+        "what they hold",
+    )
+    sweeping.add_argument(
+        "--max-seconds",
+        type=float,
+        default=16_200,
+        help="stop starting projects after this many seconds (default: 16200)",
+    )
     args = parser.parse_args(argv)
     gh = GitHub(
         os.environ.get("GITHUB_REPOSITORY", _REPOSITORY), os.environ["GITHUB_TOKEN"]
@@ -736,14 +1014,25 @@ def main(argv: list[str] | None = None) -> int:
     work = Path.cwd() / "work"
     work.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="run-", dir=work) as workdir:
-        report = run_once(
-            gh,
-            Http(),
-            Path(workdir),
-            now=datetime.now(UTC),
-            bootstrap=args.bootstrap,
-            override_reason=args.override_reason or None,
-            max_seconds=args.max_seconds,
-        )
+        if args.command == "sweep":
+            report = sweep(
+                gh,
+                Http(),
+                Path(workdir),
+                now=datetime.now(UTC),
+                max_seconds=args.max_seconds,
+            )
+        else:
+            report = run_once(
+                gh,
+                Http(),
+                Path(workdir),
+                now=datetime.now(UTC),
+                bootstrap=args.bootstrap,
+                override_reason=args.override_reason or None,
+                max_seconds=args.max_seconds,
+            )
     print(json.dumps(asdict(report)))
+    if args.command == "sweep" and report.swept and report.remaining:
+        return SWEEP_AGAIN
     return 0

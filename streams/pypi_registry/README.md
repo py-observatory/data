@@ -28,8 +28,8 @@ The Simple API is read as PEP 691 JSON (`application/vnd.pypi.simple.v1+json`). 
 - `src/pypi_registry/store.py`: the state database and the delta databases. A run writes each change as a numbered row of a delta, and `apply_delta` applies the rows to the state in order. The state at the end of any day can be rebuilt from the state at the start of the month and that month's deltas.
 - `src/pypi_registry/layout.py`: the names of the databases in the releases, and what a run seals when a day or a month has ended.
 - `src/pypi_registry/process.py`: the processing of projects. It probes the names that left the root, and reads the page of each project that is new, changed or listed again, writing what it finds to the open delta. A page that is missing or older than the root says is skipped and read again by the next run, a quarantined page keeps the stored files, and no file, version or release record is written twice.
-- `src/pypi_registry/run.py`: the run. It reads the last published state, and refuses a root older than that state before it writes anything. When a day has ended, it seals the open delta into the month's release. When a month has ended, it first rebuilds the month's state from its base copy and its deltas and checks that this equals the state, and only then merges the month's deltas into its part. It then processes the projects (`process.py`), applies the delta to the state, checks the new manifest against the last one with the publish gates, and publishes.
-- `tests/`: offline tests, and the fixtures they read. `run_helpers.py` holds what the tests of processing (`test_process.py`) and of the run (`test_run.py`) share, and `conftest.py` closes the connections that a test opened.
+- `src/pypi_registry/run.py`: the run. It reads the last published state, and refuses a root older than that state before it writes anything. When a day has ended, it seals the open delta into the month's release. When a month has ended, it first rebuilds the month's state from its base copy and its deltas and checks that this equals the state, and only then merges the month's deltas into its part. It then processes the projects (`process.py`), applies the delta to the state, checks the new manifest against the last one with the publish gates, and publishes. The sweep (`sweep`) is the same run without a root: it reads the page of each project that no run has read in full yet.
+- `tests/`: offline tests, and the fixtures they read. `run_helpers.py` holds what the tests of processing (`test_process.py`), of the run (`test_run.py`) and of the sweep (`test_sweep.py`) share: a clock and a transport, PyPI's replies, and the runs of a stream on a fake GitHub. `conftest.py` closes the connections that a test opened.
 
 ## What is published
 
@@ -49,6 +49,18 @@ uv run --package pypi-registry python -m pypi_registry run
 `--bootstrap` builds the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. It does not override a failed month close: when the month that ended, rebuilt from its base copy and its deltas, differs from the state, the run stops whatever the reason, because publishing would build on a month that its releases cannot restore. `--max-seconds` is how long after its start a run stops starting projects (18,000 by default), and the projects that it does not reach are read by the next run.
 
 A bootstrap that adds the month's base copy and then fails before it publishes cannot simply be run again. A second bootstrap refuses a `pypi-registry-current` release that the first one left, even a half-made one. Without one, a second bootstrap in the same month stops with CreateOnceError on `pypi-registry-state-base-YYYY-MM.db.zst`, because the state that it builds is new bytes. The way back is a manual reset with the owner: delete the half-made `pypi-registry-current` release, if there is one, and that base copy, and record the deletions in a dated entry in `RETENTION.md`. Waiting for the next month keeps the base copy, as the next month's has another name, but a half-made `pypi-registry-current` must still go.
+
+### The sweep
+
+The bootstrap stores every project of the root without its page, so each starts unswept, and the daily run reads a project's page only when the project changes. The sweep reads the rest:
+
+```
+uv run --package pypi-registry python -m pypi_registry sweep
+```
+
+It goes on from the last published state and reads no root. For each project whose page no run has read in full, it records the files with their yanks and the status of the project, as the page shows them now. They are rows of the delta and not events, because nothing says when they changed, and a file from before the first state was built is not marked as seen when it appeared. It writes no serial and no cursor, so the manifest keeps those of the last daily run. A page that is missing, quarantined or older than the state is skipped, and the next sweep asks for it again; the daily run records a project that PyPI has removed or quarantined when the root stops listing it.
+
+`--max-seconds` is how long after its start a sweep stops starting projects (16,200 by default), so each sweep reads part of the projects, and the manifest's `coverage` says how many are left. A sweep exits with 3 when it has read some projects and others are left, which is the signal to run it again, and with 0 otherwise. One that reads nothing exits with 0 although projects are left: it met only pages that it cannot use, and another sweep would meet the same ones. Any other failure ends the sweep with an error and publishes nothing, so the next sweep reads again what that one had read.
 
 ## Tests
 
