@@ -2,8 +2,8 @@
 
 `fetch_prior` reads a stream's prior state from `<stream>-current`, and
 `publish_current` swaps the next state into it. `add_create_once` adds files to a
-release whose assets are never replaced. `prepare_asset` compresses a database and
-describes it for the manifest.
+release whose assets are never replaced, and `fetch_assets` reads assets back from any
+release. `prepare_asset` compresses a database and describes it for the manifest.
 
 Reading prior state fails closed. An error once read as "no release yet" let a run
 publish over good data, so only a confirmed HTTP 404 of the `-current` release, with
@@ -152,6 +152,51 @@ def fetch_prior(
     for asset, source in zip(state, sources, strict=True):
         _fetch_asset(gh, asset, source, workdir)
     return manifest
+
+
+def fetch_assets(gh: GitHub, assets: list[Asset], workdir: Path) -> list[Path]:
+    """Download the manifest entries `assets`, each from the release of its tag, and
+    return the checked file that each expands to, in order.
+
+    Each asset is downloaded to `workdir/<name>` and expanded to `workdir/<name
+    without .zst>`, and both files are checked against the entry, as `fetch_prior`
+    checks the state. A file that is not a `.zst` is checked as it is, and its own
+    path is returned. No release is changed.
+
+    Every asset is found, by its tag and its name, before any is downloaded. Raises
+    PriorStateError when a tag has no release (GitHub answers 404), when a release
+    holds no asset of the name, and when a downloaded or expanded file does not match
+    its entry. Every other error propagates. Raises ValueError, before any request,
+    when two entries share a name, because both would be downloaded to one path.
+    """
+    repeated = _repeated([asset.name for asset in assets])
+    if repeated:
+        raise ValueError(
+            f"more than one asset is named {', '.join(repeated)}, and each is "
+            "downloaded to its name"
+        )
+    listings: dict[str, dict[str, dict]] = {}
+    sources = []
+    for asset in assets:
+        if asset.tag not in listings:
+            try:
+                release = gh.release_by_tag(asset.tag)
+            except NotFound as exc:
+                raise PriorStateError(
+                    f"{gh.repo} has no release {asset.tag}, which the manifest says "
+                    f"holds {asset.name}"
+                ) from exc
+            listings[asset.tag] = {held["name"]: held for held in gh.assets(release)}
+        source = listings[asset.tag].get(asset.name)
+        if source is None:
+            raise PriorStateError(
+                f"{asset.tag} holds no {asset.name}, which the manifest lists in it"
+            )
+        sources.append(source)
+    return [
+        _fetch_asset(gh, asset, source, workdir)
+        for asset, source in zip(assets, sources, strict=True)
+    ]
 
 
 def publish_current(

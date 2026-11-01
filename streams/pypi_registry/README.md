@@ -26,8 +26,26 @@ The Simple API is read as PEP 691 JSON (`application/vnd.pypi.simple.v1+json`). 
 - `src/pypi_registry/records.py`: the record kept for each release, with the facts of its README in place of its text. Email addresses are taken out of it, and the names of people stay. A reply of a shape that it does not know raises a ValueError.
 - `src/pypi_registry/diff.py`: what changed since the last run. It sorts the names of the root into new, changed, vanished and returned, compares a project page with the stored files, and reads the reply to a probe of a name that left the root. It also defines the events that a run records.
 - `src/pypi_registry/store.py`: the state database and the delta databases. A run writes each change as a numbered row of a delta, and `apply_delta` applies the rows to the state in order. The state at the end of any day can be rebuilt from the state at the start of the month and that month's deltas.
-- `src/pypi_registry/run.py`: the run. It probes the names that left the root, and reads the page of each project that is new, changed or listed again, writing what it finds to the open delta. A page that is missing or older than the root says is skipped and read again by the next run, a quarantined page keeps the stored files, and no file, version or release record is written twice.
+- `src/pypi_registry/layout.py`: the names of the databases in the releases, and what a run seals when a day or a month has ended.
+- `src/pypi_registry/run.py`: the run. It reads the last published state, and refuses a root older than that state before it writes anything. When a day has ended, it seals the open delta into the month's release. When a month has ended, it first rebuilds the month's state from its base copy and its deltas and checks that this equals the state, and only then merges the month's deltas into its part. It probes the names that left the root, reads the page of each project that is new, changed or listed again, writes what it finds to the open delta, and applies the delta to the state. A page that is missing or older than the root says is skipped and read again by the next run, a quarantined page keeps the stored files, and no file, version or release record is written twice. Last, it checks the new manifest against the last one with the publish gates, and publishes.
 - `tests/`: offline tests, and the fixtures they read.
+
+## What is published
+
+- `pypi-registry-current` holds the state (`pypi-registry-state.db.zst`), the open delta of the day of the last run (`pypi-registry-delta-open.db.zst`) and `manifest.json`, which lists every asset of the stream.
+- `pypi-registry-month-YYYY-MM` holds the state as the month began (`pypi-registry-state-base-YYYY-MM.db.zst`) and the delta of each day that had a run (`pypi-registry-delta-YYYY-MM-DD.db.zst`). Once the month is over, it also holds the month's deltas merged into one database (`pypi-registry-YYYY-MM.db.zst`) and the month's manifest (`manifest-YYYY-MM.json`). Its assets are never replaced.
+
+The state at the end of any day is the month's base copy with that month's deltas applied in day order, up to that day (`run.replay`). Each run that closes a month checks that this gives back the state before it publishes.
+
+## Running
+
+A run publishes to `GITHUB_REPOSITORY` (`py-observatory/data` when it is not set), with the token in `GITHUB_TOKEN`:
+
+```
+uv run --package pypi-registry python -m pypi_registry run
+```
+
+`--bootstrap` builds the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. `--max-seconds` is how long after its start a run stops starting projects (18,000 by default), and the projects that it does not reach are read by the next run.
 
 ## Tests
 

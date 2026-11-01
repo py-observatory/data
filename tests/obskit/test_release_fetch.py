@@ -8,7 +8,7 @@ import pytest
 
 from obskit.github import GitHub, NotFound, Transient
 from obskit.manifest import Asset, Manifest, ManifestError, TableInfo, Watermark, dumps
-from obskit.release import PriorStateError, fetch_prior
+from obskit.release import PriorStateError, fetch_assets, fetch_prior
 from obskit.testing import FakeGitHub
 from obskit.zst import compress_file, sha256_file
 
@@ -614,3 +614,189 @@ def test_errors_after_the_release_is_found_propagate(
         fetch_prior(gh, STREAM, workdir, bootstrap=False)
 
     assert caught.value.status == status
+
+
+# --- fetch_assets: assets of any release, found by tag and name ---
+
+NOVEMBER = "example-month-2026-11"
+DECEMBER = "example-month-2026-12"
+BASE = "example-state-base-2026-11.db.zst"
+DAY = "example-delta-2026-11-02.db.zst"
+NEXT_BASE = "example-state-base-2026-12.db.zst"
+MONTH_MANIFEST = "manifest-2026-11.json"
+
+
+def seed_release(
+    gh: GitHub, fake: FakeGitHub, tag: str, files: dict[str, Path]
+) -> None:
+    """Create the release `tag` holding each file under its asset name, then forget
+    the calls that did it."""
+    release = gh.create_release(tag)
+    for name, path in files.items():
+        gh.upload(release, name, path)
+    fake.calls.clear()
+
+
+def downloaded(fake: FakeGitHub) -> list[str]:
+    """The assets downloaded from any release, as `<tag>/<name>`, in order."""
+    prefix = f"https://github.com/{REPO}/releases/download/"
+    return [
+        url.removeprefix(prefix)
+        for method, url, _ in fake.calls
+        if method == "GET" and url.startswith(prefix)
+    ]
+
+
+@dataclass
+class Month:
+    """The closed assets of a month, each by its asset name: the file and its entry."""
+
+    files: dict[str, Path]
+    entries: dict[str, Asset]
+
+
+def closed_month(tmp_path: Path) -> Month:
+    """A month's base copy, a sealed delta and the month's manifest, all in NOVEMBER,
+    and the next month's base copy in DECEMBER."""
+    src = tmp_path / "src"
+    files: dict[str, Path] = {}
+    entries: dict[str, Asset] = {}
+    for name, tag, period, role in [
+        (BASE, NOVEMBER, "2026-11", "state"),
+        (DAY, NOVEMBER, "2026-11-02", "public"),
+        (NEXT_BASE, DECEMBER, "2026-12", "state"),
+    ]:
+        content = f"{name}\n".encode() * 1000
+        files[name], entries[name] = pack(
+            src, name, content, tag=tag, period=period, role=role, closed=True
+        )
+    data = b'{"stream": "example"}\n'
+    files[MONTH_MANIFEST] = src / MONTH_MANIFEST
+    files[MONTH_MANIFEST].write_bytes(data)
+    digest = sha256_file(files[MONTH_MANIFEST])
+    entries[MONTH_MANIFEST] = Asset(
+        name=MONTH_MANIFEST,
+        tag=NOVEMBER,
+        role="public",
+        format="json",
+        asset_bytes=len(data),
+        asset_sha256=digest,
+        db_bytes=len(data),
+        db_sha256=digest,
+        tables={},
+        period="2026-11",
+        closed=True,
+    )
+    return Month(files, entries)
+
+
+def seed_month(gh: GitHub, fake: FakeGitHub, month: Month) -> None:
+    """Both releases, each holding its assets, and NOVEMBER also one that no test asks
+    for."""
+    november = [name for name, entry in month.entries.items() if entry.tag == NOVEMBER]
+    unasked = month.files[BASE].parent / "example-delta-2026-11-01.db.zst"
+    unasked.write_bytes(b"not asked for")
+    seed_release(
+        gh,
+        fake,
+        NOVEMBER,
+        {**{name: month.files[name] for name in november}, unasked.name: unasked},
+    )
+    seed_release(gh, fake, DECEMBER, {NEXT_BASE: month.files[NEXT_BASE]})
+
+
+def test_fetch_assets_verifies_and_expands(gh, fake, tmp_path, workdir):
+    month = closed_month(tmp_path)
+    seed_month(gh, fake, month)
+    wanted = [DAY, NEXT_BASE, BASE, MONTH_MANIFEST]
+
+    paths = fetch_assets(gh, [month.entries[name] for name in wanted], workdir)
+
+    # Each path is the checked file that its asset expands to, in the order asked. A
+    # .zst is expanded beside its download, and the JSON is checked as it is.
+    assert paths == [
+        workdir / "example-delta-2026-11-02.db",
+        workdir / "example-state-base-2026-12.db",
+        workdir / "example-state-base-2026-11.db",
+        workdir / MONTH_MANIFEST,
+    ]
+    for name, path in zip(wanted, paths, strict=True):
+        if name == MONTH_MANIFEST:
+            assert path.read_bytes() == month.files[name].read_bytes()
+        else:
+            assert path.read_bytes() == f"{name}\n".encode() * 1000
+            assert (workdir / name).read_bytes() == month.files[name].read_bytes()
+    # Each release is looked up once, and only the assets asked for are downloaded,
+    # each once. Nothing is written.
+    tags = [url for method, url, _ in fake.calls if "/releases/tags/" in url]
+    assert [url.rsplit("/", 1)[1] for url in tags] == [NOVEMBER, DECEMBER]
+    assert downloaded(fake) == [
+        f"{NOVEMBER}/{DAY}",
+        f"{DECEMBER}/{NEXT_BASE}",
+        f"{NOVEMBER}/{BASE}",
+        f"{NOVEMBER}/{MONTH_MANIFEST}",
+    ]
+    assert {method for method, _, _ in fake.calls} == {"GET"}
+
+
+def test_fetch_assets_of_nothing_asks_nothing(gh, fake, workdir):
+    assert fetch_assets(gh, [], workdir) == []
+    assert fake.calls == []
+
+
+# Each way that an asset of the month can fail to be what its entry says: the entry
+# change that makes it so, and what the error names.
+REFUSED = {
+    "no release": (
+        {"tag": "example-month-2026-10"},
+        "no release example-month-2026-10",
+    ),
+    "no asset": ({"name": "example-delta-x.db.zst"}, "holds no example-delta-x.db.zst"),
+    "other bytes": ({"asset_sha256": "0" * 64}, f"gives {DAY} the sha256 0000"),
+    "other database": ({"db_sha256": "0" * 64}, f"{DAY} in {NOVEMBER} expands to"),
+}
+
+
+@pytest.mark.parametrize("case", REFUSED)
+def test_fetch_assets_refuses_an_asset_that_is_missing_or_differs(
+    gh, fake, tmp_path, workdir, case
+):
+    month = closed_month(tmp_path)
+    seed_month(gh, fake, month)
+    change, message = REFUSED[case]
+    asked = [month.entries[BASE], dataclasses.replace(month.entries[DAY], **change)]
+
+    with pytest.raises(PriorStateError, match=message) as caught:
+        fetch_assets(gh, asked, workdir)
+
+    if case == "no release":
+        assert isinstance(caught.value.__cause__, NotFound), "the 404 is the evidence"
+    if case in ("no release", "no asset"):
+        # Every asset is found before any is downloaded, so a missing one costs no
+        # download of the others.
+        assert downloaded(fake) == []
+    assert {method for method, _, _ in fake.calls} == {"GET"}
+
+
+def test_fetch_assets_lets_a_transient_failure_through(gh, fake, tmp_path, workdir):
+    # A 502 when looking the release up is not a missing release.
+    month = closed_month(tmp_path)
+    seed_month(gh, fake, month)
+    fake.fail("GET", f"/releases/tags/{NOVEMBER}", 502, times=6)
+
+    with pytest.raises(Transient) as caught:
+        fetch_assets(gh, [month.entries[BASE]], workdir)
+
+    assert caught.value.status == 502
+    assert downloaded(fake) == []
+
+
+def test_fetch_assets_refuses_two_assets_of_one_name(gh, fake, tmp_path, workdir):
+    # Both would be downloaded to one path, and one would be returned as the other.
+    month = closed_month(tmp_path)
+    twin = dataclasses.replace(month.entries[BASE], tag=DECEMBER)
+
+    with pytest.raises(ValueError, match=BASE):
+        fetch_assets(gh, [month.entries[BASE], twin], workdir)
+
+    assert fake.calls == []
