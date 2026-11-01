@@ -77,11 +77,19 @@ class _Failure:
 @dataclass
 class _Request:
     """A request that matched a route: what the route's pattern captured from the
-    path, the query string, and the body."""
+    path, the query string, the body, and the headers as the client sent them."""
 
     found: re.Match[str]
     query: dict[str, list[str]]
     body: bytes | None
+    headers: dict[str, str]
+
+
+def _wants_bytes(headers: dict[str, str]) -> bool:
+    """Whether a request asks for an asset's bytes, which GitHub gives for an `Accept`
+    of `application/octet-stream` and for nothing else."""
+    accept = {name.lower(): value for name, value in headers.items()}.get("accept", "")
+    return accept.strip().lower() == "application/octet-stream"
 
 
 class FakeGitHub:
@@ -92,7 +100,16 @@ class FakeGitHub:
 
     - A tag with no release is a 404. A second release for a tag is a 422.
     - Assets are listed a page at a time (`per_page`, `page`). Each has an `id`, a
-      `name`, a `size`, a `digest` ("sha256:<hex>") and a `browser_download_url`.
+      `name`, a `size`, a `digest` ("sha256:<hex>"), a `url` (its API URL, which holds
+      its id) and a `browser_download_url`.
+    - An asset is read by its id, at its `url`. With `Accept: application/octet-stream`
+      the reply is its bytes, and otherwise its JSON. An id that no asset holds, that
+      of a deleted asset included, is a 404.
+    - The `browser_download_url` is listed, as GitHub lists it, and is not served: the
+      kit must never download through a name. A rename moves a name from one asset to
+      another, and GitHub can go on resolving the name to the asset that held it a
+      moment before. A request for that URL raises NotImplementedError, as any route
+      that the fake lacks does.
     - An upload, or a rename, to a name that the release already holds is a 422.
     - The release objects it returns hold no `assets` list, so that code must read the
       assets endpoint. `release()` is how a test looks inside.
@@ -114,9 +131,6 @@ class FakeGitHub:
         by_tag = re.compile(rf"{api}/tags/(?P<tag>.+)")
         assets = re.compile(rf"{api}/(?P<release>[0-9]+)/assets")
         asset = re.compile(rf"{api}/assets/(?P<asset>[0-9]+)")
-        download = re.compile(
-            rf"/{re.escape(repo)}/releases/download/(?P<tag>[^/]+)/(?P<name>.+)"
-        )
         self._asset_path = asset
         # Each route: the method, the host, a pattern for the whole path, and a handler.
         self._routes: list[
@@ -126,9 +140,9 @@ class FakeGitHub:
             ("POST", "api.github.com", collection, self._create),
             ("GET", "api.github.com", assets, self._list),
             ("POST", "uploads.github.com", assets, self._upload),
+            ("GET", "api.github.com", asset, self._read),
             ("PATCH", "api.github.com", asset, self._rename),
             ("DELETE", "api.github.com", asset, self._delete),
-            ("GET", "github.com", download, self._download),
         ]
 
     def fail(
@@ -144,9 +158,10 @@ class FakeGitHub:
         `path_contains` with `status` and `headers`, without carrying them out. The
         header names are lowercased, as a Transport gives them.
 
-        The URL of a rename or a delete holds only the id of the asset. To aim at one
-        asset by its name, match `name=<name>`: such a request also matches as if its
-        URL ended `?name=<the asset's name at that moment>`, as an upload's URL does.
+        The URL of a download, a rename or a delete holds only the id of the asset. To
+        aim at one asset by its name, match `name=<name>`: such a request also matches
+        as if its URL ended `?name=<the asset's name at that moment>`, as an upload's
+        URL does.
         `fail("PATCH", "name=swap-next-state.db.zst", 422)` fails the rename of that
         one asset, and may be set before the asset exists.
         """
@@ -188,7 +203,8 @@ class FakeGitHub:
         for route_method, host, pattern, handler in self._routes:
             found = pattern.fullmatch(path)
             if found and method == route_method and parts.netloc == host:
-                return handler(_Request(found, parse_qs(parts.query), body))
+                query = parse_qs(parts.query)
+                return handler(_Request(found, query, body, headers))
         raise NotImplementedError(
             f"FakeGitHub({self.repo}) has no route for {method} {url}"
         )
@@ -231,13 +247,15 @@ class FakeGitHub:
         }
 
     def _asset_json(self, release: _Release, asset: _Asset) -> dict:
-        url = f"https://github.com/{self.repo}/releases/download/{release.tag}"
+        named = f"https://github.com/{self.repo}/releases/download/{release.tag}"
+        by_id = f"https://api.github.com/repos/{self.repo}/releases/assets/{asset.id}"
         return {
             "id": asset.id,
             "name": asset.name,
             "size": len(asset.data),
             "digest": asset.digest,
-            "browser_download_url": f"{url}/{asset.name}",
+            "url": by_id,
+            "browser_download_url": f"{named}/{asset.name}",
         }
 
     def _get(self, req: _Request) -> _Reply:
@@ -291,6 +309,19 @@ class FakeGitHub:
         release.assets.append(asset)
         return _reply(201, self._asset_json(release, asset))
 
+    def _read(self, req: _Request) -> _Reply:
+        hit = self._asset_by_id(int(req.found["asset"]))
+        if hit is None:
+            return _problem(404, "Not Found")
+        release, asset = hit
+        if not _wants_bytes(req.headers):
+            return _reply(200, self._asset_json(release, asset))
+        headers = {
+            "content-type": "application/octet-stream",
+            "content-length": str(len(asset.data)),
+        }
+        return 200, headers, asset.data
+
     def _rename(self, req: _Request) -> _Reply:
         hit = self._asset_by_id(int(req.found["asset"]))
         if hit is None:
@@ -314,17 +345,6 @@ class FakeGitHub:
         release, asset = hit
         release.assets.remove(asset)
         return _reply(204)
-
-    def _download(self, req: _Request) -> _Reply:
-        release = self._releases.get(req.found["tag"])
-        for asset in release.assets if release else ():
-            if asset.name == req.found["name"]:
-                headers = {
-                    "content-type": "application/octet-stream",
-                    "content-length": str(len(asset.data)),
-                }
-                return 200, headers, asset.data
-        return _problem(404, "Not Found")
 
 
 @dataclass

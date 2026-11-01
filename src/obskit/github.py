@@ -16,10 +16,10 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable
 from email.message import Message
-from http.client import HTTPException
+from http.client import HTTPException, HTTPMessage
 from pathlib import Path
-from typing import Protocol
-from urllib.parse import quote
+from typing import IO, Protocol
+from urllib.parse import quote, urlsplit
 
 from obskit.http import USER_AGENT
 
@@ -93,11 +93,55 @@ def _lowercase(headers: Message) -> dict[str, str]:
     return {name.lower(): value for name, value in headers.items()}
 
 
+def _origin(url: str) -> tuple[str, str]:
+    """The scheme and the authority of `url` (its host, its port if it has one, and any
+    user info), as written and in lowercase. Two URLs with the same origin go to the
+    same host, and what is meant for one may be sent to the other."""
+    parts = urlsplit(url)
+    return parts.scheme.lower(), parts.netloc.lower()
+
+
+class _AuthorizationStaysOnHost(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect as urllib does, and keeps the `Authorization` header only when
+    the redirect stays on its host.
+
+    urllib copies every header but the content headers to the request that it follows.
+    GitHub answers a download with a redirect to a signed URL on a storage host, and the
+    token must not go there: the URL is signed already, the token is not that host's to
+    have, and a storage host may refuse a signed URL that comes with an Authorization
+    header besides. The header is dropped, in whatever case it is spelled, unless the
+    new URL has the same origin (scheme, host and port) as the request that was
+    redirected. Once dropped it is not put back. Every other header is kept.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        followed = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if followed is not None and _origin(followed.full_url) != _origin(req.full_url):
+            for name in [n for n in followed.headers if n.lower() == "authorization"]:
+                del followed.headers[name]
+        return followed
+
+
 class UrllibTransport:
     """The transport that talks to the network, with urllib. It returns the status of an
     HTTP error and does not raise, and it turns every other failure into OSError.
 
+    It follows redirects, and the `Authorization` header goes only to the host that the
+    request was made to: a redirect to another host does not carry it (see
+    _AuthorizationStaysOnHost).
+
     A body goes out in blocks, so the timeout bounds a stall and not a whole upload."""
+
+    def __init__(self) -> None:
+        self._opener = urllib.request.build_opener(_AuthorizationStaysOnHost)
 
     def request(
         self, method: str, url: str, headers: dict[str, str], body: bytes | None
@@ -115,7 +159,7 @@ class UrllibTransport:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             try:
-                with urllib.request.urlopen(req, timeout=_TIMEOUT) as reply:
+                with self._opener.open(req, timeout=_TIMEOUT) as reply:
                     return reply.status, _lowercase(reply.headers), reply.read()
             except urllib.error.HTTPError as err:
                 with err:
@@ -247,10 +291,21 @@ class GitHub:
 
     def download(self, asset: dict, dst: Path) -> None:
         """Download `asset` into `dst`, which is written only once the whole body has
-        arrived. The request carries no Authorization: the assets are public, and the
-        download is redirected to another host."""
-        headers = {"User-Agent": USER_AGENT, "Accept": "application/octet-stream"}
-        dst.write_bytes(self._send("GET", asset["browser_download_url"], headers))
+        arrived.
+
+        The asset is asked for by its id: a GET of its API URL, `asset["url"]`, with
+        `Accept: application/octet-stream` and the headers of every API request, the
+        token included. GitHub redirects that request to a signed URL for the bytes of
+        exactly that asset, and the transport follows the redirect without the token
+        (see UrllibTransport). So the bytes are those of the asset that was listed,
+        whatever name it holds by now.
+
+        The `browser_download_url` is never used. It asks for a name, and a publish
+        moves names from one asset to another by renaming: for a moment after a rename,
+        GitHub can still resolve the name to the asset that held it before.
+        """
+        headers = {**self._headers(), "Accept": "application/octet-stream"}
+        dst.write_bytes(self._send("GET", asset["url"], headers))
 
     def _headers(self, content_type: str | None = None) -> dict[str, str]:
         headers = {

@@ -525,7 +525,11 @@ def test_http_defaults_to_the_urllib_transport(monkeypatch, clock):
         reply_headers = headers_of(Content_Encoding="gzip", ETag='"v1"')
         return Reply(200, reply_headers, gzip.compress(b'{"ok": true}'))
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        urllib.request.OpenerDirector,
+        "open",
+        lambda self, request, data=None, timeout=None: urlopen(request, timeout),
+    )
 
     response = Http(sleep=clock.sleep, clock=clock).get(
         PAGE, accept=SIMPLE_JSON, etag='"v0"'

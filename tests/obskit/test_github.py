@@ -1,6 +1,7 @@
 import hashlib
 import http.client
 import io
+import json
 import urllib.error
 import urllib.request
 from email.message import Message
@@ -8,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from obskit.github import Fatal, GitHub, NotFound, Transient, UrllibTransport
+from obskit.github import (
+    Fatal,
+    GitHub,
+    NotFound,
+    Transient,
+    UrllibTransport,
+    _AuthorizationStaysOnHost,
+)
 from obskit.http import USER_AGENT
 from obskit.testing import FakeGitHub
 
@@ -16,6 +24,7 @@ REPO = "py-observatory/data"
 TOKEN = "t0ken"
 TAG = "example-current"
 RELEASES_URL = f"https://api.github.com/repos/{REPO}/releases"
+ASSETS_URL = f"{RELEASES_URL}/assets"
 # What an asset really is: binary, not text. A zstd magic number, then every byte value.
 BINARY = bytes.fromhex("28b52ffd") + bytes(range(256))
 
@@ -339,6 +348,7 @@ def test_upload_lists_digest(gh, fake, tmp_path):
     assert asset["name"] == "state.db.zst"
     assert asset["size"] == len(data)
     assert asset["digest"] == digest
+    assert asset["url"] == f"{ASSETS_URL}/{asset['id']}"
     assert asset["browser_download_url"] == (
         f"https://github.com/{REPO}/releases/download/{TAG}/state.db.zst"
     )
@@ -424,29 +434,69 @@ def test_a_failure_while_paging_is_raised_and_not_a_short_list(gh, fake, tmp_pat
         gh.assets(release)
 
 
-def test_download_has_no_authorization_header(gh, fake, tmp_path):
-    data = BINARY
+def test_download_asks_the_api_for_the_asset_by_its_id(gh, fake, tmp_path):
     release = gh.create_release(TAG)
-    asset = gh.upload(release, "state.db.zst", write(tmp_path, "src", data))
+    asset = gh.upload(release, "state.db.zst", write(tmp_path, "src", BINARY))
     dst = tmp_path / "out.zst"
+    fake.calls.clear()
 
     gh.download(asset, dst)
 
-    assert dst.read_bytes() == data
-    method, url, headers = fake.calls[-1]
-    assert (method, url) == ("GET", asset["browser_download_url"])
-    assert "authorization" not in {name.lower() for name in headers}
+    assert dst.read_bytes() == BINARY
+    [(method, url, headers)] = fake.calls
+    assert (method, url) == ("GET", f"{ASSETS_URL}/{asset['id']}")
+    assert url == asset["url"]
+    assert headers["Accept"] == "application/octet-stream"
+    assert headers["Authorization"] == f"Bearer {TOKEN}"
+    assert headers["X-GitHub-Api-Version"] == "2022-11-28"
     assert headers["User-Agent"] == USER_AGENT
 
 
+def test_download_never_goes_through_the_name_of_the_asset(gh, fake, tmp_path):
+    release = gh.create_release(TAG)
+    asset = gh.upload(release, "state.db.zst", write(tmp_path, "src", BINARY))
+    # A trap: a name-based URL that the kit must not request. The fake serves none.
+    trapped = {**asset, "browser_download_url": "https://github.com/trap/is/set"}
+    fake.calls.clear()
+
+    gh.download(trapped, tmp_path / "out")
+
+    assert [url for _, url, _ in fake.calls] == [asset["url"]]
+    assert (tmp_path / "out").read_bytes() == BINARY
+
+
+@pytest.mark.parametrize("listed", ["before", "after"])
+def test_a_download_after_a_rename_returns_the_bytes_of_its_own_asset(
+    gh, tmp_path, listed
+):
+    release = gh.create_release(TAG)
+    live = gh.upload(release, "state.db.zst", write(tmp_path, "live", b"live bytes"))
+    nxt = gh.upload(release, "swap-next-state.db.zst", write(tmp_path, "nxt", b"next"))
+    # What a publish does: the live asset moves aside and the next one takes its name.
+    gh.rename(live, "swap-prev-state.db.zst")
+    gh.rename(nxt, "state.db.zst")
+    if listed == "after":
+        by_id = {asset["id"]: asset for asset in gh.assets(release)}
+        live, nxt = by_id[live["id"]], by_id[nxt["id"]]
+
+    # Listed before the renames, `live` still says that its asset is called
+    # state.db.zst, a name that another asset holds now. Its bytes are its own all the
+    # same, and so are those of `nxt`.
+    gh.download(live, tmp_path / "from-live")
+    gh.download(nxt, tmp_path / "from-next")
+
+    assert (tmp_path / "from-live").read_bytes() == b"live bytes"
+    assert (tmp_path / "from-next").read_bytes() == b"next"
+
+
 def test_download_of_a_missing_asset_is_not_found_and_writes_nothing(gh, tmp_path):
-    gh.create_release(TAG)
-    url = f"https://github.com/{REPO}/releases/download/{TAG}/nope"
-    missing = {"browser_download_url": url}
+    release = gh.create_release(TAG)
+    asset = gh.upload(release, "a", write(tmp_path, "src", b"x"))
+    gh.delete(asset)
     dst = tmp_path / "out"
 
     with pytest.raises(NotFound):
-        gh.download(missing, dst)
+        gh.download(asset, dst)
 
     assert not dst.exists()
 
@@ -454,13 +504,26 @@ def test_download_of_a_missing_asset_is_not_found_and_writes_nothing(gh, tmp_pat
 def test_a_failed_download_writes_nothing(gh, fake, tmp_path):
     release = gh.create_release(TAG)
     asset = gh.upload(release, "a", write(tmp_path, "src", b"x"))
-    fake.fail("GET", "/releases/download/", 502, times=6)
+    fake.fail("GET", f"/releases/assets/{asset['id']}", 502, times=6)
     dst = tmp_path / "out"
 
     with pytest.raises(Transient):
         gh.download(asset, dst)
 
     assert not dst.exists()
+
+
+def test_a_download_is_retried_from_the_api_url(gh, fake, clock, tmp_path):
+    release = gh.create_release(TAG)
+    asset = gh.upload(release, "a", write(tmp_path, "src", b"x"))
+    fake.fail("GET", f"/releases/assets/{asset['id']}", 502, times=2)
+    fake.calls.clear()
+
+    gh.download(asset, tmp_path / "out")
+
+    assert (tmp_path / "out").read_bytes() == b"x"
+    assert clock.sleeps == [2, 4]
+    assert [url for _, url, _ in fake.calls] == [asset["url"]] * 3
 
 
 def test_api_requests_carry_the_documented_headers(gh, fake, tmp_path):
@@ -593,6 +656,17 @@ def headers_of(**fields: str) -> Message:
     return message
 
 
+def patch_open(monkeypatch, urlopen) -> None:
+    """Make every opener's `open` call `urlopen(request, timeout)`. The urlopen function
+    hands its request to an opener, so this stands in for it as well, and no test
+    touches the network."""
+
+    def open_(self, request, data=None, timeout=None):
+        return urlopen(request, timeout)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_)
+
+
 class Reply:
     """What urlopen returns: a context manager with `status`, `headers` and `read`."""
 
@@ -621,7 +695,7 @@ def test_urllib_transport_returns_status_lowercase_headers_and_body(monkeypatch)
         )
         return Reply(201, reply_headers, b'{"id": 1}')
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    patch_open(monkeypatch, urlopen)
 
     reply = UrllibTransport().request(
         "POST", "https://example.test/x?y=1", {"Accept": "a/b"}, b"payload"
@@ -649,7 +723,7 @@ def test_urllib_transport_returns_an_http_error_instead_of_raising(monkeypatch):
             io.BytesIO(b"upstream down"),
         )
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    patch_open(monkeypatch, urlopen)
 
     reply = UrllibTransport().request("GET", "https://example.test/x", {}, None)
 
@@ -678,7 +752,7 @@ def test_urllib_transport_network_failures_are_os_errors(monkeypatch, failure):
             raise failure
         return failure
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    patch_open(monkeypatch, urlopen)
 
     with pytest.raises(OSError):
         UrllibTransport().request("GET", "https://example.test/x", {}, None)
@@ -691,7 +765,7 @@ def test_github_defaults_to_the_urllib_transport(monkeypatch, clock):
         seen.append(request)
         return Reply(200, headers_of(), b'{"id": 7, "tag_name": "example-current"}')
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    patch_open(monkeypatch, urlopen)
 
     release = GitHub(REPO, TOKEN, sleep=clock.sleep, clock=clock).release_by_tag(TAG)
 
@@ -715,7 +789,7 @@ def stub_urlopen(monkeypatch) -> list:
         requests.append(request)
         return Reply(201, headers_of(), b"{}")
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    patch_open(monkeypatch, urlopen)
     return requests
 
 
@@ -810,6 +884,180 @@ def test_urllib_transport_sends_a_body_in_blocks_and_not_in_one_send(monkeypatch
         assert max(len(chunk) for chunk in sock.sent) <= 64 * 1024
         assert len(sock.sent) > 16
     assert timeouts == [60, 60]
+
+
+# --- A redirect: the token goes only where the request was meant to go ---
+#
+# The API answers a download with a redirect to a signed URL on a storage host. urllib
+# copies every header but the content headers to the request that it follows, so the
+# token would reach that host, which has no use for it. These tests build urllib's own
+# Request objects and call the handler as urllib does, and touch no network.
+
+STORAGE = "https://release-assets.githubusercontent.com/blob/1/2?sig=abc%3D&se=3"
+
+
+def asset_request() -> urllib.request.Request:
+    """The request of a download: the API URL of an asset, with the headers it sends."""
+    headers = {
+        "Authorization": f"Bearer {TOKEN}",
+        "Accept": "application/octet-stream",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": USER_AGENT,
+    }
+    return urllib.request.Request(f"{ASSETS_URL}/7", headers=headers, method="GET")
+
+
+def redirect(
+    request: urllib.request.Request, location: str, code: int = 302
+) -> urllib.request.Request:
+    """The request that urllib sends next when the reply to `request` is a redirect of
+    the given `code` to `location`."""
+    handler = _AuthorizationStaysOnHost()
+    followed = handler.redirect_request(
+        request, io.BytesIO(), code, "Found", http.client.HTTPMessage(), location
+    )
+    assert followed is not None
+    return followed
+
+
+def header_names(request: urllib.request.Request) -> set[str]:
+    return {name.lower() for name in request.headers}
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        STORAGE,
+        "https://api.github.com.example.test/repos/x",
+        "https://github.com/py-observatory/data",
+        "https://api.github.com:8443/repos/x",
+        "http://api.github.com/repos/x",
+        "https://api.github.com@example.test/repos/x",
+    ],
+    ids=[
+        "storage host",
+        "a host that begins with its name",
+        "its parent domain",
+        "another port",
+        "plain http",
+        "a name that is only a user",
+    ],
+)
+def test_a_redirect_to_another_host_drops_the_authorization_header(location):
+    followed = redirect(asset_request(), location)
+
+    assert followed.full_url == location
+    assert followed.get_method() == "GET"
+    assert "authorization" not in header_names(followed)
+    # The other headers go on: the new host is told what is asked for, and by whom.
+    assert followed.get_header("Accept") == "application/octet-stream"
+    assert followed.get_header("X-github-api-version") == "2022-11-28"
+    assert followed.get_header("User-agent") == USER_AGENT
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        f"{RELEASES_URL}/assets/7?again=1",
+        "https://api.github.com/repositories/9/releases/assets/7",
+        "https://API.GitHub.com/repos/x",
+    ],
+    ids=["another query", "another path", "host in capitals"],
+)
+def test_a_redirect_within_the_host_keeps_the_authorization_header(location):
+    followed = redirect(asset_request(), location)
+
+    assert followed.full_url == location
+    assert followed.get_header("Authorization") == f"Bearer {TOKEN}"
+    assert followed.get_header("Accept") == "application/octet-stream"
+    assert followed.get_header("User-agent") == USER_AGENT
+
+
+@pytest.mark.parametrize(
+    "spelling", ["Authorization", "authorization", "AUTHORIZATION", "aUtHoRiZaTiOn"]
+)
+def test_the_authorization_header_is_dropped_in_any_spelling(monkeypatch, spelling):
+    # urllib's Request capitalizes each header name that it is given, so the name
+    # reaches the handler as "Authorization" whatever it was. The handler does not rely
+    # on that, and here Request keeps the names as they were written.
+    monkeypatch.setattr(
+        urllib.request.Request,
+        "add_header",
+        lambda self, key, val: self.headers.update({key: val}),
+    )
+    headers = {"Accept": "a/b", spelling: f"Bearer {TOKEN}"}
+    request = urllib.request.Request(f"{ASSETS_URL}/7", headers=headers)
+    assert spelling in request.headers
+
+    followed = redirect(request, STORAGE)
+
+    assert spelling in request.headers, "the request that was redirected is as it was"
+    assert "authorization" not in header_names(followed)
+    assert followed.get_header("Accept") == "a/b"
+
+
+def test_a_redirect_leaves_the_request_that_was_redirected_as_it_was():
+    request = asset_request()
+
+    redirect(request, STORAGE)
+
+    assert request.get_header("Authorization") == f"Bearer {TOKEN}"
+
+
+def test_the_header_does_not_come_back_with_a_redirect_to_the_first_host():
+    elsewhere = redirect(asset_request(), STORAGE)
+
+    back = redirect(elsewhere, f"{ASSETS_URL}/7")
+
+    assert "authorization" not in header_names(back)
+
+
+def sent_to(sock: FakeSocket) -> tuple[str, dict[str, str]]:
+    """The request line, and the headers (names in lowercase), that `sock` was sent."""
+    head = b"".join(sock.sent).partition(b"\r\n\r\n")[0].decode("latin-1")
+    line, *fields = head.split("\r\n")
+    headers = {}
+    for field in fields:
+        name, _, value = field.partition(": ")
+        headers[name.lower()] = value
+    return line, headers
+
+
+def test_a_download_follows_the_redirect_without_the_token_leaving_the_host(
+    monkeypatch, clock, tmp_path
+):
+    # The real urllib and http.client, over sockets that only record what is sent. The
+    # API redirects, as GitHub does, to a signed URL on another host.
+    sockets = {
+        "api.test": FakeSocket(
+            b"HTTP/1.1 302 Found\r\n"
+            b"Location: http://storage.test/blob?sig=abc%3D\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        ),
+        "storage.test": FakeSocket(
+            b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%b" % (len(BINARY), BINARY)
+        ),
+    }
+
+    def connect(self):
+        self.sock = sockets[self.host]
+
+    monkeypatch.setattr(http.client.HTTPConnection, "connect", connect)
+    asset = {"id": 7, "url": "http://api.test/repos/x/releases/assets/7"}
+    gh = GitHub(REPO, TOKEN, sleep=clock.sleep, clock=clock)
+
+    gh.download(asset, tmp_path / "out")
+
+    assert (tmp_path / "out").read_bytes() == BINARY
+    line, headers = sent_to(sockets["api.test"])
+    assert line == "GET /repos/x/releases/assets/7 HTTP/1.1"
+    assert headers["authorization"] == f"Bearer {TOKEN}"
+    assert headers["accept"] == "application/octet-stream"
+    line, headers = sent_to(sockets["storage.test"])
+    assert line == "GET /blob?sig=abc%3D HTTP/1.1"
+    assert "authorization" not in headers, "the token never reaches the storage host"
+    assert headers["accept"] == "application/octet-stream"
+    assert headers["user-agent"] == USER_AGENT
 
 
 # --- FakeGitHub itself ---
@@ -960,14 +1208,55 @@ def test_fail_aims_at_one_asset_by_id(gh, fake, tmp_path):
     assert asset_names(fake) == ["b"]
 
 
+def test_fake_serves_an_asset_by_id_as_its_bytes_or_as_its_json(gh, fake, tmp_path):
+    release = gh.create_release(TAG)
+    asset = gh.upload(release, "a", write(tmp_path, "a", BINARY))
+    raw = {"Accept": "application/octet-stream"}
+
+    status, headers, body = fake.request("GET", asset["url"], raw, None)
+
+    assert (status, body) == (200, BINARY)
+    assert headers["content-type"] == "application/octet-stream"
+    assert headers["content-length"] == str(len(BINARY))
+    for given in ({"Accept": "application/vnd.github+json"}, {}):
+        status, headers, body = fake.request("GET", asset["url"], given, None)
+        assert status == 200, given
+        assert headers["content-type"].startswith("application/json"), given
+        assert json.loads(body) == asset, given
+
+
+@pytest.mark.parametrize("name", ["Accept", "accept", "ACCEPT"])
+def test_fake_reads_the_accept_header_in_any_case(gh, fake, tmp_path, name):
+    release = gh.create_release(TAG)
+    asset = gh.upload(release, "a", write(tmp_path, "a", BINARY))
+
+    _, _, body = fake.request(
+        "GET", asset["url"], {name: "application/octet-stream"}, None
+    )
+
+    assert body == BINARY
+
+
+def test_fake_answers_404_for_an_asset_id_that_no_asset_has(gh, fake, tmp_path):
+    release = gh.create_release(TAG)
+    gone = gh.upload(release, "a", write(tmp_path, "a", b"x"))
+    gh.delete(gone)
+
+    for accept in ("application/octet-stream", "application/vnd.github+json"):
+        for url in (gone["url"], f"{ASSETS_URL}/999999"):
+            status, _, _ = fake.request("GET", url, {"Accept": accept}, None)
+            assert status == 404, (accept, url)
+
+
 @pytest.mark.parametrize(
     "url",
     [
         "https://api.github.com/rate_limit",
         "https://api.github.com/repos/someone/else/releases/tags/x",
         "https://example.test/repos/py-observatory/data/releases/tags/x",
+        f"https://github.com/{REPO}/releases/download/{TAG}/a",
     ],
-    ids=["unknown path", "other repository", "other host"],
+    ids=["unknown path", "other repository", "other host", "download by name"],
 )
 def test_fake_refuses_routes_it_does_not_serve(fake, url):
     # A 404 is what the kit reads as "no release", so no unserved route may give one.

@@ -541,6 +541,9 @@ def _fetch_asset(
     """Download the release asset `source`, which holds the manifest entry `asset`,
     and return the path of the checked file that it expands to.
 
+    `source` is downloaded by its id, so the bytes are those of the asset that was
+    listed, and not those of whichever asset holds its name by then.
+
     The download goes to `workdir/<name>` and must have the entry's `asset_sha256`. A
     `.zst` is expanded to `workdir/<name without .zst>`, which must have the entry's
     `db_sha256`, and the download is then deleted unless `keep_download` is set; any

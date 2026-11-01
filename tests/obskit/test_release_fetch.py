@@ -8,7 +8,12 @@ import pytest
 
 from obskit.github import GitHub, NotFound, Transient
 from obskit.manifest import Asset, Manifest, ManifestError, TableInfo, Watermark, dumps
-from obskit.release import PriorStateError, fetch_assets, fetch_prior
+from obskit.release import (
+    PriorStateError,
+    fetch_assets,
+    fetch_prior,
+    publish_current,
+)
 from obskit.testing import FakeGitHub
 from obskit.zst import compress_file, sha256_file
 
@@ -17,7 +22,6 @@ TOKEN = "t0ken"
 STREAM = "example"
 TAG = "example-current"
 TAG_URL = f"https://api.github.com/repos/{REPO}/releases/tags/{TAG}"
-DOWNLOADS = f"https://github.com/{REPO}/releases/download/{TAG}/"
 MANIFEST = "manifest.json"
 STATE = "example-state.db.zst"
 DELTA = "example-delta-open.db.zst"
@@ -126,10 +130,11 @@ def seed(gh: GitHub, fake: FakeGitHub, files: dict[str, Path]) -> None:
 
 def downloads(fake: FakeGitHub) -> list[str]:
     """The names of the assets downloaded from TAG, in order."""
+    prefix = f"{TAG}/"
     return [
-        url.removeprefix(DOWNLOADS)
-        for method, url, _ in fake.calls
-        if method == "GET" and url.startswith(DOWNLOADS)
+        entry.removeprefix(prefix)
+        for entry in downloaded(fake)
+        if entry.startswith(prefix)
     ]
 
 
@@ -430,7 +435,11 @@ class Rewriting:
         self, fake: FakeGitHub, name: str, rewrite: Callable[[bytes], bytes]
     ) -> None:
         self.fake = fake
-        self.url = DOWNLOADS + name
+        [self.url] = [
+            asset["url"]
+            for asset in fake.release(TAG)["assets"]
+            if asset["name"] == name
+        ]
         self.rewrite = rewrite
 
     def request(self, method, url, headers, body):
@@ -454,6 +463,57 @@ def test_downloaded_bytes_are_checked(gh, fake, tmp_path, workdir):
         fetch_prior(corrupted, STREAM, workdir, bootstrap=False)
 
     assert not (workdir / "example-state.db").exists(), "nothing is expanded"
+
+
+class Interrupting:
+    """A transport that passes each request to `fake`, and once it has answered the
+    first listing of a release's assets, calls `interrupt`: something that happens to
+    the release between that listing and the downloads."""
+
+    def __init__(self, fake: FakeGitHub, interrupt: Callable[[], None]) -> None:
+        self.fake = fake
+        self.interrupt: Callable[[], None] | None = interrupt
+
+    def request(self, method, url, headers, body):
+        reply = self.fake.request(method, url, headers, body)
+        if "/assets?" in url and self.interrupt is not None:
+            interrupt, self.interrupt = self.interrupt, None
+            interrupt()
+        return reply
+
+
+def test_a_publish_between_the_listing_and_the_downloads_does_not_mix_states(
+    gh, fake, tmp_path, workdir
+):
+    old = build(tmp_path, "old", STATE)
+    new = build(tmp_path, "new", STATE)
+    seed(gh, fake, old.files)
+    # Another run publishes after the fetch has listed the assets and before it has
+    # downloaded any: every name moves to other bytes. That is what a run sees when it
+    # starts just after a publish and GitHub still answers for a name with the asset
+    # that held it before, and the same race in the small.
+    other = GitHub(REPO, TOKEN, transport=fake, sleep=no_sleep)
+
+    def publish() -> None:
+        publish_current(
+            other, STREAM, [new.files[STATE]], new.manifest, bootstrap=False
+        )
+
+    racing = GitHub(REPO, TOKEN, transport=Interrupting(fake, publish), sleep=no_sleep)
+
+    prior = fetch_prior(racing, STREAM, workdir, bootstrap=False)
+
+    assert fake.asset_bytes(TAG, MANIFEST) == new.files[MANIFEST].read_bytes()
+    assert fake.asset_bytes(TAG, STATE) == new.files[STATE].read_bytes()
+    # The fetch downloaded the assets that its listing showed, by their ids, so it holds
+    # the old state whole: its manifest, and the state that the manifest names.
+    assert prior == old.manifest
+    assert expanded(workdir, STATE) == old.expanded[STATE]
+    # The next run lists after the publish, and holds the new state.
+    later = tmp_path / "later"
+    later.mkdir()
+    assert fetch_prior(gh, STREAM, later, bootstrap=False) == new.manifest
+    assert expanded(later, STATE) == new.expanded[STATE]
 
 
 class Undigested:
@@ -593,10 +653,10 @@ def test_an_asset_without_zst_is_checked_and_not_expanded(gh, fake, tmp_path, wo
     ("needle", "status", "error"),
     [
         ("/assets?", 404, NotFound),
-        (f"/{TAG}/{MANIFEST}", 404, NotFound),
-        (f"/{TAG}/{STATE}", 404, NotFound),
+        (f"name={MANIFEST}", 404, NotFound),
+        (f"name={STATE}", 404, NotFound),
         ("/assets?", 502, Transient),
-        (f"/{TAG}/{STATE}", 502, Transient),
+        (f"name={STATE}", 502, Transient),
     ],
     ids=[
         "listing 404",
@@ -640,12 +700,17 @@ def seed_release(
 
 
 def downloaded(fake: FakeGitHub) -> list[str]:
-    """The assets downloaded from any release, as `<tag>/<name>`, in order."""
-    prefix = f"https://github.com/{REPO}/releases/download/"
+    """The assets downloaded from any release, as `<tag>/<name>`, in order.
+
+    A download asks for the asset by its API URL, so each is named by what its release
+    holds when this is called. The tests do not rename."""
+    named = {}
+    for tag in (TAG, NOVEMBER, DECEMBER):
+        release = fake.release(tag)
+        for asset in release["assets"] if release else ():
+            named[asset["url"]] = f"{tag}/{asset['name']}"
     return [
-        url.removeprefix(prefix)
-        for method, url, _ in fake.calls
-        if method == "GET" and url.startswith(prefix)
+        named[url] for method, url, _ in fake.calls if method == "GET" and url in named
     ]
 
 

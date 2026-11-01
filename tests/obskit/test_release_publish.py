@@ -323,7 +323,7 @@ def test_interrupted_publish_recovers(gh, fake, tmp_path, workdir):
 
     assert prior == v1.manifest
     assert expanded(workdir, STATE) == v1.dbs[STATE].read_bytes()
-    downloaded = f"https://github.com/{REPO}/releases/download/{TAG}/swap-prev-{STATE}"
+    downloaded = asset_url(fake, f"swap-prev-{STATE}")
     assert ("GET", downloaded) in [(m, u) for m, u, _ in fake.calls]
 
     publish(gh, v3)
