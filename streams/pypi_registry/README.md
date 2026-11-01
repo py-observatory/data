@@ -15,7 +15,7 @@ The Simple API is read as PEP 691 JSON (`application/vnd.pypi.simple.v1+json`). 
 ## What is kept
 
 - Project names are in PEP 503 canonical form, and versions are in PEP 440 canonical form. The spelling that PyPI gave is kept beside them.
-- There is no README text. A release keeps a fingerprint of its README, its size and its word count.
+- There is no README text. A release keeps a fingerprint of its README, its size, its word count and its format.
 - There are no email addresses. The names of people are kept.
 
 ## In this folder
@@ -23,6 +23,7 @@ The Simple API is read as PEP 691 JSON (`application/vnd.pypi.simple.v1+json`). 
 - `stream.toml`: the stream's id, its upstream and terms of use, and each table with its history class.
 - `src/pypi_registry/names.py`: canonical names and versions, and the version that a filename carries.
 - `src/pypi_registry/simple.py`: the Simple API's URLs and the parsers for its root and project pages. A reply of a shape that the parsers do not know raises a ValueError.
+- `src/pypi_registry/records.py`: the record kept for each release, with the facts of its README in place of its text. Email addresses are taken out of it, and the names of people stay. A reply of a shape that it does not know raises a ValueError.
 - `tests/`: offline tests, and the fixtures they read.
 
 ## Tests
