@@ -74,7 +74,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh pypi-registry-backfill failure
+      # Failing to close the issue must not fail the job. The next sweep is dispatched only
+      # when this job succeeds, so a failure here would end the chain with no report. The
+      # next good sweep closes the issue.
       - if: success()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh pypi-registry-backfill success
@@ -116,7 +120,9 @@ jobs:
   # The ways in which the chain stops without a sweep saying so: the next sweep could not be
   # dispatched, a sweep was cancelled while it waited (a run that queues in the group
   # replaces the one that waits there), and a sweep hit the timeout of its job. A sweep that
-  # fails reports through its own step above, and this job is skipped then.
+  # fails reports through its own step above, and this job is skipped then. That is why the
+  # step that closes the issue after a good sweep may not fail the job: the sweep job would
+  # fail, the dispatch would be skipped, and this job would stay skipped too.
   report:
     needs: [sweep, redispatch]
     if: always() && (needs.sweep.result == 'cancelled' || needs.redispatch.result == 'failure')

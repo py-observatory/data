@@ -158,8 +158,11 @@ def sequence(section: str, key: str, indent: int) -> list[str] | None:
 
 
 def steps(job: str) -> list[str]:
-    """The text of each step of a job (they come last in a job's text)."""
-    return ["- " + part for part in re.split(r"(?m)^      - ", job)[1:]]
+    """The text of each step of a job (they come last in a job's text), without the
+    comments, so that a comment above a step is not read as part of the one before."""
+    lines = [line for line in job.splitlines() if not line.lstrip().startswith("#")]
+    code = "\n".join(lines)
+    return ["- " + part for part in re.split(r"(?m)^      - ", code)[1:]]
 
 
 def run_scripts(text: str) -> list[str]:
@@ -321,11 +324,11 @@ def test_job_timeouts_leave_room_after_the_run_budget():
     its job's so that the step fails and the failure issue is opened (a job that times
     out may count as cancelled). So the limits that apply are the steps'.
 
-    A tick stops starting projects after 18,000 s (300 minutes), which leaves 27 of its
-    327. A sweep always runs to its deadline, and after it only the project in hand, the
-    apply and the publish remain. The publish compresses a state of about 2 GB late in
-    the backfill, at 4 MB/s on a Mac and slower on a runner. So the sweep is given
-    15,000 s (250 minutes) of a step of 297, which leaves 47.
+    A tick and a sweep both stop starting projects after 15,000 s (250 minutes), and
+    then only the project in hand, the apply and the publish remain. A sweep always runs
+    to its deadline, and so does a tick that has much to read. The publish compresses a
+    state of about 2 GB late in the backfill, at 4 MB/s on a Mac and slower on a runner.
+    The tick's step of 327 minutes leaves 77 for that, and the sweep's of 297 leaves 47.
     """
     assert scalar(job_of("tick.yml", "pypi-registry"), "timeout-minutes", 4) == "330"
     assert scalar(job_of("backfill.yml", "sweep"), "timeout-minutes", 4) == "300"
@@ -335,12 +338,14 @@ def test_job_timeouts_leave_room_after_the_run_budget():
     assert step_limit("backfill.yml", "sweep", "pypi_registry sweep") == 297
     assert step_limit("smoke.yml", "smoke", "obskit.smoke") == 12
 
-    script = one_script("backfill.yml", "sweep", "pypi_registry sweep")
-    [seconds] = re.findall(r"--max-seconds (\d+)", script)
-    room = (
-        step_limit("backfill.yml", "sweep", "pypi_registry sweep") - int(seconds) / 60
-    )
-    assert room >= 45, f"only {room:.0f} minutes are left after the sweep's deadline"
+    for file, job, mentions in [
+        ("tick.yml", "pypi-registry", "pypi_registry run"),
+        ("backfill.yml", "sweep", "pypi_registry sweep"),
+    ]:
+        budget = re.findall(r"--max-seconds (\d+)", one_script(file, job, mentions))
+        assert len(budget) == 1, f"{file}: --max-seconds must be passed once"
+        room = step_limit(file, job, mentions) - int(budget[0]) / 60
+        assert room >= 45, f"{file}: {room:.0f} minutes are left after the deadline"
 
 
 def test_actions_pinned_by_sha():
@@ -501,6 +506,24 @@ def test_a_hung_dispatch_fails_its_step_before_its_job_times_out():
     assert step_limit("backfill.yml", "redispatch", "gh workflow run") < job
 
 
+def test_a_failed_close_of_the_issue_cannot_skip_the_redispatch():
+    """The next sweep is dispatched only when the sweep job succeeds. After a sweep that
+    exited with 3, the step that closes the backfill's issue runs, and if it failed once
+    (an API error) the job would fail. The dispatch would be skipped, and so would the
+    report, because the sweep job failed and was not cancelled: a red run, no issue and
+    no next sweep. So no step after the sweep step may fail the job, except the one
+    that runs when the sweep step has failed, and the job with it."""
+    after_the_sweep = steps(job_of("backfill.yml", "sweep"))
+    [index] = [i for i, step in enumerate(after_the_sweep) if "id: sweep" in step]
+    sweep, after_the_sweep = after_the_sweep[index], after_the_sweep[index + 1 :]
+    assert "continue-on-error" not in sweep, "the sweep itself must be able to fail"
+    assert len(after_the_sweep) == 2, "the report of a failure, and the close"
+    for step in after_the_sweep:
+        if re.search(r"(?m)^\s*(?:- )?if:\s*failure\(\)\s*$", step):
+            continue
+        assert re.search(r"(?m)^\s+continue-on-error:\s*true\s*$", step), step
+
+
 def test_report_covers_the_ways_the_chain_stops_silently():
     """A sweep that fails reports through its own step. These are the other ways in which
     the chain ends without a sweep saying so: the next sweep cannot be dispatched, a
@@ -572,10 +595,20 @@ def test_sweep_passes_its_time_budget(tmp_path):
     assert call[call.index("sweep") :] == ["sweep", "--max-seconds", "15000"]
 
 
+def test_tick_passes_its_time_budget(tmp_path):
+    """15,000 s is 250 minutes, which leaves the rest of the step to publish."""
+    script = one_script("tick.yml", "pypi-registry", "pypi_registry run")
+    _, calls = run_step(tmp_path, script)
+    [call] = calls
+    assert call[call.index("pypi_registry") :] == [
+        *["pypi_registry", "run", "--max-seconds", "15000"]
+    ]
+
+
 def test_tick_passes_bootstrap_and_a_reason_only_when_asked(tmp_path):
     script = one_script("tick.yml", "pypi-registry", "pypi_registry run")
     base = ["uv", "run", "--package", "pypi-registry", "python", "-m"]
-    base += ["pypi_registry", "run"]
+    base += ["pypi_registry", "run", "--max-seconds", "15000"]
     cases = [
         # (what the inputs hold, the arguments after `run`)
         ({}, []),  # a scheduled run has no inputs
