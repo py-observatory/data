@@ -199,12 +199,14 @@ def _free_text(info: dict, key: str) -> str | None:
 
 
 def _link(info: dict, key: str) -> str | None:
-    """The URL at `key` of `info`: None for a mail link, and otherwise the text with any
-    email address taken out of it."""
+    """The URL at `key` of `info`, or None when it is a mail link or holds an email
+    address. A URL is kept whole or not at all, as a project URL is: taking the address
+    out of `git+ssh://git@github.com/foo/bar.git` leaves `git+ssh:///foo/bar.git`,
+    which points nowhere, and a record is never replaced."""
     url = _optional_text(info, key)
-    if url is not None and _is_mail_link(url):
+    if url is None or _is_mail_link(url) or _HAS_ADDRESS.search(url):
         return None
-    return _without_addresses(url)
+    return url or None
 
 
 def _text_list(info: dict, key: str) -> str | None:
@@ -297,12 +299,12 @@ def release_record(
     `version_raw`.
 
     The README has no column: `readme_facts` takes its place. The four fields of people
-    go through `strip_emails`. The summary, licence, keywords, home page, download URL,
-    platform and yank reason lose any email address they hold, and a home page or
-    download URL that is a `mailto:` link is None. A project URL is left out when it is a
-    mail link or when its link or label holds an address. Requirements are kept as they
-    are: `name @ url` and a VCS URL are not contact addresses. A text that nothing is
-    left of is None.
+    go through `strip_emails`. The summary, licence, keywords, platform and yank reason
+    lose any email address they hold. A home page or download URL is None when it is a
+    `mailto:` link or holds an address, and a project URL is left out when it is a mail
+    link or when its link or label holds an address. Requirements are kept as they are:
+    `name @ url` and a VCS URL are not contact addresses. A text that nothing is left of
+    is None.
 
     Lists are compact JSON, and so are the project URLs, with their keys in order. An
     empty list or object is None. `uploaded_at` is the earliest upload time of a file,

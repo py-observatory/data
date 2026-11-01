@@ -4,6 +4,7 @@ import json
 import platform
 import sqlite3
 import struct
+from collections import namedtuple
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
@@ -423,6 +424,81 @@ def test_month_close_builds_month_part_and_new_base(tmp_path):
         [*month_assets, MANIFEST_NOVEMBER, BASE_DECEMBER]
     )
     assert entries[DELTA].period == "2026-12-01"
+
+
+def test_month_close_frees_the_files_that_it_has_used(tmp_path):
+    stream = Stream(tmp_path)
+    stream.run("2026-11-28T06:00:00Z", 100, PROJECTS, bootstrap=True)
+    stream.run(
+        "2026-11-29T06:00:00Z",
+        110,
+        {**PROJECTS, "alpha": 11},
+        pages=[page("alpha", 11)],
+    )
+    stream.run(
+        "2026-11-30T06:00:00Z",
+        120,
+        {**PROJECTS, "alpha": 11, "beta": 21},
+        pages=[page("beta", 21)],
+    )
+
+    stream.run("2026-12-01T06:00:00Z", 130, {**PROJECTS, "alpha": 11, "beta": 21})
+
+    # The first close of a month holds a month of deltas, so what it has used goes as
+    # it goes: the downloads of the base copy and the sealed deltas once they expand,
+    # the replayed base once it checks, and each delta once the part has its rows.
+    # What is left is what the run uploads, and the state and the open delta.
+    workdir = tmp_path / f"run-{stream.runs}"
+    assert sorted(path.name for path in workdir.iterdir()) == sorted(
+        [
+            MANIFEST,
+            MANIFEST_NOVEMBER,
+            "pypi-registry-2026-11.db",
+            PART_NOVEMBER,
+            sealed_name("2026-11-30"),  # the upload, which is the published open delta
+            BASE_DECEMBER,
+            "pypi-registry-state.db",
+            STATE,
+            "pypi-registry-delta-open.db",
+            DELTA,
+        ]
+    )
+    # The part still holds every row of the month.
+    sealed = [
+        table_counts(stream.expand(NOVEMBER, sealed_name(day)))
+        for day in ("2026-11-28", "2026-11-29", "2026-11-30")
+    ]
+    merged = table_counts(stream.expand(NOVEMBER, PART_NOVEMBER))
+    assert merged == {table: sum(c[table] for c in sealed) for table in DELTA_TABLES}
+
+
+def test_month_close_logs_the_free_disk_as_it_starts_and_ends(
+    tmp_path, monkeypatch, capsys
+):
+    Usage = namedtuple("Usage", "total used free")
+    free = iter([12_345_678_901, 9_876_543_210])
+    asked: list[tuple[Path, bool]] = []
+
+    def disk_usage(path):
+        # Where it is asked, and whether the month's part is made yet.
+        asked.append((Path(path), (Path(path) / PART_NOVEMBER).exists()))
+        return Usage(14_000_000_000, 0, next(free))
+
+    monkeypatch.setattr("pypi_registry.run.shutil.disk_usage", disk_usage)
+    stream = Stream(tmp_path)
+    stream.run("2026-11-29T06:00:00Z", 100, PROJECTS, bootstrap=True)
+    # A day that ends is not a month close, and says nothing of the disk.
+    stream.run("2026-11-30T06:00:00Z", 110, PROJECTS)
+    assert (asked, capsys.readouterr().err) == ([], "")
+
+    stream.run("2026-12-01T06:00:00Z", 120, PROJECTS)
+
+    workdir = tmp_path / f"run-{stream.runs}"
+    assert asked == [(workdir, False), (workdir, True)]
+    assert capsys.readouterr().err.splitlines() == [
+        f"month close 2026-11 starts: 12.3 GB free on {workdir}",
+        f"month close 2026-11 ends: 9.9 GB free on {workdir}",
+    ]
 
 
 def test_restore_month_base_plus_deltas_equals_current(tmp_path):
@@ -975,3 +1051,35 @@ def test_main_runs_once_with_one_github_client(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_TOKEN")
     with pytest.raises(KeyError, match="GITHUB_TOKEN"):
         main(["run"])
+
+
+@pytest.mark.parametrize("command", ["run", "sweep"])
+def test_main_works_in_the_folder_that_workdir_names(tmp_path, monkeypatch, command):
+    # So that a workflow can put the work on a larger disk.
+    workdirs: list[Path] = []
+
+    def record(gh, http, workdir, **options) -> RunReport:
+        assert list(workdir.iterdir()) == []
+        workdirs.append(workdir)
+        return RunReport(0, 0, 0, 0, 0, 0, 0, 0, [])
+
+    monkeypatch.setattr("pypi_registry.run.run_once", record)
+    monkeypatch.setattr("pypi_registry.run.sweep", record)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
+    disk = tmp_path / "mnt"
+    disk.mkdir()
+
+    assert main([command, "--workdir", str(disk / "work")]) == 0
+    assert main([command, "--workdir", "elsewhere"]) == 0
+    assert main([command]) == 0
+
+    # Each run works in a new directory of its own in that folder, and removes it
+    # afterwards. A relative folder is taken from where the command runs, and the
+    # default is ./work, as before.
+    assert [path.parent for path in workdirs] == [
+        disk / "work",
+        tmp_path / "elsewhere",
+        tmp_path / "work",
+    ]
+    assert not any(path.exists() for path in workdirs)

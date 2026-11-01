@@ -38,6 +38,10 @@ SCRUBBED_COLUMNS = [
     "platform",
     "yanked_reason",
 ]
+# The columns among them that hold a URL. A URL that holds an address goes whole.
+URL_COLUMNS = ["home_page", "download_url"]
+# The rest lose an address and keep what is around it.
+FREE_TEXT_COLUMNS = [column for column in SCRUBBED_COLUMNS if column not in URL_COLUMNS]
 
 
 def sample() -> dict:
@@ -558,10 +562,33 @@ def test_release_record_scrubs_emails_from_free_text():
     assert "@" not in record["project_urls"]
 
 
-@pytest.mark.parametrize("column", SCRUBBED_COLUMNS)
+@pytest.mark.parametrize("column", FREE_TEXT_COLUMNS)
 def test_release_record_scrubs_every_free_text_column(column):
     record = record_of({column: "see jane@x.org for more"})
     assert record[column] == "see for more"
+
+
+@pytest.mark.parametrize("column", URL_COLUMNS)
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # Taking the address out would leave a URL that points nowhere, such as
+        # `git+ssh:///foo/bar.git` or `:foo/bar.git`, in a part that is never replaced.
+        # So the URL goes whole.
+        ("git+ssh://git@github.com/foo/bar.git", None),
+        ("git@github.com:foo/bar.git", None),
+        ("https://example.org/contact?to=jane@x.org", None),
+        ("see jane@x.org for more", None),
+        # A URL with no address is kept as it is.
+        ("https://github.com/foo/bar", "https://github.com/foo/bar"),
+        ("https://twitter.com/@jane", "https://twitter.com/@jane"),  # no address
+        ("", None),
+    ],
+)
+def test_release_record_drops_a_page_or_a_download_that_holds_an_address(
+    column, url, expected
+):
+    assert record_of({column: url})[column] == expected
 
 
 @pytest.mark.parametrize(

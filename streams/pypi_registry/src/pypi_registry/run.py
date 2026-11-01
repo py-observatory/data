@@ -21,18 +21,20 @@ the stored cursor, which is a stale copy, before it writes anything. Then:
 `sweep` is the other run. A bootstrap stores every project of the root without reading
 its page, so every project starts unswept, and the daily run reads a page only when its
 project changes. The sweep reads the page of each project that is not swept yet, in
-full, a time budget at a time, and is run again until none is left. It goes at about
-0.8 requests a second (SWEEP_INTERVAL), which spreads the pages of close to a million
-projects over about two weeks of sweeps. It takes the same steps as `run_once`, except
-that it reads no root: it goes on from the state as it is, rolls over, reads the
-unswept projects (`_sweep_projects`), and then applies the delta, writes the manifest,
-checks the gates and publishes in the same way (`_resume` and `_publish` are the start
-and the end of both). With no root it has no serial to record, so it writes no serial
-and no cursor, and its manifest keeps the `data_through`, the `cursor` and the backlog of
-the run before it: the coverage's `remaining` is what the last daily run left to the
-next one, and its `unswept` is the sweep's progress. It writes no event either: it
-reads a page as it is now, and nothing says when a file was added or a status changed,
-so none of the files that it records is exact.
+full, a time budget at a time. It is run again while it reads some (`swept > 0`) and
+some are left. One that reads none while some are left has met only pages that it
+cannot use, which the next sweep would meet as well, so the chain ends there (see
+`main`). It goes at about 0.8 requests a second (SWEEP_INTERVAL), which spreads the
+pages of close to a million projects over about two weeks of sweeps. It takes the same
+steps as `run_once`, except that it reads no root: it goes on from the state as it is,
+rolls over, reads the unswept projects (`_sweep_projects`), and then applies the delta,
+writes the manifest, checks the gates and publishes in the same way (`_resume` and
+`_publish` are the start and the end of both). With no root it has no serial to record,
+so it writes no serial and no cursor, and its manifest keeps the `data_through`, the
+`cursor` and the backlog of the run before it: the coverage's `remaining` is what the
+last daily run left to the next one, and its `unswept` is the sweep's progress. It
+writes no event either: it reads a page as it is now, and nothing says when a file was
+added or a status changed, so none of the files that it records is exact.
 
 A manifest says that the data is `complete` when neither is left: no project to the next
 daily run, and none unswept. That holds for every run, so the bootstrap, which has read
@@ -63,6 +65,7 @@ import os
 import platform
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 import tomllib
@@ -413,6 +416,13 @@ def _month_manifest(
     return path, entry
 
 
+def _log_free_disk(workdir: Path, when: str) -> None:
+    """Write to stderr, on one line, how much space is free on the disk that holds
+    `workdir`, so that the log of a run shows what a month close needs of it."""
+    free = shutil.disk_usage(workdir).free
+    print(f"{when}: {free / 1e9:.1f} GB free on {workdir}", file=sys.stderr)
+
+
 def _close_month(
     gh: GitHub,
     workdir: Path,
@@ -429,6 +439,11 @@ def _close_month(
     and the month's manifest made. Returns the part and the manifest, each as its file
     and its entry, to add to the month's release. Nothing is uploaded here.
 
+    A month of deltas takes much of a runner's disk, so each file goes as soon as it
+    has served: the rebuilt base once it checks, and each delta, `last`'s database
+    included, once the part holds its rows. A retry fetches them again. The space
+    free on the disk is logged to stderr as the close starts and as it ends.
+
     Raises PriorStateError when the prior manifest lists no base copy of the month,
     or a copy does not download as its entry says, and GateError when the rebuilt
     state differs from the state. No override reason passes that failure: going on
@@ -436,6 +451,7 @@ def _close_month(
     """
     year, number = month
     period = f"{year:04d}-{number:02d}"
+    _log_free_disk(workdir, f"month close {period} starts")
     tag = month_tag(STREAM, date(year, number, 1))
     held = {asset.name: asset for asset in prior.assets if asset.tag == tag}
     base = held.get(f"{base_state_name(year, number)}.zst")
@@ -462,8 +478,9 @@ def _close_month(
             "releases cannot restore"
         )
         raise GateError([GateFailure("replay", detail)])
+    base_db.unlink()
     part_db = workdir / month_part_name(year, number)
-    consolidate(deltas, part_db)
+    consolidate(deltas, part_db, remove_inputs=True)
     part = prepare_asset(
         part_db,
         workdir,
@@ -474,7 +491,9 @@ def _close_month(
         closed=True,
     )
     month_assets = [base, *days, sealed, part[1]]
-    return [part, _month_manifest(workdir, prior, month, month_assets)]
+    manifest = _month_manifest(workdir, prior, month, month_assets)
+    _log_free_disk(workdir, f"month close {period} ends")
+    return [part, manifest]
 
 
 def _add_create_once(gh: GitHub, added: list[tuple[Path, Asset]]) -> None:
@@ -1005,10 +1024,11 @@ def main(argv: list[str] | None = None) -> int:
 
     It needs GITHUB_TOKEN, and publishes to GITHUB_REPOSITORY, or to
     py-observatory/data when that is not set. It makes one GitHub client, whose
-    writes are paced, for every call of the run, and works in a new directory under
-    ./work, which is removed afterwards. It prints the report as JSON. Every error
-    propagates. A sweep waits SWEEP_INTERVAL seconds between requests, and a run waits
-    for as long as the kit's `Http` does by default.
+    writes are paced, for every call of the run, and works in a new directory in the
+    folder that `--workdir` names (./work by default), which is removed afterwards.
+    It prints the report as JSON. Every error propagates. A sweep waits
+    SWEEP_INTERVAL seconds between requests, and a run waits for as long as the kit's
+    `Http` does by default.
 
     `run` returns 0. `sweep` returns 3, when it has swept some projects and others
     are left, to say that it is to be run again, and 0 otherwise. A sweep that reads
@@ -1031,7 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument(
         "--override-reason",
         default="",
-        help="publish although a gate failed, for this reason, which the manifest logs",
+        help="publish although a gate failed (except a failed month close), for this "
+        "reason, which the manifest logs",
     )
     run.add_argument(
         "--max-seconds",
@@ -1050,11 +1071,20 @@ def main(argv: list[str] | None = None) -> int:
         default=16_200,
         help="stop starting projects after this many seconds (default: 16200)",
     )
+    for command in (run, sweeping):
+        command.add_argument(
+            "--workdir",
+            type=Path,
+            default=Path("work"),
+            metavar="PATH",
+            help="the folder to work in, on a disk with room for a month close; each "
+            "run makes a directory of its own there and removes it (default: work)",
+        )
     args = parser.parse_args(argv)
     gh = GitHub(
         os.environ.get("GITHUB_REPOSITORY", _REPOSITORY), os.environ["GITHUB_TOKEN"]
     )
-    work = Path.cwd() / "work"
+    work = args.workdir.absolute()
     work.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="run-", dir=work) as workdir:
         if args.command == "sweep":
