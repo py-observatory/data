@@ -1,7 +1,9 @@
 import json
 import re
+import tracemalloc
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +23,12 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 # Deeper than json can read, so reading it raises RecursionError.
 TOO_DEEP = 5_000_000
+
+# Nesting that json reads and repr() cannot show. On the macOS machine where this was
+# found, json reads about 116,000 levels and repr() overflows the stack from about
+# 69,000. Where json's limit is lower, these bodies fail in json and not in repr(), and
+# the tests still hold. The tests that use `deeply_nested` do not depend on either limit.
+READABLE_DEPTH = 100_000
 
 
 def fixture(name: str) -> bytes:
@@ -80,6 +88,20 @@ def page_document(changes: dict | None = None, drop: tuple[str, ...] = ()) -> di
         changes,
         drop,
     )
+
+
+def deeply_nested(depth: int = 300_000) -> list:
+    """A list nested `depth` levels deep. It is built in a loop and never goes through
+    json, so no limit of json applies to it, and it is deeper than repr() can show."""
+    deep: list = []
+    for _ in range(depth):
+        deep = [deep]
+    return deep
+
+
+def nested_text(depth: int) -> bytes:
+    """The JSON of a list nested `depth` levels deep."""
+    return b"[" * depth + b"]" * depth
 
 
 def parsed_file(changes: dict | None = None, drop: tuple[str, ...] = ()) -> FileInfo:
@@ -651,16 +673,164 @@ def test_parse_project_page_rejects_json_nested_too_deeply_to_read():
         parse_project_page(raw)
 
 
-def test_a_message_shows_a_long_bad_value_only_in_part():
-    # A list is not a version, so each of these is refused and the message shows it.
-    # A reply can hold anything, and its error goes to a log and an issue.
-    bad = ["x" * 5000]
-    with pytest.raises(ValueError, match="xxx") as page_error:
-        parse_project_page(body(page_document({"versions": [bad]})))
-    with pytest.raises(ValueError, match="xxx") as root_error:
+# ---- the message of an error
+
+
+def test_a_message_names_the_document_the_path_and_the_value():
+    document = page_document({"files": [file_entry({"size": "12"})]})
+    with pytest.raises(ValueError) as caught:
+        parse_project_page(body(document))
+    assert str(caught.value) == (
+        "a project page: files[0].size must be a non-negative integer or null, not '12'"
+    )
+    with pytest.raises(ValueError) as caught:
+        parse_root(body([1, 2]))
+    assert str(caught.value) == "the Simple API root must be a JSON object, not [1, 2]"
+    # A value shows three levels deep, and `...` stands for what lies below them.
+    with pytest.raises(ValueError) as caught:
+        parse_root(body([[[[[1]]]]]))
+    assert str(caught.value) == (
+        "the Simple API root must be a JSON object, not [[[[...]]]]"
+    )
+
+
+@pytest.mark.parametrize(
+    ("bad", "seen"),
+    [
+        (["x" * 5000], "xxx"),
+        # Wide as well as long, so cutting each part short is not enough.
+        ([["x" * 5000] * 6 for _ in range(6)], "xxx"),
+        ({"k" * 500: "v" * 500}, "kkk"),
+        ("z" * 5000, "zzz"),
+    ],
+)
+def test_a_message_shows_a_long_bad_value_only_in_part(bad, seen):
+    # Neither a size nor an api-version can be a list, an object or a long string, so
+    # each is refused where it stands. A reply can hold anything, and its error goes to
+    # a log and to an issue.
+    with pytest.raises(ValueError, match=seen) as page_error:
+        parse_project_page(body(page_document({"files": [file_entry({"size": bad})]})))
+    with pytest.raises(ValueError, match=seen) as root_error:
         parse_root(body(root_document(meta={"api-version": bad, "_last-serial": 1})))
     assert len(str(page_error.value)) < 300
     assert len(str(root_error.value)) < 300
+
+
+# A bad value, as a function that puts the value `deep` into a document, and the path
+# that the error for it names.
+DEEP_VALUES = [
+    pytest.param(
+        parse_root,
+        lambda deep: root_document(meta={"api-version": deep, "_last-serial": 1}),
+        "meta.api-version",
+        id="root api-version",
+    ),
+    pytest.param(
+        parse_root,
+        lambda deep: {
+            "meta": GOOD_META,
+            "projects": [{"name": deep, "_last-serial": 1}],
+        },
+        "projects[0].name",
+        id="root name",
+    ),
+    pytest.param(
+        parse_root, lambda deep: deep, "must be a JSON object", id="root document"
+    ),
+    pytest.param(
+        parse_project_page,
+        lambda deep: page_document({"versions": [deep]}),
+        "versions[0]",
+        id="page version",
+    ),
+    pytest.param(
+        parse_project_page,
+        lambda deep: page_document({"files": [file_entry({"yanked": deep})]}),
+        "files[0].yanked",
+        id="page yanked",
+    ),
+    pytest.param(
+        parse_project_page,
+        lambda deep: page_document(
+            {"project-status": {"status": "active", "reason": deep}}
+        ),
+        "project-status.reason",
+        id="page status reason",
+    ),
+    pytest.param(
+        parse_project_page,
+        lambda deep: deep,
+        "must be a JSON object",
+        id="page document",
+    ),
+]
+
+
+@pytest.mark.parametrize(("parse", "build", "path"), DEEP_VALUES)
+def test_a_bad_value_too_deep_for_repr_is_still_a_value_error(
+    monkeypatch, parse, build, path
+):
+    # repr() recurses once for each level of nesting, and overflows the stack on a value
+    # that is nested deeply enough. The reply here never goes through json, so how deep
+    # it is does not depend on json's limit.
+    document = build(deeply_nested())
+    monkeypatch.setattr(
+        "pypi_registry.simple.json", SimpleNamespace(loads=lambda body: document)
+    )
+    with pytest.raises(ValueError, match=re.escape(path)) as caught:
+        parse(b"")
+    assert len(str(caught.value)) < 300
+
+
+@pytest.mark.parametrize(
+    "make_huge",
+    [lambda: "y" * 20_000_000, lambda: [0] * 3_000_000],
+    ids=["a string of 20 MB", "a list of 3 million"],
+)
+def test_showing_a_huge_bad_value_does_not_build_its_whole_text(monkeypatch, make_huge):
+    # The message holds 60 characters of the value, and the work to show them does not
+    # grow with the value. repr() would build the whole text of a string or a list first,
+    # which is as much memory again as the value. The value is made before the memory is
+    # counted and the reply does not go through json, so what is counted is the parser.
+    document = page_document({"files": [file_entry({"size": make_huge()})]})
+    monkeypatch.setattr(
+        "pypi_registry.simple.json", SimpleNamespace(loads=lambda body: document)
+    )
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=re.escape("files[0].size")):
+            parse_project_page(b"")
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 1_000_000
+
+
+READABLE_BODIES = [
+    pytest.param(
+        parse_root,
+        b'{"meta": {"api-version": '
+        + nested_text(READABLE_DEPTH)
+        + b', "_last-serial": 1}, "projects": []}',
+        id="root api-version",
+    ),
+    pytest.param(
+        parse_project_page,
+        b'{"meta": {"api-version": "1.4", "_last-serial": 1}, "name": "demo",'
+        b' "files": [], "versions": [' + nested_text(READABLE_DEPTH) + b"]}",
+        id="page version",
+    ),
+    pytest.param(parse_root, nested_text(READABLE_DEPTH), id="root document"),
+    pytest.param(parse_project_page, nested_text(READABLE_DEPTH), id="page document"),
+]
+
+
+@pytest.mark.parametrize(("parse", "raw"), READABLE_BODIES)
+def test_a_body_nested_as_deep_as_json_reads_is_still_a_value_error(parse, raw):
+    # The case as it comes in: a body that json reads, holding a bad value that repr()
+    # cannot show. Where json's limit is lower, json is what refuses it.
+    with pytest.raises(ValueError):
+        parse(raw)
 
 
 # ---- the types
