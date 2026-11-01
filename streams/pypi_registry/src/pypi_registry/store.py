@@ -37,7 +37,7 @@ what they are about, so a delta holds a file or a release once, and each also ha
 import heapq
 import sqlite3
 from collections.abc import Callable, Generator, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from operator import itemgetter
 from pathlib import Path
 
@@ -200,18 +200,44 @@ _INSERT_SWEPT = _insert("swept", "seq", "name", "incarnation", "status")
 _INSERT_CURSOR = _insert("cursors", "seq", "serial", "fetched_at")
 
 
+def _table_names(conn: sqlite3.Connection) -> set[str]:
+    """The names of the tables of a database, leaving out the ones SQLite keeps."""
+    return {
+        name
+        for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master "
+            r"WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\'"
+        )
+    }
+
+
+def _require_tables(conn: sqlite3.Connection, path: Path, schema: str) -> None:
+    """Raise ValueError unless the database holds every table that `schema` makes."""
+    with closing(sqlite3.connect(":memory:")) as scratch:
+        scratch.executescript(schema)
+        wanted = _table_names(scratch)
+    lacking = sorted(wanted - _table_names(conn))
+    if lacking:
+        raise ValueError(
+            f"{path} is not a database of this schema: it lacks {', '.join(lacking)}"
+        )
+
+
 def open_db(path: Path, schema: str, *, create: bool = False) -> sqlite3.Connection:
     """Open the database at `path`, or make it from `schema`.
 
     With `create` the file must not exist yet. It is made, and `schema` is run in it. If
     that fails, the file is removed. Without `create` the file must exist, and it is
-    opened to read and write, and `schema` is not used.
+    opened to read and write. It must hold every table of `schema`, and it may hold
+    more.
 
     SQLite is never asked to make a file that is missing, because it would make an empty
     database and say nothing. A state that should be there and is not must be an error,
-    and not a new state with no projects in it. Raises FileExistsError when `create`
-    finds the file, and FileNotFoundError when `create` is not set and the file is not
-    there, or when the folder is not there.
+    and not a new state with no projects in it. A file of zero bytes is the same trap,
+    because SQLite reads it as a new, empty database, and so is a database of another
+    kind, so neither is opened as one. Raises FileExistsError when `create` finds the
+    file, FileNotFoundError when `create` is not set and the file is not there, or when
+    the folder is not there, and ValueError when the file lacks a table of `schema`.
 
     The connection is as SQLite opens it: what is written is in an open transaction
     until it is committed.
@@ -223,23 +249,26 @@ def open_db(path: Path, schema: str, *, create: bool = False) -> sqlite3.Connect
     # raises for a file that is not there. `mode=rw` is the second guard: it makes
     # SQLite refuse a missing file where it would otherwise create one.
     conn = sqlite3.connect(f"{path.resolve(strict=True).as_uri()}?mode=rw", uri=True)
-    if create:
-        try:
+    try:
+        if create:
             conn.executescript(schema)
-        except BaseException:
-            conn.close()
+        else:
+            _require_tables(conn, path, schema)
+    except BaseException:
+        conn.close()
+        if create:
             path.unlink(missing_ok=True)
-            raise
+        raise
     return conn
 
 
-def _highest_seq(conn: sqlite3.Connection) -> int:
-    """The highest `seq` in any table of the delta, or 0 when it has no row."""
+def _highest_seq(conn: sqlite3.Connection) -> int | None:
+    """The highest `seq` in any table of the delta, or None when it has no row."""
     highests = " UNION ALL ".join(
         f"SELECT max(seq) AS seq FROM {table}" for table in _DELTA_TABLES
     )
     (highest,) = conn.execute(f"SELECT max(seq) FROM ({highests})").fetchone()
-    return 0 if highest is None else highest
+    return highest
 
 
 class Delta:
@@ -269,7 +298,8 @@ class Delta:
             raise ValueError(f"first_seq must be at least 1, not {first_seq}")
         self._conn = conn
         self._observed_at = observed_at
-        self._next_seq = max(first_seq, _highest_seq(conn) + 1)
+        highest = _highest_seq(conn)
+        self._next_seq = first_seq if highest is None else max(first_seq, highest + 1)
 
     def _write(self, statement: str, values: tuple) -> None:
         self._conn.execute(statement, (self._next_seq, *values))
@@ -381,16 +411,20 @@ def _apply_event(state: sqlite3.Connection, row: tuple) -> None:
                 (name, incarnation, observed_at),
             )
         case "reregistered":
-            # The event carries the new incarnation, and the project that it replaces
-            # must be of an earlier one. That is also what stops a replay from applying
-            # the same event twice.
+            # The event carries the new incarnation. It can only follow a removal: the
+            # project that it replaces must be removed, and of an earlier incarnation. A
+            # quarantined project keeps its files and is the same project when it
+            # returns. The condition is also what stops a replay from applying the same
+            # event twice.
             cursor = state.execute(
                 "UPDATE projects SET incarnation = ?, status = 'active', swept = 0, "
                 "first_seen = ?, first_seen_exact = 1 "
-                "WHERE name = ? AND incarnation < ?",
+                "WHERE name = ? AND incarnation < ? AND status = 'removed'",
                 (incarnation, observed_at, name, incarnation),
             )
-            _expect_one(cursor, f"project {name!r} below incarnation {incarnation}")
+            _expect_one(
+                cursor, f"removed project {name!r} below incarnation {incarnation}"
+            )
         case "removed":
             _set_status(state, name, incarnation, "removed")
             state.execute(
@@ -465,10 +499,12 @@ def _apply_swept(state: sqlite3.Connection, row: tuple) -> None:
 
 def _apply_cursor(state: sqlite3.Connection, row: tuple) -> None:
     _, serial = row
+    # The serial goes in as it is. `meta.value` is TEXT, so a number is stored as its
+    # text, and a null is refused there and does not become the text 'None'.
     state.execute(
         "INSERT INTO meta (key, value) VALUES ('cursor', ?) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        (str(serial),),
+        (serial,),
     )
 
 
@@ -540,15 +576,23 @@ def apply_delta(
     number is `after_seq` when the delta has no row above it. A release record counts,
     though it changes nothing, so a delta that ends with one is applied through it.
 
+    A delta that has rows, all of them below `after_seq`, is refused. It was not opened
+    with a `first_seq` that goes on from what the state has applied, so none of its rows
+    would ever be applied, and returning `after_seq` would hide that. A delta with no
+    rows, or whose highest `seq` is `after_seq`, has nothing to apply and is not an
+    error.
+
     Each row changes the state as follows. Every event and row is about a project or a
     file at an incarnation, and the state must hold it.
 
     - `created` adds the project: active, with `last_serial` 0, not swept, and first
       seen at the event's `observed_at`, exactly.
-    - `reregistered` gives the project the event's incarnation, which must be above the
-      stored one. The project is active and not swept, and first seen at the event's
-      `observed_at`, exactly: it is a new project, and it was seen when it came back.
-      Its `last_serial` is left for the serial row that follows.
+    - `reregistered` gives a removed project the event's incarnation, which must be
+      above the stored one. A project in any other status is refused: it is the same
+      project, and a quarantined one keeps its files. The project is active and not
+      swept, and first seen at the event's `observed_at`, exactly: it is a new project,
+      and it was seen when it came back. Its `last_serial` is left for the serial row
+      that follows.
     - `removed` sets the status `removed` and deletes the incarnation's files.
       `quarantined` sets `quarantined` and keeps the files, `unquarantined` sets
       `active`, and `status_changed` sets the status in the event's `detail`.
@@ -559,17 +603,26 @@ def apply_delta(
       higher `record`: a record is never taken away.
     - A `serials` row sets the project's `last_serial`, to a lower number as well. A
       `swept` row sets `swept` to 1 and the status to the one in the row. A `cursors`
-      row sets `meta.cursor`.
+      row sets `meta.cursor`, to the text of the serial, and a row with no serial is
+      refused.
     - A `release_records` row changes nothing.
 
     The changes are made in one transaction, which is committed before the function
     returns, or none is made: an error undoes what the call did to the state. Raises
     ValueError for an event or row about a project or file that the state does not
-    hold, for an event of a kind that is not known, and for two rows with one `seq`,
-    whose order would be open. Raises sqlite3.IntegrityError for a `created` event for
-    a project that is there, and for a `files` row for a file that is there. The error
-    says which row it was.
+    hold, for an event of a kind that is not known, for two rows with one `seq`, whose
+    order would be open, and for a delta numbered below `after_seq`. Raises
+    sqlite3.IntegrityError for a `created` event for a project that is there, for a
+    `files` row for a file that is there, and for a `cursors` row with no serial. The
+    error for a row says which row it was.
     """
+    top = _highest_seq(delta)
+    if top is not None and top < after_seq:
+        raise ValueError(
+            f"the highest seq of the delta is {top}, which is below after_seq "
+            f"{after_seq}: its rows were not numbered from what the state has applied, "
+            "so none of them would ever be applied"
+        )
     highest = after_seq
     with _atomic(state):
         for seq, table, row in _rows_after(delta, after_seq):
@@ -590,9 +643,64 @@ def state_rows(state: sqlite3.Connection) -> dict[str, list[tuple]]:
     """Every row of the four tables of the state, each table's rows sorted.
 
     The tables are in the order of the schema. The rows are all held in memory, so this
-    is for tests and for small states, and a large state is better compared in SQL.
+    is for tests and for small states. `diff_states` compares large ones.
     """
     return {
         table: sorted(tuple(row) for row in state.execute(f"SELECT * FROM {table}"))
         for table in _STATE_TABLES
     }
+
+
+def _only_in(conn: sqlite3.Connection, table: str, here: str, there: str) -> bool:
+    """Whether the table in the database `here` has a row that the one in `there` lacks.
+
+    SQLite does the work, and only a count comes back. The query is written so that
+    SQLite reads the two tables in key order and merges them as it goes, which takes no
+    memory and stops at the first row that differs. `ORDER BY 1`, the first column of
+    the key of every state table, is what asks for that, with the `LIMIT 1`. A plain
+    EXCEPT, or an EXISTS around it, is merged like this by newer SQLite (3.53 and 3.54
+    were tried), but 3.49 and 3.50 build a temporary b-tree of the whole first table
+    instead, which took four times as long on three million rows and never stopped
+    early.
+    """
+    (count,) = conn.execute(
+        f"SELECT count(*) FROM (SELECT * FROM {here}.{table} "
+        f"EXCEPT SELECT * FROM {there}.{table} ORDER BY 1 LIMIT 1)"
+    ).fetchone()
+    return count > 0
+
+
+def diff_states(a: sqlite3.Connection, b: Path) -> list[str]:
+    """The names of the state tables in which `a` and the state database at `b` differ,
+    sorted. An empty list means that the two are equal.
+
+    For each table it asks whether either has a row that the other lacks, where a row is
+    the same only if every value is the same, a null with a null, and a number is not
+    the text of that number. The comparison is in SQL, and no row is read into Python,
+    so it works for states of millions of rows, where `state_rows` would need gigabytes.
+    `b` is attached to `a` while it runs, and it is detached again whatever happens.
+    Neither database is written to.
+
+    `a` must have no transaction open, so commit first. SQLite attaches inside one, but
+    then will not detach the database that the transaction has read, and `b` would stay
+    attached to the caller's connection. A connection opened with `autocommit=False` is
+    always in a transaction, so it cannot be compared. Raises ValueError for a
+    connection that has a transaction open, FileNotFoundError when `b` is not there,
+    because attaching it would make an empty database, and sqlite3.OperationalError
+    when `b` lacks a table of the state.
+    """
+    if a.in_transaction:
+        raise ValueError(
+            "the connection has a transaction open, so the other state could not be "
+            "detached again: commit before comparing"
+        )
+    a.execute("ATTACH DATABASE ? AS compared", (str(b.resolve(strict=True)),))
+    try:
+        return sorted(
+            table
+            for table in _STATE_TABLES
+            if _only_in(a, table, "main", "compared")
+            or _only_in(a, table, "compared", "main")
+        )
+    finally:
+        a.execute("DETACH DATABASE compared")

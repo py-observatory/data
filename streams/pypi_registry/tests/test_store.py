@@ -17,6 +17,7 @@ from pypi_registry.store import (
     STATE_SCHEMA,
     Delta,
     apply_delta,
+    diff_states,
     open_db,
     state_rows,
 )
@@ -219,13 +220,18 @@ def seeded_state(tmp_path: Path, name: str, rows: Rows) -> sqlite3.Connection:
     return state
 
 
-def base_copy(tmp_path: Path, name: str) -> sqlite3.Connection:
-    """An open copy of the base state, so that a test can change it as it likes."""
+def base_file(tmp_path: Path, name: str) -> Path:
+    """A copy of the base state as a file that nothing has open."""
     base = tmp_path / "base.db"
     if not base.exists():
         seeded_state(tmp_path, "base.db", BASE).close()
     shutil.copy(base, tmp_path / name)
-    return opened(open_db(tmp_path / name, STATE_SCHEMA))
+    return tmp_path / name
+
+
+def base_copy(tmp_path: Path, name: str) -> sqlite3.Connection:
+    """An open copy of the base state, so that a test can change it as it likes."""
+    return opened(open_db(base_file(tmp_path, name), STATE_SCHEMA))
 
 
 def apply_rows(state: sqlite3.Connection, tmp_path: Path, write: Writer) -> int:
@@ -407,6 +413,67 @@ def test_open_db_takes_a_relative_path(tmp_path, monkeypatch):
         assert user_tables(state) == dict.fromkeys(STATE_COLUMNS, True)
 
 
+def make_file(path: Path, kind: str) -> None:
+    """A file of one of four kinds: `empty` (zero bytes), `delta`, `state`, and `state
+    without a table`, which lacks `versions_seen`."""
+    if kind == "empty":
+        path.touch()  # SQLite reads a file of zero bytes as a new, empty database
+        return
+    with closing(sqlite3.connect(path)) as conn:
+        conn.executescript(DELTA_SCHEMA if kind == "delta" else STATE_SCHEMA)
+        if kind == "state without a table":
+            conn.execute("DROP TABLE versions_seen")
+        conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("kind", "schema", "missing"),
+    [
+        ("empty", STATE_SCHEMA, sorted(STATE_COLUMNS)),
+        ("empty", DELTA_SCHEMA, sorted(DELTA_COLUMNS)),
+        ("delta", STATE_SCHEMA, sorted(STATE_COLUMNS)),
+        ("state", DELTA_SCHEMA, sorted(DELTA_COLUMNS)),
+        ("state without a table", STATE_SCHEMA, ["versions_seen"]),
+    ],
+    ids=[
+        "empty file as a state",
+        "empty file as a delta",
+        "delta as a state",
+        "state as a delta",
+        "state with a table gone",
+    ],
+)
+def test_open_db_refuses_a_file_that_is_not_of_the_schema(
+    tmp_path, kind, schema, missing
+):
+    # A file that is there but lacks tables of the schema must not open as an empty
+    # database, which is what SQLite makes of a file of zero bytes. It is refused, and
+    # the error ends with the tables that are missing, and only those.
+    path = tmp_path / "state.db"
+    make_file(path, kind)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="state.db") as caught:
+        open_db(path, schema)
+    assert str(caught.value).endswith(f"it lacks {', '.join(missing)}")
+    # Nothing was written to the file, and nothing was made beside it.
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["state.db"]
+
+
+def test_open_db_opens_a_database_that_has_more_tables(tmp_path):
+    # Only the tables of the schema have to be there.
+    path = tmp_path / "state.db"
+    make_file(path, "state")
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE extra (x)")
+        conn.commit()
+    with closing(open_db(path, STATE_SCHEMA)) as state:
+        assert user_tables(state) == {
+            **dict.fromkeys(STATE_COLUMNS, True),
+            "extra": False,
+        }
+
+
 @pytest.mark.parametrize(
     "schema",
     ["CREATE TABLE (", "CREATE TABLE a (x); CREATE TABLE a (y);"],
@@ -416,6 +483,29 @@ def test_a_failed_create_leaves_no_file(tmp_path, schema):
     with pytest.raises(sqlite3.Error):
         open_db(tmp_path / "bad.db", schema, create=True)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_open_db_closes_every_connection_it_made_when_it_refuses(tmp_path, monkeypatch):
+    # A refusal must not leave a connection open on the file, whether the file lacks
+    # the tables of the schema or the schema of a new file does not run.
+    made: list[sqlite3.Connection] = []
+    connect = sqlite3.connect
+
+    def watching(*args, **kwargs):
+        conn = connect(*args, **kwargs)
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", watching)
+    (tmp_path / "empty.db").touch()
+    with pytest.raises(ValueError, match="lacks"):
+        open_db(tmp_path / "empty.db", STATE_SCHEMA)
+    with pytest.raises(sqlite3.Error):
+        open_db(tmp_path / "bad.db", "CREATE TABLE (", create=True)
+    assert made
+    for conn in made:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
 
 
 # ---- the delta: numbering
@@ -672,6 +762,19 @@ def test_reregistered_starts_the_new_incarnation(tmp_path):
     assert rows["files_current"] == BASE["files_current"]
 
 
+@pytest.mark.parametrize("status", ["active", "quarantined", "archived", "deprecated"])
+def test_reregistered_is_refused_for_a_project_that_is_not_removed(tmp_path, status):
+    # Only a name that was removed can be registered again. A project in any other
+    # status is the same project, and a quarantined one keeps its files, so a
+    # `reregistered` event for it means that the delta and the state disagree.
+    rows = {**BASE, "projects": [project("demo", status=status)]}
+    state = seeded_state(tmp_path, "state.db", rows)
+    with pytest.raises(ValueError, match="removed project 'demo' below incarnation 2"):
+        apply_events(state, tmp_path, Event("demo", 2, "reregistered"))
+    assert state_rows(state)["projects"] == [project("demo", status=status)]
+    assert not state.in_transaction
+
+
 def test_removed_drops_the_files_of_that_incarnation(tmp_path):
     state = base_copy(tmp_path, "state.db")
     # A file of another incarnation of the name is not the removed project's.
@@ -869,6 +972,18 @@ def test_a_cursor_row_adds_the_cursor_when_there_is_none(tmp_path):
     assert state_rows(state)["meta"] == [("cursor", "150")]
 
 
+def test_a_cursor_row_without_a_serial_is_refused(tmp_path):
+    # The serial goes to `meta.value` as it is, and a null is refused there. It is not
+    # turned into the text 'None' and kept as a cursor.
+    state = base_copy(tmp_path, "state.db")
+    conn, _ = new_delta(tmp_path)
+    conn.execute("INSERT INTO cursors VALUES (1, NULL, '2026-11-01T06:00:01Z')")
+    conn.commit()
+    with closing(conn), pytest.raises(sqlite3.IntegrityError, match="meta.value"):
+        apply_delta(state, conn)
+    assert state_rows(state) == BASE
+
+
 def test_a_release_record_changes_no_state(tmp_path):
     state = base_copy(tmp_path, "state.db")
     apply_rows(state, tmp_path, lambda d: d.record(record_of("demo", 1, "1.2")))
@@ -934,16 +1049,47 @@ def test_a_release_record_counts_toward_the_seq_applied(tmp_path):
 def test_apply_delta_with_nothing_to_apply_returns_after_seq(tmp_path):
     state = base_copy(tmp_path, "state.db")
     conn, delta = new_delta(tmp_path)
+    # A delta with no rows has nothing to apply, whatever the state has applied.
     assert apply_delta(state, conn) == 0
     assert apply_delta(state, conn, after_seq=7) == 7
     delta.serial("demo", 9)  # 1
     delta.serial("other", 8)  # 2
     conn.commit()
-    # Nothing in the delta is above these, so nothing is applied and nothing is lost.
+    # The state has applied through the last row of the delta, as it has after the
+    # last pass of a day, so nothing is applied and nothing is lost.
     assert apply_delta(state, conn, after_seq=2) == 2
-    assert apply_delta(state, conn, after_seq=50) == 50
     conn.close()
     assert state_rows(state) == BASE
+
+
+@pytest.mark.parametrize("after_seq", [3, 50])
+def test_a_delta_numbered_below_after_seq_is_refused(tmp_path, after_seq):
+    # A delta that has rows, all of them below what the state has applied, was not
+    # numbered from there. None of its rows would ever be applied, and returning
+    # `after_seq` would let that pass for a delta with nothing in it.
+    state = base_copy(tmp_path, "state.db")
+    conn, delta = new_delta(tmp_path)
+    delta.serial("demo", 9)  # 1
+    delta.record(record_of("demo", 1, "1.2"))  # 2
+    conn.commit()
+    with closing(conn), pytest.raises(ValueError, match="below after_seq") as caught:
+        apply_delta(state, conn, after_seq=after_seq)
+    assert f"is 2, which is below after_seq {after_seq}" in str(caught.value)
+    assert state_rows(state) == BASE
+    assert not state.in_transaction
+
+
+def test_a_delta_whose_only_rows_are_records_is_numbered_by_them(tmp_path):
+    # Records count toward the highest seq, so a delta of records alone, applied
+    # through its last, is applied and is not refused.
+    state = base_copy(tmp_path, "state.db")
+    conn, delta = new_delta(tmp_path, first_seq=4)
+    delta.record(record_of("demo", 1, "1.2"))  # 4
+    conn.commit()
+    with closing(conn):
+        assert apply_delta(state, conn, after_seq=4) == 4
+        with pytest.raises(ValueError, match="below after_seq"):
+            apply_delta(state, conn, after_seq=5)
 
 
 @pytest.mark.parametrize(
@@ -1073,7 +1219,11 @@ MISFITS: list[tuple[str, Writer]] = [
     ("removed, another incarnation", lambda d: d.event(Event("demo", 2, "removed"))),
     (
         "reregistered, not a later incarnation",
-        lambda d: d.event(Event("demo", 1, "reregistered")),
+        lambda d: d.event(Event("gone", 1, "reregistered")),  # removed, at 1
+    ),
+    (
+        "reregistered, a project that is not removed",
+        lambda d: d.event(Event("demo", 2, "reregistered")),  # active, at 1
     ),
     (
         "file_removed, no such file",
@@ -1362,6 +1512,198 @@ def test_state_rows_of_an_empty_state(tmp_path):
         "files_current": [],
         "versions_seen": [],
     }
+
+
+# ---- diff_states
+
+
+def run_sql(path: Path, sql: str) -> None:
+    """Change a database file that nothing has open."""
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(sql)
+        conn.commit()
+
+
+# One change to a single value of a single row, for each table. The last two are the
+# changes that a comparison of values could miss: a null that gets a value, and a
+# number that becomes the text of that number.
+CHANGES = {
+    "a value of meta": (
+        "meta",
+        "UPDATE meta SET value = '101' WHERE key = 'cursor'",
+    ),
+    "a serial": (
+        "projects",
+        "UPDATE projects SET last_serial = 6 WHERE name = 'demo'",
+    ),
+    "a status": (
+        "projects",
+        "UPDATE projects SET status = 'archived' WHERE name = 'other'",
+    ),
+    "a yank": (
+        "files_current",
+        "UPDATE files_current SET yanked = 1 WHERE filename = 'demo-1.0.tar.gz'",
+    ),
+    "a null that gets a value": (
+        "files_current",
+        "UPDATE files_current SET yanked_reason = 'x' "
+        "WHERE filename = 'other-2.0.tar.gz'",
+    ),
+    "a number that becomes its text": (
+        "files_current",
+        "UPDATE files_current SET incarnation = '1' "
+        "WHERE filename = 'other-2.0.tar.gz'",
+    ),
+    "a record flag": (
+        "versions_seen",
+        "UPDATE versions_seen SET record = 0 WHERE name = 'demo' AND version = '1.0'",
+    ),
+}
+# One row taken out of each table.
+REMOVALS = {
+    "meta": "DELETE FROM meta WHERE key = 'cursor'",
+    "projects": "DELETE FROM projects WHERE name = 'other'",
+    "files_current": "DELETE FROM files_current WHERE filename = 'demo-1.1.tar.gz'",
+    "versions_seen": "DELETE FROM versions_seen WHERE name = 'gone'",
+}
+
+
+def attached(conn: sqlite3.Connection) -> list[str]:
+    """The names of the databases that `conn` has open."""
+    return [row[1] for row in conn.execute("PRAGMA database_list")]
+
+
+@pytest.mark.parametrize("name", ["b.db", "odd name #1?%.db"])
+def test_diff_states_of_equal_states_is_empty(tmp_path, name):
+    a = base_copy(tmp_path, "a.db")
+    assert diff_states(a, base_file(tmp_path, name)) == []
+    # The two are equal whatever is in them, and that includes nothing at all.
+    empty = seeded_state(tmp_path, "empty-a.db", {})
+    seeded_state(tmp_path, "empty-b.db", {}).close()
+    assert diff_states(empty, tmp_path / "empty-b.db") == []
+
+
+@pytest.mark.parametrize("label", CHANGES)
+def test_diff_states_names_the_table_that_has_a_changed_value(tmp_path, label):
+    table, change = CHANGES[label]
+    a = base_copy(tmp_path, "a.db")
+    b = base_file(tmp_path, "b.db")
+    run_sql(b, change)
+    assert diff_states(a, b) == [table]
+
+
+@pytest.mark.parametrize("table", REMOVALS)
+@pytest.mark.parametrize("side", ["b lacks a row of a", "a lacks a row of b"])
+def test_diff_states_sees_a_row_that_is_missing_on_either_side(tmp_path, table, side):
+    a = base_copy(tmp_path, "a.db")
+    b = base_file(tmp_path, "b.db")
+    if side == "b lacks a row of a":
+        run_sql(b, REMOVALS[table])
+    else:
+        a.execute(REMOVALS[table])
+        a.commit()
+    assert diff_states(a, b) == [table]
+
+
+def test_diff_states_sees_a_table_in_which_many_rows_differ(tmp_path):
+    a = base_copy(tmp_path, "a.db")
+    b = base_file(tmp_path, "b.db")
+    run_sql(b, "UPDATE files_current SET yanked = 1 - yanked")  # all three rows
+    assert diff_states(a, b) == ["files_current"]
+
+
+def test_diff_states_lists_the_tables_that_differ_sorted(tmp_path):
+    a = base_copy(tmp_path, "a.db")
+    b = base_file(tmp_path, "b.db")
+    for label in ("a value of meta", "a serial", "a record flag"):
+        run_sql(b, CHANGES[label][1])
+    # Three tables, found in the order of the schema, and listed by name.
+    assert diff_states(a, b) == ["meta", "projects", "versions_seen"]
+    run_sql(b, CHANGES["a yank"][1])
+    assert diff_states(a, b) == ["files_current", "meta", "projects", "versions_seen"]
+
+
+def test_diff_states_leaves_both_databases_as_they_were(tmp_path):
+    a = base_copy(tmp_path, "a.db")
+    b = base_file(tmp_path, "b.db")
+    run_sql(b, CHANGES["a serial"][1])
+    before = b.read_bytes()
+    assert diff_states(a, b) == ["projects"]
+    # Nothing is left attached, nothing was written, and `a` goes on as it was.
+    assert attached(a) == ["main"]
+    assert b.read_bytes() == before
+    assert not a.in_transaction
+    assert state_rows(a) == BASE
+    assert diff_states(a, b) == ["projects"]
+    a.execute("UPDATE meta SET value = '7' WHERE key = 'cursor'")
+    a.commit()
+    assert diff_states(a, b) == ["meta", "projects"]
+
+
+def test_diff_states_does_not_load_rows_into_python(tmp_path):
+    # The tables are compared in SQL, and only a count comes back for each comparison.
+    # Each one is written as `ORDER BY 1 LIMIT 1` so that SQLite merges the two tables
+    # as it reads them in key order, and stops at the first row that differs. SQLite
+    # 3.49 and 3.50 build a temporary b-tree of a whole table for a plainer form of the
+    # same query, which for millions of rows is slow and never stops early.
+    a = base_copy(tmp_path, "a.db")
+    b = base_file(tmp_path, "b.db")
+    statements: list[str] = []
+    a.set_trace_callback(statements.append)
+    assert diff_states(a, b) == []
+    a.set_trace_callback(None)
+    queries = [s for s in statements if s.startswith("SELECT")]
+    assert queries
+    for query in queries:
+        assert query.startswith("SELECT count(*) FROM (SELECT * FROM")
+        assert query.endswith(" ORDER BY 1 LIMIT 1)")
+    a.execute("ATTACH DATABASE ? AS compared", (str(b),))
+    for query in queries:
+        plan = [row[3] for row in a.execute("EXPLAIN QUERY PLAN " + query)]
+        assert not any("TEMP B-TREE" in line for line in plan), (query, plan)
+    a.execute("DETACH DATABASE compared")
+
+
+def test_diff_states_needs_a_state_with_no_transaction_open(tmp_path):
+    # SQLite attaches a database inside a transaction, but then cannot detach it, so
+    # the other state would stay attached to the caller's connection. A write that is
+    # not committed yet is an error, nothing is attached, and the comparison does not
+    # commit the write for the caller.
+    a = base_copy(tmp_path, "a.db")
+    b = base_file(tmp_path, "b.db")
+    a.execute("UPDATE meta SET value = '7' WHERE key = 'cursor'")
+    with pytest.raises(ValueError, match="transaction open"):
+        diff_states(a, b)
+    assert a.in_transaction
+    assert attached(a) == ["main"]
+    a.commit()
+    assert diff_states(a, b) == ["meta"]
+    assert attached(a) == ["main"]
+
+
+def test_diff_states_refuses_a_file_that_is_missing(tmp_path):
+    # Attaching a path that is not there would make an empty database, and an empty
+    # state would differ from `a` in every table. It must be an error.
+    a = base_copy(tmp_path, "a.db")
+    before = sorted(p.name for p in tmp_path.iterdir())
+    with pytest.raises(FileNotFoundError, match="gone.db"):
+        diff_states(a, tmp_path / "gone.db")
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+    assert attached(a) == ["main"]
+
+
+def test_diff_states_of_a_file_that_is_not_a_state_is_an_error(tmp_path):
+    a = base_copy(tmp_path, "a.db")
+    make_file(tmp_path / "delta.db", "delta")
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        diff_states(a, tmp_path / "delta.db")
+    assert attached(a) == ["main"]
+    # An empty file is the same: it has none of the tables.
+    make_file(tmp_path / "empty.db", "empty")
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        diff_states(a, tmp_path / "empty.db")
+    assert attached(a) == ["main"]
+    assert (tmp_path / "empty.db").stat().st_size == 0
 
 
 # ---- the deltas of a month merge
