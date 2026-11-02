@@ -252,7 +252,7 @@ def test_seal_refuses_bytes_that_differ_from_the_prior(tmp_path):
     # The open delta's file is no longer the one that was published and checked: it
     # was compressed again, with another build, which gives other bytes. The seal
     # would add them to November's release for good, under an entry that gives the
-    # published bytes (R20).
+    # published bytes, which the seal reuses so that a retry adds the same bytes.
     packed = workdir / DELTA
     Build("b")(workdir / TOY.open_delta_db, packed)
     stream.github.calls.clear()
@@ -355,8 +355,9 @@ def test_month_close_builds_month_part_and_new_base(tmp_path):
     # replayed base once it checks, and each delta once the part has its rows. Left
     # are the files that the rollover added to the month releases and the part's
     # database, and what `fetch_prior` downloaded: the manifest, the state, and the
-    # published files of the state and the open delta, which it keeps for R20. Only
-    # the open delta's database is new: the prior one went into the part.
+    # published files of the state and the open delta, which it keeps so that a retry
+    # adds the same bytes. Only the open delta's database is new: the prior one went
+    # into the part.
     assert sorted(path.name for path in workdir.iterdir()) == sorted(
         [
             MANIFEST,
