@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.9.2",
+  "id": "MAL-2026-40017",
+  "published": "2026-08-12T09:14:27Z",
+  "modified": "2026-08-12T11:02:45.913726404Z",
+  "summary": "Malicious code in example-typosquat (PyPI)",
+  "details": "\n---\n_-= Per source details. Do not edit below this line.=-_\n\n## Source: example-scanner\nThe package runs a downloader from its setup.py when it is installed.\n",
+  "affected": [
+    {
+      "package": {
+        "name": "example-typosquat",
+        "ecosystem": "PyPI",
+        "purl": "pkg:pypi/example-typosquat"
+      },
+      "versions": ["0.0.1", "0.0.2", "1.0.0"],
+      "database_specific": {
+        "cwes": [
+          {
+            "cweId": "CWE-506",
+            "description": "The product contains code that appears to be malicious in nature.",
+            "name": "Embedded Malicious Code"
+          }
+        ],
+        "indicators": {
+          "evidence_files": [
+            {
+              "path": "setup.py",
+              "sha256": "6f0d3c1e9a8b7c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d"
+            }
+          ]
+        },
+        "source": "https://github.com/ossf/malicious-packages/blob/main/osv/malicious/pypi/example-typosquat/MAL-2026-40017.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "EVIDENCE",
+      "url": "https://reports.example.org/example-typosquat/1.0.0"
+    }
+  ],
+  "database_specific": {
+    "iocs": {
+      "domains": ["payload.example.net"],
+      "urls": ["http://payload.example.net:8080/stage2.exe"]
+    },
+    "malicious-packages-origins": [
+      {
+        "id": "pypi/2026-08-example/example-typosquat",
+        "import_time": "2026-08-12T10:01:15.120448871Z",
+        "modified_time": "2026-08-12T09:14:27.554013Z",
+        "sha256": "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
+        "source": "example-scanner",
+        "versions": ["0.0.1", "0.0.2", "1.0.0"]
+      }
+    ]
+  },
+  "credits": [
+    {
+      "name": "Example Scanner",
+      "contact": ["research@scanner.example.com", "https://scanner.example.com"],
+      "type": "FINDER"
+    }
+  ]
+}

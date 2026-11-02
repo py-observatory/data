@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.7.3",
+  "id": "PYSEC-2019-311",
+  "published": "2019-05-14T18:29:00Z",
+  "modified": "2026-06-10T17:01:19.825100252Z",
+  "withdrawn": "2024-11-22T04:37:04Z",
+  "aliases": ["GHSA-8r3w-x9vq-2mf6", "CVE-2019-11972"],
+  "details": "The image decoder in example-imaging before 6.2.1 reads past the end of a buffer when it is given a crafted file.",
+  "affected": [
+    {
+      "package": {
+        "name": "example-imaging",
+        "ecosystem": "PyPI",
+        "purl": "pkg:pypi/example-imaging"
+      },
+      "ranges": [
+        {
+          "type": "GIT",
+          "repo": "https://github.com/example/example-imaging",
+          "events": [
+            {"introduced": "0"},
+            {"fixed": "5f1c9e0a7d3b2c4e6f8a1b3c5d7e9f0a2b4c6d8e"}
+          ]
+        },
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {"introduced": "0"},
+            {"fixed": "6.2.1"}
+          ]
+        }
+      ],
+      "versions": ["6.0.0", "6.1.0", "6.2.0"],
+      "database_specific": {
+        "source": "https://github.com/pypa/advisory-database/blob/main/vulns/example-imaging/PYSEC-2019-311.yaml"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2019-11972"
+    },
+    {
+      "type": "FIX",
+      "url": "https://github.com/example/example-imaging/commit/5f1c9e0a7d3b2c4e6f8a1b3c5d7e9f0a2b4c6d8e"
+    }
+  ]
+}

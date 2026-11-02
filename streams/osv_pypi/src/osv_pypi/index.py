@@ -12,12 +12,12 @@ other shape raises ValueError, because a guess at a bad line would be stored as 
 """
 
 import re
-import reprlib
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote
 
 from obskit.http import Http
+from obskit.show import show
 
 BASE = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/"
 INDEX_URL = BASE + "modified_id.csv"  # every advisory, with the time it last changed
@@ -46,17 +46,6 @@ _TO_THE_SECOND = 19
 # which `int` cannot read, and `int` itself reads digits of other scripts, signs,
 # blanks and underscores.
 _DIGITS = re.compile(r"[0-9]+")
-
-# How much of a bad value an error message shows. The index and its headers come from
-# outside, and an error goes to a log and to an issue.
-_SHOWN = 60
-_REPR = reprlib.Repr(maxstring=_SHOWN)
-
-
-def _show(text: str) -> str:
-    """`text` as an error message shows it: quoted, and cut to _SHOWN characters with
-    its two ends kept, so that a long value cannot make a long message."""
-    return _REPR.repr(text)
 
 
 def record_url(advisory_id: str) -> str:
@@ -89,7 +78,7 @@ def instant_key(text: str) -> str:
     found = _INSTANT.fullmatch(text)
     if found is None:
         raise ValueError(
-            f"{_show(text)} is not an RFC 3339 UTC time like 2022-03-21T20:04:49.5Z"
+            f"{show(text)} is not an RFC 3339 UTC time like 2022-03-21T20:04:49.5Z"
         )
     *fields, fraction = found.groups()
     try:
@@ -97,7 +86,7 @@ def instant_key(text: str) -> str:
         # February 30, an hour 24 and a second 60.
         datetime(*map(int, fields))
     except ValueError as exc:
-        raise ValueError(f"{_show(text)} is not a time that exists: {exc}") from exc
+        raise ValueError(f"{show(text)} is not a time that exists: {exc}") from exc
     return f"{text[:_TO_THE_SECOND]}.{(fraction or '').ljust(9, '0')}Z"
 
 
@@ -124,11 +113,11 @@ def _read_line(number: int, line: str) -> tuple[str, str]:
     if not comma or "," in advisory_id:
         raise ValueError(
             f"line {number} of the index must be a time, a comma and an id, "
-            f"not {_show(line)}"
+            f"not {show(line)}"
         )
     if not is_advisory_id(advisory_id):
         raise ValueError(
-            f"line {number} of the index has {_show(advisory_id)}, "
+            f"line {number} of the index has {show(advisory_id)}, "
             "which is not an advisory id"
         )
     try:
@@ -198,6 +187,6 @@ def get_index(http: Http) -> Index:
     if not _DIGITS.fullmatch(generation):
         raise ValueError(
             f"the x-goog-generation of the reply to GET {INDEX_URL} must be all "
-            f"digits, not {_show(generation)}"
+            f"digits, not {show(generation)}"
         )
     return parse_index(reply.body, int(generation))
