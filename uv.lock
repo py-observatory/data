@@ -4,9 +4,29 @@ requires-python = ">=3.14"
 
 [manifest]
 members = [
+    "catalog",
     "obskit",
     "osv-pypi",
     "pypi-registry",
+]
+
+[[package]]
+name = "catalog"
+version = "0.1.0"
+source = { editable = "catalog" }
+dependencies = [
+    { name = "obskit" },
+    { name = "osv-pypi" },
+    { name = "packaging" },
+    { name = "pypi-registry" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "obskit", editable = "." },
+    { name = "osv-pypi", editable = "streams/osv_pypi" },
+    { name = "packaging", specifier = ">=25" },
+    { name = "pypi-registry", editable = "streams/pypi_registry" },
 ]
 
 [[package]]

@@ -12,8 +12,8 @@ build-backend = "uv_build"
 dev = ["pytest>=8.4"]
 
 [tool.uv.workspace]
-members = ["streams/pypi_registry", "streams/osv_pypi"]
+members = ["streams/pypi_registry", "streams/osv_pypi", "catalog"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "streams"]
+testpaths = ["tests", "streams", "catalog"]
 addopts = "-q"

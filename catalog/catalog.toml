@@ -1,0 +1,16 @@
+# What the catalog reads. Each stream here is read from its `<stream>-current` release,
+# and only the tables listed for it are read. Each listed table has a test of what the
+# catalog makes of it, in tests/test_catalog_admission.py.
+
+[build]
+min_gap_minutes = 50  # a build waits this long after the last one
+max_gap_hours = 24    # and one is made anyway once the last is this old
+pin_wait_hours = 24   # a day's pin waits this long after the day for a stream to seal it
+
+[streams.pypi-registry]
+tables = ["projects", "versions_seen", "files_current", "files", "release_records", "events"]
+stale_after_hours = 30
+
+[streams.osv-pypi]
+tables = ["advisories"]
+stale_after_hours = 72
