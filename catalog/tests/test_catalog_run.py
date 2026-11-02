@@ -72,17 +72,29 @@ def main_at(
 
 
 def registry(
-    gh: GitHub, day: str, *names: str, sealed: tuple[str, ...] = ()
+    gh: GitHub,
+    day: str,
+    *names: str,
+    sealed: tuple[str, ...] = (),
+    created: tuple[str, ...] = (),
 ) -> Manifest:
     """Publish the registry as its run on `day` leaves it, with a project of each of
-    `names` that has a release 1.0, with its file and its record, and an empty sealed
-    delta of each day of `sealed`."""
+    `names` that has a release 1.0, with its file and its record, an empty sealed delta
+    of each day of `sealed`, and an event in the open delta for the creation of each
+    project of `created`."""
     state: dict[str, list[dict]] = {
         "projects": [],
         "versions_seen": [],
         "files_current": [],
     }
-    delta: dict[str, list[dict]] = {"files": [], "release_records": []}
+    delta: dict[str, list[dict]] = {
+        "files": [],
+        "release_records": [],
+        "events": [
+            {"name": name, "incarnation": 1, "kind": "created", "observed_at": UPLOADED}
+            for name in created
+        ],
+    }
     for name in names:
         file = f"{name}-1.0.tar.gz"
         state["projects"].append({"name": name})
@@ -217,7 +229,11 @@ def test_bootstrap_publishes_catalog_current_as_the_latest_release(gh, fake, tmp
         "public",
         False,
     )
-    assert {info.history_class for info in asset.tables.values()} == {"derived"}
+    # A build's projects and events are the registry's, which never shrink, so the
+    # gates hold them to the last build's rows. Every other table is made afresh.
+    classes = {table: info.history_class for table, info in asset.tables.items()}
+    assert (classes.pop("project"), classes.pop("event")) == ("append", "events")
+    assert set(classes.values()) == {"derived"}
     assert (manifest.complete, manifest.cursor) == (True, None)
     assert manifest.coverage == {
         "first_build": "2026-11-02",
@@ -666,6 +682,35 @@ def test_older_inputs_need_an_override(gh, fake, tmp_path):
         built=True, reason="heartbeat"
     )
     assert published(fake).overrides == [override]
+
+
+def test_a_build_that_lost_registry_events_needs_an_override(gh, fake, tmp_path):
+    registry(gh, FIRST, "foo", "bar", created=("foo", "bar"))
+    osv(gh, FIRST, "PYSEC-1")
+    run(gh, tmp_path, T0, bootstrap=True)
+    # The registry is published again from an earlier state, which had seen only the
+    # first of the two events.
+    registry(gh, FIRST, "foo", "bar", created=("foo",))
+    fake.calls.clear()
+
+    with pytest.raises(GateError, match="event"):
+        run(gh, tmp_path, T0 + HOUR)
+
+    assert writes(fake) == []
+    assert published(fake).generated_at == instant(T0)
+
+    assert run(gh, tmp_path, T0 + HOUR, override_reason="checked") == report(
+        built=True, reason="inputs changed"
+    )
+
+    manifest = published(fake)
+    (override,) = manifest.overrides
+    assert (override["at"], override["reason"]) == (instant(T0 + HOUR), "checked")
+    (failure,) = override["failures"]
+    assert failure["rule"] == "rows"
+    assert "the events table event" in failure["detail"]
+    db = serving_db(fake, tmp_path)
+    assert select(db, "SELECT name FROM event") == [("foo",)]
 
 
 def test_main_prints_the_report_and_returns_its_code(

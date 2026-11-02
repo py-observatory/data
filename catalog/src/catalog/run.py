@@ -25,8 +25,9 @@ stages each stream that was read, carries each stream that could not be read or 
 from the last build's database, and builds the serving database. Its manifest says
 which streams were carried and which are stale, and the data is complete only when none
 is. The kit's gates check the manifest against the last one, so a build from older
-inputs than the last build's waits for a person's reason. Then it is swapped into
-`catalog-current`, which is the only release that GitHub shows as Latest.
+inputs than the last build's waits for a person's reason, and so does one with fewer
+projects or events than the last build. Then it is swapped into `catalog-current`,
+which is the only release that GitHub shows as Latest.
 
 Every run writes the daily pins that are due and ready (see `pins`). They depend on the
 streams' manifests alone, so a build writes them before it publishes, and its manifest
@@ -101,6 +102,13 @@ _STAGE_ERRORS = (
     sqlite3.Error,
     OSError,
 )
+
+# The history class of each serving table that the kit's gates hold to the last build's
+# rows. The registry's projects are an append table and its events an events table, so
+# neither ever shrinks: a build with fewer of either than the last build has read a
+# stream that went back, and waits for a person's reason. Every other table, the search
+# index's included, is derived: each build makes it afresh, and it may shrink.
+_HISTORY_CLASSES = {"project": "append", "event": "events"}
 
 
 @dataclass(frozen=True)
@@ -357,10 +365,12 @@ def _previous_build(gh: GitHub, prior: Manifest, workdir: Path) -> Path:
 
 
 def _pack(db: Path, workdir: Path) -> tuple[Path, Asset, bool]:
-    """Compress the serving database `db` into `workdir` for `catalog-current`, every
-    table of it derived, since each build makes it afresh. Returns the file, its entry
+    """Compress the serving database `db` into `workdir` for `catalog-current`, with the
+    history class of each table (see `_HISTORY_CLASSES`). Returns the file, its entry
     and whether it is over the budget, which warns."""
-    classes = {table: "derived" for table in table_counts(db)}
+    classes = {
+        table: _HISTORY_CLASSES.get(table, "derived") for table in table_counts(db)
+    }
     packed, entry = prepare_asset(
         db, workdir, tag=current_tag(CATALOG), role="public", classes=classes
     )
