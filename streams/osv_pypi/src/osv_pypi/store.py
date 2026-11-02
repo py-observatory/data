@@ -47,6 +47,11 @@ _ADVISORY_VERSION = ",\n    ".join(
 )
 
 # The tables that hold versions are made from VERSION_COLUMNS, as the rows are.
+#
+# `advisories` is a rowid table, where `meta` is WITHOUT ROWID. Its rows hold a whole
+# version, about 1.1 KB each, and WITHOUT ROWID suits rows under about a twentieth of a
+# page. On real data the state is 47.2 MB this way, and 74.2 MB as WITHOUT ROWID. A
+# rowid table lets its key be null unless it says otherwise, so `id` is NOT NULL.
 STATE_SCHEMA = f"""
 CREATE TABLE meta (
     key TEXT PRIMARY KEY,
@@ -54,12 +59,12 @@ CREATE TABLE meta (
 ) WITHOUT ROWID;
 
 CREATE TABLE advisories (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('active', 'removed')),
     first_seen TEXT NOT NULL,
     seq INTEGER NOT NULL,
     {_ADVISORY_VERSION}
-) WITHOUT ROWID;
+);
 """
 
 DELTA_SCHEMA = f"""

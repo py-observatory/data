@@ -183,6 +183,26 @@ def test_the_tables_are_those_of_stream_toml_and_hold_the_version_columns():
                 scratch.execute(statement)
 
 
+def test_advisories_is_a_rowid_table_whose_id_is_never_null():
+    # An advisory's row holds its whole last version, about 1.1 KB, and WITHOUT ROWID
+    # suits rows under about a twentieth of a page. A rowid table lets a key be null
+    # unless it says NOT NULL.
+    with closing(sqlite3.connect(":memory:")) as scratch:
+        scratch.executescript(STATE_SCHEMA)
+        without_rowid = {
+            name: bool(flag)
+            for schema, name, kind, _, flag, _ in scratch.execute("PRAGMA table_list")
+            if schema == "main" and kind == "table" and not name.startswith("sqlite_")
+        }
+        assert without_rowid == {"meta": True, "advisories": False}
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL.*advisories.id"):
+            scratch.execute(
+                "INSERT INTO advisories (id, status, first_seen, seq, kind, modified, "
+                "modified_key, affected) VALUES (NULL, 'active', 't', 1, 'malware', "
+                "'t', 't', '[]')"
+            )
+
+
 # ---- versions
 
 
