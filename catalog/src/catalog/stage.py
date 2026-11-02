@@ -146,7 +146,7 @@ def stage_registry(gh: GitHub, assets: list[Asset], workdir: Path) -> RegistrySt
     open_db(state, registry_store.STATE_SCHEMA).close()
     stage = workdir / _STAGE_DB
     with closing(open_db(stage, STAGE_SCHEMA, create=True)) as con:
-        con.execute("ATTACH DATABASE ? AS state", (_read_only(state),))
+        attach_read_only(con, state, "state")
         for part in parts:
             _stage_part(gh, con, part, workdir)
         con.execute("DETACH DATABASE state")
@@ -161,7 +161,7 @@ def _stage_part(
     stage that `con` is open on, with the state attached as `state`, and delete it."""
     [part] = fetch_assets(gh, [asset], workdir)
     open_db(part, registry_store.DELTA_SCHEMA).close()
-    con.execute("ATTACH DATABASE ? AS part", (_read_only(part),))
+    attach_read_only(con, part, "part")
     con.execute(_SUM_FILES)
     for table in _COPIED:
         _copy(con, table)
@@ -183,9 +183,12 @@ def _copy(con: sqlite3.Connection, table: str) -> None:
     )
 
 
-def _read_only(db: Path) -> str:
-    """A URI that attaches `db` read-only, so that reading it cannot write to it."""
-    return f"{db.resolve(strict=True).as_uri()}?mode=ro"
+def attach_read_only(con: sqlite3.Connection, path: Path, alias: str) -> None:
+    """Attach the database at `path` to `con` as `alias`, read-only, so that reading it
+    cannot write to it. `con` must open URIs, as the one that `open_db` gives does, and
+    `alias` is written into the statement as it is, so it must be a plain name."""
+    uri = f"{path.resolve(strict=True).as_uri()}?mode=ro"
+    con.execute(f"ATTACH DATABASE ? AS {alias}", (uri,))
 
 
 def _log_free_disk(workdir: Path, when: str) -> None:

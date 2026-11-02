@@ -17,9 +17,8 @@ import sqlite3
 from collections.abc import Iterable
 from itertools import groupby
 from operator import itemgetter
-from pathlib import Path
 
-from catalog.stage import RegistryStage
+from catalog.stage import RegistryStage, attach_read_only
 from packaging.version import Version
 
 # The kinds of event that set a project's status: it is created, removed, quarantined or
@@ -201,8 +200,8 @@ def build_registry(con: sqlite3.Connection, stage: RegistryStage) -> None:
     attached, and what was written uncommitted, for the caller to close the connection
     on and discard the database.
     """
-    _attach_read_only(con, stage.state, "state")
-    _attach_read_only(con, stage.stage, "stage")
+    attach_read_only(con, stage.state, "state")
+    attach_read_only(con, stage.stage, "stage")
     con.execute(_INSERT_PROJECTS)
     con.execute(_INSERT_RELEASES)
     con.execute(_SET_RELEASE_TOTALS)
@@ -230,10 +229,3 @@ def _set_latest_versions(con: sqlite3.Connection) -> None:
         for project_id, releases in groupby(offered, key=itemgetter(0))
     )
     con.executemany(_SET_LATEST_VERSION, latest)
-
-
-def _attach_read_only(con: sqlite3.Connection, db: Path, alias: str) -> None:
-    """Attach `db` to `con` as `alias`, read-only, so that reading it cannot write to
-    it."""
-    uri = f"{db.resolve(strict=True).as_uri()}?mode=ro"
-    con.execute(f"ATTACH DATABASE ? AS {alias}", (uri,))
