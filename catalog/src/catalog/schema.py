@@ -93,7 +93,10 @@ CREATE TABLE change (
     PRIMARY KEY (project_id, version, field)
 ) WITHOUT ROWID;
 
--- The requirements of each project's record_version, with the text interned.
+-- The requirements of each project's record_version, with the text interned. A
+-- requirement whose marker names an extra, such as `pytest; extra == 'test'`, is
+-- optional: it is installed only with that extra, so a count of the projects that depend
+-- on another can leave out test and documentation extras.
 CREATE TABLE requirement_text (
     requirement_id INTEGER PRIMARY KEY,
     text TEXT NOT NULL UNIQUE
@@ -102,6 +105,7 @@ CREATE TABLE requirement (
     project_id INTEGER NOT NULL,
     requirement_id INTEGER NOT NULL,
     depends_on TEXT NOT NULL,          -- PEP 503 name of the project required
+    optional INTEGER NOT NULL,         -- 1 when the marker names an extra
     PRIMARY KEY (project_id, requirement_id)
 ) WITHOUT ROWID;
 CREATE INDEX requirement_by_dependency ON requirement (depends_on, project_id);

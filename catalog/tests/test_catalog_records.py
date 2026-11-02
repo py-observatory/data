@@ -359,6 +359,27 @@ def test_requirements_name_the_projects_they_depend_on(gh, tmp_path):
     assert found == [(1,), (2,)]
 
 
+def test_a_requirement_of_an_extra_is_optional(gh, tmp_path):
+    db, _ = build(
+        gh,
+        tmp_path,
+        [project("foo", "1.0")],
+        [
+            record(
+                "foo",
+                "1.0",
+                "2020-01-01T00:00:00Z",
+                requires_dist=json.dumps(["pytest; extra == 'test'", "requests>=2"]),
+            )
+        ],
+    )
+
+    # pytest is needed only by those who install foo[test], and requests by everyone.
+    assert select(
+        db, "SELECT depends_on, optional FROM requirement ORDER BY depends_on"
+    ) == [("pytest", 1), ("requests", 0)]
+
+
 def test_requirements_come_from_the_record_version_only(gh, tmp_path):
     db, _ = build(
         gh,

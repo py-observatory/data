@@ -96,8 +96,8 @@ VALUES (?, ?, ?, ?, ?)
 _INTERN_REQUIREMENT = "INSERT OR IGNORE INTO main.requirement_text (text) VALUES (?)"
 _REQUIREMENT_ID = "SELECT requirement_id FROM main.requirement_text WHERE text = ?"
 _INSERT_REQUIREMENT = """
-INSERT OR IGNORE INTO main.requirement (project_id, requirement_id, depends_on)
-VALUES (?, ?, ?)
+INSERT OR IGNORE INTO main.requirement (project_id, requirement_id, depends_on, optional)
+VALUES (?, ?, ?, ?)
 """
 
 _INTERN_CLASSIFIER = (
@@ -259,19 +259,24 @@ def _write_requirements(
     con: sqlite3.Connection, project_id: int, name: str, requires_dist: str | None
 ) -> int:
     """Intern the requirements in the JSON list `requires_dist` and link them to the
-    project. Return the number that PEP 508 refused."""
+    project, each marked optional when its marker names an extra. Return the number
+    that PEP 508 refused."""
     refused = 0
     for text in _json_list(requires_dist):
         try:
-            depends_on = canonical_name(Requirement(text).name)
+            requirement = Requirement(text)
         except InvalidRequirement:
             refused += 1
             continue
+        depends_on = canonical_name(requirement.name)
         if depends_on == name:
             continue
+        optional = requirement.marker is not None and "extra" in str(requirement.marker)
         con.execute(_INTERN_REQUIREMENT, (text,))
         (requirement_id,) = con.execute(_REQUIREMENT_ID, (text,)).fetchone()
-        con.execute(_INSERT_REQUIREMENT, (project_id, requirement_id, depends_on))
+        con.execute(
+            _INSERT_REQUIREMENT, (project_id, requirement_id, depends_on, int(optional))
+        )
     return refused
 
 
