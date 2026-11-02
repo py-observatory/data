@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 [manifest]
 members = [
     "obskit",
+    "osv-pypi",
     "pypi-registry",
 ]
 
@@ -40,6 +41,17 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.4" }]
+
+[[package]]
+name = "osv-pypi"
+version = "0.1.0"
+source = { editable = "streams/osv_pypi" }
+dependencies = [
+    { name = "obskit" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "obskit", editable = "." }]
 
 [[package]]
 name = "packaging"

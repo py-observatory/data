@@ -1,0 +1,30 @@
+id = "osv-pypi"
+description = "Every OSV advisory that affects a PyPI project, read from OSV.dev's public data dumps."
+
+[[upstreams]]
+name = "OSV.dev data dumps"
+url = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/"
+licence = "NOASSERTION"
+terms = "https://google.github.io/osv.dev/data/"
+
+[[upstreams]]
+name = "GitHub Advisory Database (GHSA-*)"
+url = "https://github.com/github/advisory-database"
+licence = "CC-BY-4.0"
+
+[[upstreams]]
+name = "PyPA Advisory Database (PYSEC-*)"
+url = "https://github.com/pypa/advisory-database"
+licence = "CC-BY-4.0"
+
+[[upstreams]]
+name = "OpenSSF Malicious Packages (MAL-*)"
+url = "https://github.com/ossf/malicious-packages"
+licence = "Apache-2.0"
+
+[tables]
+meta = "snapshot"
+advisories = "snapshot"
+versions = "append"
+events = "events"
+cursors = "append"
