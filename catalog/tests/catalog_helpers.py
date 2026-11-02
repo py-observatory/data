@@ -187,16 +187,20 @@ def publish_osv(
     advisories: Sequence[Mapping[str, object]],
     open_day: str,
     generated_at: str | None = None,
+    sealed: Mapping[str, Rows] | None = None,
+    parts: Mapping[str, Rows] | None = None,
 ) -> Manifest:
     """Publish osv-pypi as its run on `open_day`, given as YYYY-MM-DD, leaves it, and
     return the live manifest.
 
     `advisories` are the rows of the state's advisories table. The open delta is empty,
-    because the catalog reads only the state of osv. The manifest is made as
-    `publish_registry`'s is, but the data reaches the start of `open_day`, as an
-    instant (see `_osv_data_through`). `generated_at`, when given, is the time that the
-    manifest says the publish was made, in place of the start of `open_day`, for a test
-    of a stream whose publish is older than its last.
+    because the catalog reads only the state of osv. `sealed` and `parts` give the rows
+    of sealed deltas and of month parts, as `publish_registry`'s do, for a test of what
+    a daily pin names, which is every sealed delta of its month whatever the catalog
+    reads. The manifest is made as `publish_registry`'s is, but the data reaches the
+    start of `open_day`, as an instant (see `_osv_data_through`). `generated_at`, when
+    given, is the time that the manifest says the publish was made, in place of the
+    start of `open_day`, for a test of a stream whose publish is older than its last.
     """
     return _publish(
         gh,
@@ -204,8 +208,8 @@ def publish_osv(
         {"advisories": advisories},
         open_day,
         {},
-        {},
-        {},
+        sealed or {},
+        parts or {},
         generated_at=generated_at,
     )
 

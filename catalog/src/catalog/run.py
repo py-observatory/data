@@ -11,16 +11,27 @@ A stream's freshness is judged by how long its `data_through` has stood still. T
 catalog keeps, in its coverage, when it first saw each stream's value, and a stream
 whose value is older than its `stale_after_hours` is stale.
 
-A run builds on a bootstrap. It builds when the assets that it reads of a stream have
-changed since the last build, or a stream that the last build carried can be read
-again, once `min_gap_minutes` have passed since that build, and it builds anyway once
-the last build is `max_gap_hours` old. Every other run builds
-nothing. A build stages each stream that was read, carries each stream that could not
-be read or staged from the last build's database, and builds the serving database. Its
-manifest says which streams were carried and which are stale, and the data is complete
-only when none is. The kit's gates check the manifest against the last one, so a build
-from older inputs than the last build's waits for a person's reason. Then it is swapped
-into `catalog-current`, which is the only release that GitHub shows as Latest.
+The first run of a month copies the last build of the month before into
+`catalog-month-YYYY-MM` before anything else is written (see `pins.copy_month`), and a
+failed copy stops the run.
+
+A run builds on a bootstrap, and when it is the first run of a month. It builds when
+the assets that it reads of a stream have changed since the last build, or when the
+last build's manifest no longer says how a stream stands: a stream that it carried can
+be read again, one that it read cannot, or one has turned stale or fresh. That waits
+until `min_gap_minutes` have passed since the last build, and a build is made anyway
+once the last build is `max_gap_hours` old. Every other run builds nothing. A build
+stages each stream that was read, carries each stream that could not be read or staged
+from the last build's database, and builds the serving database. Its manifest says
+which streams were carried and which are stale, and the data is complete only when none
+is. The kit's gates check the manifest against the last one, so a build from older
+inputs than the last build's waits for a person's reason. Then it is swapped into
+`catalog-current`, which is the only release that GitHub shows as Latest.
+
+Every run writes the daily pins that are due and ready (see `pins`). They depend on the
+streams' manifests alone, so a build writes them before it publishes, and its manifest
+records the last of them. A run that builds nothing writes them too, and the next build
+records them.
 
 A first build needs every stream, so on a bootstrap a stream that cannot be read or
 staged stops the run. `main` exits 2, after the publish, when a stream was carried,
@@ -29,11 +40,12 @@ stale or unreadable, so that the workflow opens its failure issue.
 
 import argparse
 import json
+import os
 import shutil
 import sqlite3
 import warnings
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from obskit.cycle import gate
@@ -52,6 +64,15 @@ from obskit.tags import current_tag
 
 from catalog.config import Config, StreamAdmission, load_config
 from catalog.inputs import StreamRead, read_stream
+from catalog.pins import (
+    copy_month,
+    due_days,
+    pin_document,
+    pin_ready,
+    pin_tag,
+    serving_asset,
+    write_pin,
+)
 from catalog.schema import CATALOG, SERVING_DB
 from catalog.serving import (
     BUDGET_BYTES,
@@ -63,7 +84,7 @@ from catalog.serving import (
 from catalog.stage import STAGERS, OsvStage, RegistryStage
 
 # The reasons for which a run builds. Every other reason builds nothing.
-_BUILDS = frozenset({"bootstrap", "inputs changed", "heartbeat"})
+_BUILDS = frozenset({"bootstrap", "month began", "inputs changed", "heartbeat"})
 
 # What makes a stream that was read fail to stage, and so be carried: a release that
 # does not hold what its manifest lists, a failed download, a database that is not of
@@ -77,12 +98,13 @@ class RunReport:
     """What a run did.
 
     `built` says whether it built and published, and `reason` why or why not:
-    bootstrap, inputs changed, heartbeat, too soon (an input changed, and the last
-    build is less than min_gap_minutes old) or unchanged. `carried` names the streams
-    whose tables the build took from the last build, `stale` those whose data_through
-    has stood still for too long, and `unreadable` those whose release could not be
-    read, each in the order of catalog.toml. `pins` and `month_copy` name the daily
-    pins and the month's copy that the run wrote, which it does not write yet.
+    bootstrap, month began (the first run of a month), inputs changed, heartbeat, too
+    soon (an input changed, and the last build is less than min_gap_minutes old) or
+    unchanged. `carried` names the streams whose tables the build took from the last
+    build, `stale` those whose data_through has stood still for too long, and
+    `unreadable` those whose release could not be read, each in the order of
+    catalog.toml. `pins` names the releases of the daily pins that the run wrote, in
+    day order, and `month_copy` the release of the month's copy that it made, or None.
     `unparsed_requirements` counts the requirements in the registry's records that PEP
     508 refused.
     """
@@ -183,39 +205,51 @@ def _stale(streams: dict[str, dict]) -> list[str]:
     return [stream for stream, coverage in streams.items() if coverage["stale"]]
 
 
-def _changed(read: StreamRead, last: dict[str, dict]) -> bool:
-    """Whether the stream was read, and the last build does not hold it as it is now:
-    the last build lacks it, carried it, or read other assets of it.
+def _changed(read: StreamRead, known: dict, last: dict[str, dict]) -> bool:
+    """Whether the last build does not hold the stream as the run finds it, which
+    `known`, its coverage, gives: the last build lacks it, carried it and it can be read
+    now, read it and it cannot be read now, judged it stale or fresh otherwise, or read
+    other assets of it.
 
     A stream that the last build carried has changed even when its fingerprint is the
     one recorded, which is that of its last good input. The tables would be the same,
     but the last build's manifest says that the stream could not be read, and would go
-    on saying so after the stream recovered.
+    on saying so after the stream recovered. In the same way, a stream that cannot be
+    read, or has turned stale, changes what the manifest says of it, though no asset
+    that the build reads has changed.
     """
-    if read.error is not None:
-        return False
     before = last.get(read.stream)
-    if before is None or before["carried"]:
+    if before is None:
         return True
-    return before["fingerprint"] != read.fingerprint
+    unreadable = read.error is not None
+    if before["carried"] != unreadable or before["stale"] != known["stale"]:
+        return True
+    return not unreadable and before["fingerprint"] != read.fingerprint
 
 
 def _decide(
     prior: Manifest | None,
     reads: dict[str, StreamRead],
+    known: dict[str, dict],
     now: datetime,
     config: Config,
+    *,
+    month_began: bool,
 ) -> str:
-    """Why the run builds, or why it does not, judged in this order: a bootstrap; an
-    input that changed (see `_changed`), once min_gap_minutes have passed since the last
-    build, and "too soon" before that; a last build that is max_gap_hours old (the
-    heartbeat); and otherwise "unchanged". The catalog publishes only when it builds, so
-    the last publish is the last build."""
+    """Why the run builds, or why it does not, judged in this order: a bootstrap; the
+    first run of a month, which `month_began` says, as it has made the month's copy;
+    an input that changed (see `_changed`), once min_gap_minutes have passed since the
+    last build, and "too soon" before that; a last build that is max_gap_hours old (the
+    heartbeat); and otherwise "unchanged". `known` is the coverage of each stream as
+    the run finds it. The catalog publishes only when it builds, so the last publish is
+    the last build."""
     if prior is None:
         return "bootstrap"
+    if month_began:
+        return "month began"
     since_build = now - _time(prior.generated_at)
     last = prior.coverage["streams"]
-    if any(_changed(read, last) for read in reads.values()):
+    if any(_changed(read, known[stream], last) for stream, read in reads.items()):
         if since_build >= timedelta(minutes=config.min_gap_minutes):
             return "inputs changed"
         return "too soon"
@@ -303,26 +337,12 @@ def _input(
     )
 
 
-def _serving_asset(prior: Manifest) -> Asset:
-    """The serving database that the last build put in `catalog-current`. Raises
-    PriorStateError when the last manifest lists none."""
-    tag = current_tag(CATALOG)
-    name = f"{SERVING_DB}.zst"
-    for asset in prior.assets:
-        if asset.tag == tag and asset.name == name:
-            return asset
-    raise PriorStateError(
-        f"the catalog's last manifest lists no {name} in {tag}, so there is no build "
-        "to carry a stream from"
-    )
-
-
 def _previous_build(gh: GitHub, prior: Manifest, workdir: Path) -> Path:
     """Download the last build's serving database into `workdir/previous`, for the
     streams that are carried from it, and return the database."""
     directory = workdir / "previous"
     directory.mkdir()
-    [previous] = fetch_assets(gh, [_serving_asset(prior)], directory)
+    [previous] = fetch_assets(gh, [serving_asset(prior)], directory)
     return previous
 
 
@@ -342,6 +362,55 @@ def _pack(db: Path, workdir: Path) -> tuple[Path, Asset, bool]:
             stacklevel=3,
         )
     return packed, entry, over
+
+
+def _copy_month(
+    gh: GitHub, prior: Manifest | None, workdir: Path, now: datetime
+) -> list[Asset]:
+    """Make the month's copy when a month has begun since the last build (see
+    `copy_month`), in `workdir/month`, so that its download never meets the new
+    build's database in `workdir`. Returns its entries, or [] when there is none to
+    make, as on a bootstrap, which has no last build."""
+    if prior is None:
+        return []
+    directory = workdir / "month"
+    directory.mkdir()
+    return copy_month(gh, prior, directory, now)
+
+
+def _write_pins(
+    gh: GitHub,
+    workdir: Path,
+    reads: dict[str, StreamRead],
+    now: datetime,
+    config: Config,
+    first_build: str,
+    last_pin: str | None,
+) -> tuple[list[str], str | None]:
+    """Write the pins that are due (see `due_days`), in day order, from `workdir`, and
+    stop at the first day whose pin is not ready (see `pin_ready`). Each pin gives the
+    commit that the run's code is at, which a workflow sets as GITHUB_SHA, and none
+    outside one.
+
+    Returns the releases of the pins written and the last day written or found, which
+    is `last_pin` when there is none. Days are YYYY-MM-DD, as the coverage gives them.
+    A pin that its release holds already is left alone (see `write_pin`), and its day
+    still counts as the last pin found, so the build after a run that wrote pins and
+    built nothing records them.
+    """
+    listed = list(reads.values())
+    commit = os.environ.get("GITHUB_SHA", "")
+    found = None if last_pin is None else date.fromisoformat(last_pin)
+    today = now.astimezone(UTC).date()
+    written = []
+    for day in due_days(date.fromisoformat(first_build), found, today):
+        if not pin_ready(day, listed, now, config.pin_wait_hours):
+            break
+        document = pin_document(day, listed, config, gh.repo, commit)
+        if write_pin(gh, day, document, workdir):
+            written.append(pin_tag(day))
+        found = day
+    return written, None if found is None else found.isoformat()
 
 
 def _licences(inputs: list[StreamInput]) -> list[dict]:
@@ -368,23 +437,28 @@ def run_once(
     streams that `config` admits.
 
     It reads the catalog's last publish (`fetch_prior`), which only `bootstrap` may find
-    missing, and each stream's manifest, and judges each stream's freshness. Then it
-    decides whether to build (see `_decide`), and a run that does not build returns
-    there, having changed nothing.
+    missing, and each stream's manifest, and judges each stream's freshness. When a
+    month has begun since the last build, it copies that build into the month's
+    release (see `copy_month`). Then it decides whether to build (see `_decide`), and
+    a run that does not build writes the daily pins that are due (see `_write_pins`)
+    and returns there.
 
     A build stages each stream that was read, and carries each one that could not be
     read or staged from the last build's serving database, which it downloads for
     them. It builds the serving database, which has one input for each admitted
-    stream, carried or not, and compresses it. Its manifest says how far the oldest
-    input reaches, and says of each stream whether it was carried and whether it is
-    stale. Without `bootstrap`, the manifest is checked against the last one with the
-    kit's gates, which raise GateError, before anything is published, unless
-    `override_reason` gives a person's reason. Then the database and the manifest are
-    swapped into `catalog-current`, which a bootstrap creates as the Latest release.
+    stream, carried or not, and compresses it. It writes the daily pins that are due.
+    Its manifest says how far the oldest input reaches, says of each stream whether it
+    was carried and whether it is stale, records the last pin, and lists the month's
+    copy beside the last build's closed assets. Without `bootstrap`, the manifest is
+    checked against the last one with the kit's gates, which raise GateError, before
+    anything is published, unless `override_reason` gives a person's reason. Then the
+    database and the manifest are swapped into `catalog-current`, which a bootstrap
+    creates as the Latest release.
 
     On a bootstrap, a stream that cannot be read raises CarryError, and one that cannot
     be staged raises its error, because a first build needs every stream. Every other
-    error propagates, and a run that fails publishes nothing.
+    error propagates, a failed month's copy included, and a run that fails publishes
+    nothing.
     """
     moment = instant(now)
     prior_dir = workdir / "prior"
@@ -393,16 +467,23 @@ def run_once(
     last = prior.coverage["streams"] if prior else {}
     reads = _read_streams(gh, config, workdir)
     seen = {stream: _seen(read, last, now) for stream, read in reads.items()}
+    known = _judged(seen, config, now)
     unreadable = [stream for stream, read in reads.items() if read.error is not None]
-    reason = _decide(prior, reads, now, config)
+    month_copy = _copy_month(gh, prior, workdir, now)
+    reason = _decide(prior, reads, known, now, config, month_began=bool(month_copy))
+    first_build = (
+        prior.coverage["first_build"] if prior else f"{now.astimezone(UTC):%Y-%m-%d}"
+    )
+    last_pin = prior.coverage["last_pin"] if prior else None
     if reason not in _BUILDS:
+        pins, _ = _write_pins(gh, workdir, reads, now, config, first_build, last_pin)
         return RunReport(
             built=False,
             reason=reason,
             carried=[],
-            stale=_stale(_judged(seen, config, now)),
+            stale=_stale(known),
             unreadable=unreadable,
-            pins=[],
+            pins=pins,
             month_copy=None,
             unparsed_requirements=0,
         )
@@ -413,12 +494,13 @@ def run_once(
     db = workdir / SERVING_DB
     built = build_serving(db, inputs, previous)
     packed, entry, over = _pack(db, workdir)
+    # The pins are written before the manifest is made, so that it records them.
+    pins, last_pin = _write_pins(gh, workdir, reads, now, config, first_build, last_pin)
     streams = _judged(seen, config, now)
     stale = _stale(streams)
     closed = [asset for asset in prior.assets if asset.closed] if prior else []
-    first_build = (
-        prior.coverage["first_build"] if prior else f"{now.astimezone(UTC):%Y-%m-%d}"
-    )
+    held = {(asset.tag, asset.name) for asset in closed}
+    copied = [asset for asset in month_copy if (asset.tag, asset.name) not in held]
     manifest = Manifest(
         stream=CATALOG,
         producer=producer(gh.repo),
@@ -426,7 +508,7 @@ def run_once(
         complete=not (built.carried or stale or unreadable),
         coverage={
             "first_build": first_build,
-            "last_pin": None,
+            "last_pin": last_pin,
             "over_budget": over,
             "streams": streams,
         },
@@ -435,7 +517,7 @@ def run_once(
         data_through=Watermark(min(item.generated_at for item in inputs), "instant"),
         cursor=None,
         licences=_licences(inputs),
-        assets=[entry, *closed],
+        assets=[entry, *closed, *copied],
         series_breaks=list(prior.series_breaks) if prior else [],
         corrections=list(prior.corrections) if prior else [],
         overrides=list(prior.overrides) if prior else [],
@@ -456,8 +538,8 @@ def run_once(
         carried=built.carried,
         stale=stale,
         unreadable=unreadable,
-        pins=[],
-        month_copy=None,
+        pins=pins,
+        month_copy=month_copy[0].tag if month_copy else None,
         unparsed_requirements=built.unparsed_requirements,
     )
 

@@ -18,6 +18,7 @@ from catalog_helpers import REPO, TOKEN, no_sleep, publish_osv, publish_registry
 from obskit.gates import GateError
 from obskit.github import GitHub, GitHubError
 from obskit.manifest import Manifest, Watermark, instant, loads
+from obskit.release import CreateOnceError, add_create_once
 from obskit.testing import FakeGitHub
 from obskit.zst import decompress_file
 
@@ -25,6 +26,9 @@ CONFIG = load_config()
 CURRENT = "catalog-current"
 FIRST = "2026-11-02"
 SECOND = "2026-11-03"
+# The last day of November, for the tests of the month's copy.
+LAST = "2026-11-30"
+MONTH_COPY = "catalog-month-2026-11"
 # Each test's first run is at noon on the day of the streams' first publish.
 T0 = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
 HOUR = timedelta(hours=1)
@@ -65,9 +69,12 @@ def main_at(
     return run_main
 
 
-def registry(gh: GitHub, day: str, *names: str) -> Manifest:
+def registry(
+    gh: GitHub, day: str, *names: str, sealed: tuple[str, ...] = ()
+) -> Manifest:
     """Publish the registry as its run on `day` leaves it, with a project of each of
-    `names` that has a release 1.0, with its file and its record."""
+    `names` that has a release 1.0, with its file and its record, and an empty sealed
+    delta of each day of `sealed`."""
     state: dict[str, list[dict]] = {
         "projects": [],
         "versions_seen": [],
@@ -85,14 +92,31 @@ def registry(gh: GitHub, day: str, *names: str) -> Manifest:
         delta["release_records"].append(
             {"name": name, "version": "1.0", "uploaded_at": UPLOADED}
         )
-    return publish_registry(gh, state=state, open_day=day, open_delta=delta)
+    return publish_registry(
+        gh,
+        state=state,
+        open_day=day,
+        open_delta=delta,
+        sealed={sealed_day: {} for sealed_day in sealed},
+    )
 
 
-def osv(gh: GitHub, day: str, *ids: str, generated_at: str | None = None) -> Manifest:
-    """Publish osv as its run on `day` leaves it, with an advisory of each of `ids`."""
+def osv(
+    gh: GitHub,
+    day: str,
+    *ids: str,
+    generated_at: str | None = None,
+    sealed: tuple[str, ...] = (),
+) -> Manifest:
+    """Publish osv as its run on `day` leaves it, with an advisory of each of `ids`,
+    and an empty sealed delta of each day of `sealed`."""
     advisories = [{"id": advisory} for advisory in ids]
     return publish_osv(
-        gh, advisories=advisories, open_day=day, generated_at=generated_at
+        gh,
+        advisories=advisories,
+        open_day=day,
+        generated_at=generated_at,
+        sealed={sealed_day: {} for sealed_day in sealed},
     )
 
 
@@ -487,6 +511,56 @@ def test_a_stream_whose_data_through_stands_still_turns_stale(gh, fake, tmp_path
     assert run(gh, tmp_path, T0 + 32 * HOUR) == report(stale=["pypi-registry"])
 
 
+def test_a_stream_that_turns_stale_counts_as_a_change(gh, fake, tmp_path):
+    registry(gh, FIRST, "foo")
+    osv(gh, FIRST, "PYSEC-1")
+    run(gh, tmp_path, T0, bootstrap=True)
+    last_build = T0 + 29 * HOUR + 30 * MINUTE
+    assert run(gh, tmp_path, last_build) == report(built=True, reason="heartbeat")
+
+    # Nothing changes, and the registry's data_through, which the catalog first saw
+    # at the bootstrap, turns stale after 30 hours. The manifest says that it is
+    # fresh, so the catalog builds once the min gap has passed.
+    assert run(gh, tmp_path, last_build + 31 * MINUTE) == report(
+        reason="too soon", stale=["pypi-registry"]
+    )
+    assert run(gh, tmp_path, last_build + 50 * MINUTE) == report(
+        built=True, reason="inputs changed", stale=["pypi-registry"]
+    )
+
+    manifest = published(fake)
+    assert manifest.coverage["streams"]["pypi-registry"]["stale"] is True
+    assert manifest.complete is False
+
+
+def test_a_stream_that_turns_unreadable_counts_as_a_change(gh, fake, tmp_path):
+    registry(gh, FIRST, "foo")
+    osv(gh, FIRST, "PYSEC-1")
+    run(gh, tmp_path, T0, bootstrap=True)
+
+    # Nothing else changes, and the registry cannot be read. The manifest says that it
+    # was read, so the catalog builds once the min gap has passed.
+    a_registry_502(fake)
+    assert run(gh, tmp_path, T0 + 30 * MINUTE) == report(
+        reason="too soon", unreadable=["pypi-registry"]
+    )
+    a_registry_502(fake)
+    assert run(gh, tmp_path, T0 + 50 * MINUTE) == report(
+        built=True,
+        reason="inputs changed",
+        carried=["pypi-registry"],
+        unreadable=["pypi-registry"],
+    )
+
+    manifest = published(fake)
+    assert manifest.coverage["streams"]["pypi-registry"]["carried"] is True
+    assert manifest.complete is False
+
+    # Now the manifest says so, and a stream that stays unreadable changes nothing.
+    a_registry_502(fake)
+    assert run(gh, tmp_path, T0 + 2 * HOUR) == report(unreadable=["pypi-registry"])
+
+
 def test_data_through_is_the_oldest_input_generated_at(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, "2026-11-01", "PYSEC-1")
@@ -558,10 +632,168 @@ def test_main_prints_the_report_and_returns_its_code(
     # The run worked in a directory of its own there, which is gone.
     assert list(work.iterdir()) == []
 
-    # The heartbeat builds, and the registry has stood still for longer than its 30
-    # hours, which the workflow hears of from the exit code.
+    # The registry has stood still for longer than its 30 hours. That changes what the
+    # manifest says, so the run builds, and the workflow hears of it from the exit code.
     assert main_at(T0 + 31 * HOUR, ["run", "--workdir", str(work)]) == 2
 
     printed = json.loads(capsys.readouterr().out)
-    assert (printed["built"], printed["reason"]) == (True, "heartbeat")
+    assert (printed["built"], printed["reason"]) == (True, "inputs changed")
     assert printed["stale"] == ["pypi-registry"]
+
+
+def test_the_run_writes_each_pin_that_is_ready_and_records_the_last(
+    gh, fake, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_SHA", "8f3c2a1")
+    registry(gh, FIRST, "foo")
+    osv(gh, FIRST, "PYSEC-1")
+    first = datetime(2026, 11, 2, 23, 40, tzinfo=UTC)
+    run(gh, tmp_path, first, bootstrap=True)
+    # Early on the 3rd, both streams seal the 2nd.
+    registry(gh, SECOND, "foo", sealed=(FIRST,))
+    osv(gh, SECOND, "PYSEC-1", sealed=(FIRST,))
+
+    # It is too soon to build, and the pin of the 2nd is written all the same.
+    assert run(gh, tmp_path, first + 30 * MINUTE) == report(
+        reason="too soon", pins=["v2026-11-02"]
+    )
+    pin = json.loads(fake.asset_bytes("v2026-11-02", "release.json"))
+    assert (pin["day"], pin["commit"], pin["repo"]) == (FIRST, "8f3c2a1", REPO)
+    assert [stream["complete"] for stream in pin["streams"].values()] == [True, True]
+    assert published(fake).coverage["last_pin"] is None
+    written = fake.release("v2026-11-02")
+
+    # The next build finds the pin, leaves it alone, and records it.
+    assert run(gh, tmp_path, first + 50 * MINUTE) == report(
+        built=True, reason="inputs changed"
+    )
+    assert fake.release("v2026-11-02") == written
+    assert published(fake).coverage["last_pin"] == FIRST
+
+    # On the 5th, the registry has sealed the 3rd, and osv the 3rd and the 4th. The
+    # build writes the pin of the 3rd and records it in its own manifest. The pin of
+    # the 4th waits for the registry.
+    registry(gh, "2026-11-04", "foo", sealed=(SECOND,))
+    osv(gh, "2026-11-05", "PYSEC-1", sealed=(SECOND, "2026-11-04"))
+    assert run(gh, tmp_path, datetime(2026, 11, 5, 1, 0, tzinfo=UTC)) == report(
+        built=True, reason="inputs changed", pins=["v2026-11-03"]
+    )
+    assert published(fake).coverage["last_pin"] == SECOND
+    assert fake.release("v2026-11-04") is None
+
+
+def bootstrap_at_the_end_of_november(gh: GitHub, tmp_path: Path) -> datetime:
+    """Publish both streams on the last day of November, bootstrap the catalog late
+    that day, and return the time of the build. No pin is due until December's runs,
+    and none is ready before the streams seal the 30th."""
+    registry(gh, LAST, "foo")
+    osv(gh, LAST, "PYSEC-1")
+    built = datetime(2026, 11, 30, 23, 40, tzinfo=UTC)
+    run(gh, tmp_path, built, bootstrap=True)
+    return built
+
+
+@pytest.mark.parametrize(
+    "change", [False, True], ids=["inputs unchanged", "inputs changed too soon"]
+)
+def test_the_first_run_of_a_month_always_builds(gh, fake, tmp_path, change):
+    built = bootstrap_at_the_end_of_november(gh, tmp_path)
+    if change:
+        registry(gh, LAST, "foo", "bar")
+
+    # Twenty minutes on, December has begun, and its first run builds whether or not
+    # an input has changed, before the min gap has passed.
+    assert run(gh, tmp_path, built + 20 * MINUTE) == report(
+        built=True, reason="month began", month_copy=MONTH_COPY
+    )
+
+    manifest = published(fake)
+    assert manifest.generated_at == instant(built + 20 * MINUTE)
+    assert [(asset.name, asset.closed) for asset in manifest.assets] == [
+        ("catalog.db.zst", False),
+        ("catalog-2026-11.db.zst", True),
+        ("manifest-2026-11.json", True),
+    ]
+
+
+def test_the_month_copy_is_made_once(gh, fake, tmp_path):
+    built = bootstrap_at_the_end_of_november(gh, tmp_path)
+    # December's first run copies November's last build, and then fails to publish.
+    fake.fail("POST", "name=swap-next-catalog.db.zst", 502, times=6)
+    with pytest.raises(GitHubError):
+        run(gh, tmp_path, built + HOUR)
+    copy = fake.release(MONTH_COPY)
+    assert [asset["name"] for asset in copy["assets"]] == [
+        "catalog-2026-11.db.zst",
+        "manifest-2026-11.json",
+    ]
+    assert published(fake).generated_at == instant(built)
+    fake.calls.clear()
+
+    # The run again makes the same copy, finds it there, and uploads none of it.
+    assert run(gh, tmp_path, built + 2 * HOUR) == report(
+        built=True, reason="month began", month_copy=MONTH_COPY
+    )
+    assert fake.release(MONTH_COPY) == copy
+    assert not any(f"/releases/{copy['id']}/" in url for _, url in writes(fake))
+    copied = [
+        (asset.tag, asset.name, asset.closed)
+        for asset in published(fake).assets
+        if asset.tag == MONTH_COPY
+    ]
+    assert copied == [
+        (MONTH_COPY, "catalog-2026-11.db.zst", True),
+        (MONTH_COPY, "manifest-2026-11.json", True),
+    ]
+
+    # Later runs of the month make no copy, and every later manifest keeps the
+    # entries, each once.
+    osv(gh, "2026-12-01", "PYSEC-1", "PYSEC-2")
+    fake.calls.clear()
+    assert run(gh, tmp_path, built + 3 * HOUR) == report(
+        built=True, reason="inputs changed"
+    )
+    assert not any(MONTH_COPY in url for _, url, _ in fake.calls)
+    assert [
+        (asset.tag, asset.name, asset.closed)
+        for asset in published(fake).assets
+        if asset.tag == MONTH_COPY
+    ] == copied
+
+
+def the_download_fails(gh: GitHub, fake: FakeGitHub, tmp_path: Path) -> None:
+    """Every attempt to download the serving database of catalog-current gets a 502."""
+    fake.fail("GET", "name=catalog.db.zst", 502, times=6)
+
+
+def the_copy_is_there_with_other_bytes(
+    gh: GitHub, fake: FakeGitHub, tmp_path: Path
+) -> None:
+    """catalog-month-2026-11 holds catalog-2026-11.db.zst already, with other bytes."""
+    stray = tmp_path / "catalog-2026-11.db.zst"
+    stray.write_bytes(b"other bytes")
+    add_create_once(gh, "catalog", MONTH_COPY, [stray])
+
+
+@pytest.mark.parametrize(
+    ("broken", "error"),
+    [
+        pytest.param(the_download_fails, GitHubError, id="the download fails"),
+        pytest.param(
+            the_copy_is_there_with_other_bytes,
+            CreateOnceError,
+            id="the copy is there with other bytes",
+        ),
+    ],
+)
+def test_a_failed_month_copy_stops_the_run_before_it_publishes(
+    gh, fake, tmp_path, broken, error
+):
+    built = bootstrap_at_the_end_of_november(gh, tmp_path)
+    before = fake.release(CURRENT)
+    broken(gh, fake, tmp_path)
+
+    with pytest.raises(error):
+        run(gh, tmp_path, built + HOUR)
+
+    assert fake.release(CURRENT) == before
