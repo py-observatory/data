@@ -97,7 +97,7 @@ uv run --package osv-pypi python -m osv_pypi run
 
 `--bootstrap` builds the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. It does not override a failed month close. `--max-seconds` is how long after its start a run stops fetching records (1,200 by default), and the advisories that it does not reach are fetched by the next run. `--workdir PATH` is the folder in which a run makes its own directory and removes it afterwards (`work` by default). SQLite's temporary files go in that folder too, unless `SQLITE_TMPDIR` is set.
 
-The run prints its report as JSON: how many versions it wrote (`new` and `changed`), how many advisories it removed and returned, how many are left for the next run (`remaining`), the requests that it made, the ids of the records that did not parse (`unparsed`) and the gate failures that it overrode. It exits with 0, or with 2 when a record did not parse. Either comes after the publish.
+The run prints its report as JSON: how many versions it wrote (`new` and `changed`), how many advisories it removed and returned, how many are left for the next run (`remaining`), the requests that it made, the ids of the records that did not parse (`unparsed`) and the gate failures that it overrode. `remaining` is the sum of `stale` (stale copies), `missing` (records that OSV did not have), `deferred` (records not fetched in time) and the records in `unparsed`. It exits with 0, or with 2 when a record did not parse. Either comes after the publish.
 
 ### On GitHub
 

@@ -115,7 +115,11 @@ class RunReport:
     version rows written for the advisories that the state lacked and for those whose
     index entry moved, so a bootstrap counts each record of the dump as new. `removed`
     and `returned` count the events written, and `remaining` the advisories left to the
-    next run. `requests` counts the requests to OSV, the retries among them.
+    next run. `stale`, `missing` and `deferred` say why each of those was left: a stale
+    copy, a missing record (404 or 410), and a record not fetched by the deadline. The
+    rest of `remaining` are the records in `unparsed`. A record that a bootstrap took
+    from the dump counts in none of them. `requests` counts the requests to OSV, the
+    retries among them.
 
     `unparsed` names each record that did not parse by its id, and by nothing else: the
     report goes to the log of a public repository, and a refusal shows part of the bad
@@ -128,6 +132,9 @@ class RunReport:
     removed: int
     returned: int
     remaining: int
+    stale: int
+    missing: int
+    deferred: int
     requests: int
     unparsed: list[str]
     gate_failures: list[GateFailure]
@@ -237,6 +244,9 @@ def _report(
         removed=processed.removed,
         returned=processed.returned,
         remaining=processed.remaining,
+        stale=processed.stale,
+        missing=processed.missing,
+        deferred=processed.deferred,
         requests=requests,
         unparsed=processed.unparsed,
         gate_failures=failures,

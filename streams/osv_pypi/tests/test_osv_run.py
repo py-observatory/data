@@ -208,6 +208,9 @@ def test_bootstrap_publishes_state_delta_base_and_manifest(tmp_path):
         removed=0,
         returned=0,
         remaining=0,
+        stale=0,
+        missing=0,
+        deferred=0,
         requests=4,
         unparsed=[],
         gate_failures=[],
@@ -281,6 +284,9 @@ def test_second_run_records_a_new_and_a_changed_advisory(tmp_path):
         removed=0,
         returned=0,
         remaining=0,
+        stale=0,
+        missing=0,
+        deferred=0,
         requests=3,
         unparsed=[],
         gate_failures=[],
@@ -306,6 +312,98 @@ def test_stale_index_refused_without_writes(tmp_path):
     assert stream.requested() == [INDEX_URL]
     assert stream.github.asset_bytes(CURRENT, MANIFEST) == held
     assert stream.assets(NOVEMBER) == [BASE_NOVEMBER]
+
+
+def test_a_run_on_the_stored_generation_publishes(tmp_path):
+    kept, late = "GHSA-same-0000-0001", "GHSA-same-0000-0002"
+    listed = {kept: OLD, late: NEWEST}
+    stream = Stream(tmp_path)
+    # The dump lacks the record of `late`, and OSV has none for it yet (404), so the
+    # bootstrap leaves it to the next run.
+    report = stream.run(
+        BOOTSTRAP_AT, GENERATION, listed, dump={kept: record(kept, OLD)}, bootstrap=True
+    )
+    first = stream.manifest()
+    assert (first.coverage["remaining"], first.complete) == (1, False)
+    assert report == RunReport(
+        new=1,
+        changed=0,
+        removed=0,
+        returned=0,
+        remaining=1,
+        stale=0,
+        missing=1,
+        deferred=0,
+        requests=3,
+        unparsed=[],
+        gate_failures=[],
+    )
+    stream.osv.requests.clear()
+
+    # OSV's index often goes many hours without a new generation, so most runs read
+    # the generation that the state stored last. That copy is not stale: the run
+    # publishes, with the same cursor and the same data_through, and fetches the
+    # record that the bootstrap left.
+    at = "2026-11-02T12:00:00Z"
+    report = stream.run(at, GENERATION, listed, records={late: record(late, NEWEST)})
+
+    assert stream.requested() == [INDEX_URL, record_url(late)]
+    manifest = stream.manifest()
+    assert manifest.generated_at == at
+    assert manifest.cursor == first.cursor
+    assert manifest.data_through == first.data_through
+    assert (manifest.coverage["remaining"], manifest.complete) == (0, True)
+    # The day's open delta goes on after the bootstrap's two rows, with the same
+    # generation as its cursor again.
+    assert written(stream.open(CURRENT, DELTA), 2) == [
+        ("version", late, NEWEST),
+        ("cursor", GENERATION),
+    ]
+    assert report == RunReport(
+        new=1,
+        changed=0,
+        removed=0,
+        returned=0,
+        remaining=0,
+        stale=0,
+        missing=0,
+        deferred=0,
+        requests=2,
+        unparsed=[],
+        gate_failures=[],
+    )
+    open_bytes = stream.github.asset_bytes(CURRENT, DELTA)
+    stream.osv.requests.clear()
+
+    # The next day's first run reads the same generation once more. It seals the delta
+    # of 11-02 into the month's release, and publishes with the same cursor and the
+    # same data_through.
+    at = "2026-11-03T06:00:00Z"
+    report = stream.run(at, GENERATION, listed)
+
+    assert stream.requested() == [INDEX_URL]
+    sealed = sealed_name("2026-11-02")
+    assert stream.assets(NOVEMBER) == sorted([BASE_NOVEMBER, sealed])
+    assert stream.github.asset_bytes(NOVEMBER, sealed) == open_bytes
+    manifest = stream.manifest()
+    assert manifest.generated_at == at
+    assert manifest.cursor == first.cursor
+    assert manifest.data_through == first.data_through
+    assert stream.entries()[DELTA].period == "2026-11-03"
+    assert written(stream.open(CURRENT, DELTA), 0) == [("cursor", GENERATION)]
+    assert report == RunReport(
+        new=0,
+        changed=0,
+        removed=0,
+        returned=0,
+        remaining=0,
+        stale=0,
+        missing=0,
+        deferred=0,
+        requests=1,
+        unparsed=[],
+        gate_failures=[],
+    )
 
 
 def test_mass_removal_needs_override(tmp_path):
@@ -622,6 +720,9 @@ def test_main_exits_2_after_publishing_with_unparsed_records(
             removed=0,
             returned=0,
             remaining=1,
+            stale=0,
+            missing=0,
+            deferred=0,
             requests=2,
             unparsed=[broken],
             gate_failures=[],
@@ -645,8 +746,11 @@ def test_main_parses_arguments_and_workdir(tmp_path, monkeypatch, capsys):
         changed=2,
         removed=3,
         returned=4,
-        remaining=5,
-        requests=6,
+        remaining=18,
+        stale=5,
+        missing=6,
+        deferred=7,
+        requests=8,
         unparsed=[],
         gate_failures=[],
     )
