@@ -12,8 +12,9 @@ catalog keeps, in its coverage, when it first saw each stream's value, and a str
 whose value is older than its `stale_after_hours` is stale.
 
 A run builds on a bootstrap. It builds when the assets that it reads of a stream have
-changed since the last build, once `min_gap_minutes` have passed since that build, and
-it builds anyway once the last build is `max_gap_hours` old. Every other run builds
+changed since the last build, or a stream that the last build carried can be read
+again, once `min_gap_minutes` have passed since that build, and it builds anyway once
+the last build is `max_gap_hours` old. Every other run builds
 nothing. A build stages each stream that was read, carries each stream that could not
 be read or staged from the last build's database, and builds the serving database. Its
 manifest says which streams were carried and which are stale, and the data is complete
@@ -183,12 +184,20 @@ def _stale(streams: dict[str, dict]) -> list[str]:
 
 
 def _changed(read: StreamRead, last: dict[str, dict]) -> bool:
-    """Whether the stream was read, and its fingerprint is not the last build's. A
-    stream that the last build lacks has changed."""
+    """Whether the stream was read, and the last build does not hold it as it is now:
+    the last build lacks it, carried it, or read other assets of it.
+
+    A stream that the last build carried has changed even when its fingerprint is the
+    one recorded, which is that of its last good input. The tables would be the same,
+    but the last build's manifest says that the stream could not be read, and would go
+    on saying so after the stream recovered.
+    """
     if read.error is not None:
         return False
     before = last.get(read.stream)
-    return before is None or before["fingerprint"] != read.fingerprint
+    if before is None or before["carried"]:
+        return True
+    return before["fingerprint"] != read.fingerprint
 
 
 def _decide(
@@ -198,10 +207,10 @@ def _decide(
     config: Config,
 ) -> str:
     """Why the run builds, or why it does not, judged in this order: a bootstrap; an
-    input that changed, once min_gap_minutes have passed since the last build, and
-    "too soon" before that; a last build that is max_gap_hours old (the heartbeat);
-    and otherwise "unchanged". The catalog publishes only when it builds, so the last
-    publish is the last build."""
+    input that changed (see `_changed`), once min_gap_minutes have passed since the last
+    build, and "too soon" before that; a last build that is max_gap_hours old (the
+    heartbeat); and otherwise "unchanged". The catalog publishes only when it builds, so
+    the last publish is the last build."""
     if prior is None:
         return "bootstrap"
     since_build = now - _time(prior.generated_at)

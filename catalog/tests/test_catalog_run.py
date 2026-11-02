@@ -385,6 +385,43 @@ def test_an_unreadable_stream_is_carried_from_the_previous_build(
     ]
 
 
+def test_a_carried_stream_that_can_be_read_again_is_rebuilt(
+    gh, fake, tmp_path, main_at, capsys
+):
+    registry(gh, FIRST, "foo")
+    osv(gh, FIRST, "PYSEC-1")
+    run(gh, tmp_path, T0, bootstrap=True)
+    osv(gh, SECOND, "PYSEC-1", "PYSEC-2")
+    a_registry_502(fake)
+    carried_at = T0 + 2 * HOUR
+    assert run(gh, tmp_path, carried_at) == report(
+        built=True,
+        reason="inputs changed",
+        carried=["pypi-registry"],
+        unreadable=["pypi-registry"],
+    )
+
+    # The registry can be read again, with the assets that the last good build read,
+    # so its fingerprint is the one recorded. It changed all the same, since the build
+    # says that it was carried, and it waits for the min gap as any change does.
+    assert run(gh, tmp_path, carried_at + 30 * MINUTE) == report(reason="too soon")
+    assert main_at(carried_at + HOUR, ["run"]) == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["built"], printed["reason"]) == (True, "inputs changed")
+    assert (printed["carried"], printed["unreadable"]) == ([], [])
+    manifest = published(fake)
+    assert manifest.generated_at == instant(carried_at + HOUR)
+    entry = manifest.coverage["streams"]["pypi-registry"]
+    assert (entry["carried"], entry["error"]) == (False, None)
+    assert manifest.complete is True
+    db = serving_db(fake, tmp_path)
+    assert select(db, "SELECT stream, carried FROM input ORDER BY stream") == [
+        ("osv-pypi", 0),
+        ("pypi-registry", 0),
+    ]
+
+
 def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
