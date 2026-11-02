@@ -21,7 +21,7 @@ from catalog.run import run_once
 from catalog_helpers import REPO, TOKEN, no_sleep, publish_osv, publish_registry
 from obskit.github import GitHub
 from obskit.manifest import Asset, Manifest, dumps, loads
-from obskit.release import add_create_once
+from obskit.release import CreateOnceError, add_create_once
 from obskit.testing import FakeGitHub
 
 CONFIG = load_config()
@@ -327,6 +327,30 @@ def test_a_pin_that_exists_is_left_alone(gh, fake, tmp_path):
     assert write_pin(gh, third, document, tmp_path) is True
 
     assert fake.asset_bytes("v2026-11-03", PIN_ASSET) == text_of(document)
+
+
+def test_a_pin_that_github_lists_without_a_digest_is_not_taken_as_written(
+    gh, fake, tmp_path, monkeypatch
+):
+    registry(gh, "2026-11-03", "2026-11-02")
+    osv(gh, "2026-11-03", "2026-11-02")
+    document = pin_document(DAY, read_all(gh, tmp_path), CONFIG, REPO, "8f3c2a1")
+    stuck = tmp_path / "stuck"
+    stuck.mkdir()
+    (stuck / PIN_ASSET).write_bytes(text_of(document))
+    add_create_once(gh, "catalog", "v2026-11-02", [stuck / PIN_ASSET])
+    # An upload that stuck or failed: GitHub lists release.json with no digest.
+    listed = gh.assets
+    monkeypatch.setattr(
+        gh,
+        "assets",
+        lambda release: [{**asset, "digest": None} for asset in listed(release)],
+    )
+
+    # The pin is not skipped as written. Adding it again fails loudly, for a person
+    # to look at, instead of leaving the day without a pin for good.
+    with pytest.raises(CreateOnceError, match=PIN_ASSET):
+        write_pin(gh, DAY, document, tmp_path)
 
 
 def test_the_month_copy_copies_the_last_build_byte_for_byte(gh, fake, tmp_path):

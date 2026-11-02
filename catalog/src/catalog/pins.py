@@ -157,7 +157,8 @@ def write_pin(gh: GitHub, day: date, document: dict, workdir: Path) -> bool:
     a pin is written once, and a rerun leaves it as it is. Otherwise it adds the file
     to the release, which is created as a prerelease that is not Latest when there is
     none, and returns True. So a release that a stopped run left without the file gets
-    it.
+    it. A release.json that GitHub lists without a digest is not a pin (see
+    `_holds_pin`), and adding the file beside it raises CreateOnceError.
     """
     tag = pin_tag(day)
     if _holds_pin(gh, tag):
@@ -170,12 +171,21 @@ def write_pin(gh: GitHub, day: date, document: dict, workdir: Path) -> bool:
 
 
 def _holds_pin(gh: GitHub, tag: str) -> bool:
-    """Whether the release `tag` exists and holds release.json."""
+    """Whether the release `tag` exists and holds release.json, which GitHub lists with
+    a digest once its upload is whole.
+
+    One listed without a digest is an upload that stuck or failed, and it is not taken
+    as a pin: `write_pin` then adds the file again, which `add_create_once` refuses
+    loudly, rather than skip the day for good.
+    """
     try:
         release = gh.release_by_tag(tag)
     except NotFound:
         return False
-    return any(asset["name"] == PIN_ASSET for asset in gh.assets(release))
+    return any(
+        asset["name"] == PIN_ASSET and asset.get("digest")
+        for asset in gh.assets(release)
+    )
 
 
 def serving_asset(prior: Manifest) -> Asset:
