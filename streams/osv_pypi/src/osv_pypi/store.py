@@ -101,7 +101,7 @@ _UPDATE_ADVISORY = (
 )
 
 
-def _meta(state: sqlite3.Connection, key: str) -> str | None:
+def meta(state: sqlite3.Connection, key: str) -> str | None:
     """The value of `key` in the state's meta table, or None when it has none."""
     row = state.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return None if row is None else row[0]
@@ -159,7 +159,7 @@ def _apply_event(state: sqlite3.Connection, row: tuple) -> None:
 
 def _apply_cursor(state: sqlite3.Connection, row: tuple) -> None:
     _, generation = row
-    held = _meta(state, "cursor")
+    held = meta(state, "cursor")
     if held is not None and generation < int(held):
         raise ValueError(
             f"the cursor would go back from generation {held} to {generation}: an "
@@ -269,7 +269,7 @@ def apply(state: sqlite3.Connection, delta: sqlite3.Connection) -> None:
     Raises ValueError when the state has no applied_seq, which a bootstrap writes, and
     as `apply_delta` does.
     """
-    applied = _meta(state, "applied_seq")
+    applied = meta(state, "applied_seq")
     if applied is None:
         raise ValueError(
             "the state has no applied_seq in meta, so no bootstrap built it"

@@ -1,4 +1,3 @@
-import json
 import math
 import sqlite3
 from collections.abc import Iterator
@@ -16,8 +15,16 @@ from osv_pypi.index import Index, instant_key, record_url
 from osv_pypi.process import ProcessReport, process_dump, process_index
 from osv_pypi.records import VERSION_COLUMNS, parse_record
 from osv_pypi.store import DELTA_SCHEMA, STATE_SCHEMA, STATE_TABLES, Delta, apply
+from osv_run_helpers import (
+    OPENED,
+    Clock,
+    Ticking,
+    advisories,
+    close_connections,  # autouse: it closes what each test of this module opened
+    record,
+    written,
+)
 
-FIXTURES = Path(__file__).parent / "fixtures"
 GENERATION = 1793526521815797
 # When the state was first built, and the time of the runs of these tests, a day later.
 BOOTSTRAP_AT = "2026-11-01T06:00:00Z"
@@ -32,14 +39,6 @@ EARLIER = "2026-11-01T09:00:00Z"
 DEMO = "GHSA-4m7q-9xv2-hc3p"
 
 
-def record(advisory_id: str, modified: str, **edits: object) -> bytes:
-    """A record of `advisory_id` as OSV serves it, modified at `modified`: the GHSA
-    record in fixtures/ with that id and that time, and the keys of `edits` set."""
-    document = json.loads((FIXTURES / "ghsa.json").read_bytes())
-    document.update(edits, id=advisory_id, modified=modified)
-    return json.dumps(document).encode()
-
-
 def listing(times: dict[str, str]) -> Index:
     """An index that lists each advisory of `times` at its time."""
     keys = {advisory_id: instant_key(time) for advisory_id, time in times.items()}
@@ -51,18 +50,6 @@ def counts(**given: object) -> ProcessReport:
     one is given."""
     zero = {field.name: 0 for field in fields(ProcessReport)}
     return ProcessReport(**(zero | {"unparsed": []} | given))
-
-
-# The connections that the helpers below open. SQLite warns about a connection that is
-# collected while it is open, so each test closes what it opened when it ends.
-OPENED: list[sqlite3.Connection] = []
-
-
-@pytest.fixture(autouse=True)
-def close_connections() -> Iterator[None]:
-    yield
-    while OPENED:
-        OPENED.pop().close()
 
 
 def make_state(
@@ -99,58 +86,6 @@ def state_rows(state: sqlite3.Connection) -> dict[str, list[tuple]]:
     return {
         table: sorted(state.execute(f"SELECT * FROM {table}")) for table in STATE_TABLES
     }
-
-
-def advisories(state: sqlite3.Connection) -> dict[str, tuple[str, str]]:
-    """Each advisory of the state, with its status and when its version was
-    modified."""
-    rows = state.execute("SELECT id, status, modified FROM advisories")
-    return {advisory_id: (status, modified) for advisory_id, status, modified in rows}
-
-
-def written(conn: sqlite3.Connection, after_seq: int) -> list[tuple]:
-    """Every row of the delta above `after_seq`, in seq order: `("version", id,
-    modified)` for a version, `(kind, id)` for a removal or a return, and `("cursor",
-    generation)` for a cursor."""
-    rows = conn.execute(
-        "SELECT seq, 'version', id, modified FROM versions WHERE seq > :after "
-        "UNION ALL SELECT seq, kind, id, NULL FROM events WHERE seq > :after "
-        "UNION ALL SELECT seq, 'cursor', generation, NULL FROM cursors "
-        "WHERE seq > :after ORDER BY seq",
-        {"after": after_seq},
-    )
-    return [
-        (kind, what) if modified is None else (kind, what, modified)
-        for _, kind, what, modified in rows
-    ]
-
-
-class Clock:
-    """A clock that moves only when it is moved, so no test waits for real."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.now += seconds
-
-
-class Ticking:
-    """The replies of `fake`, each request taking one second on `clock`. A run spends
-    its time budget on requests, so a test can say how many fit in it."""
-
-    def __init__(self, fake: FakeHttp, clock: Clock) -> None:
-        self.fake = fake
-        self.clock = clock
-
-    def request(
-        self, method: str, url: str, headers: dict[str, str], body: bytes | None
-    ) -> tuple[int, dict[str, str], bytes]:
-        self.clock.now += 1.0
-        return self.fake.request(method, url, headers, body)
 
 
 class Day:
