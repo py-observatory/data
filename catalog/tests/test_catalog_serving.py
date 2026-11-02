@@ -352,3 +352,26 @@ def test_over_budget(tmp_path):
     with packed.open("r+b") as file:
         file.truncate(BUDGET_BYTES + 1)
     assert over_budget(packed)
+
+
+def test_building_into_an_existing_file_leaves_it_alone(gh, tmp_path):
+    out = tmp_path / "out.db"
+    out.write_bytes(b"not mine to remove")
+
+    with pytest.raises(FileExistsError):
+        build_serving(out, [osv_input(gh, tmp_path, [])], None)
+    assert out.read_bytes() == b"not mine to remove"
+
+
+def test_a_previous_build_that_lacks_a_table_is_refused(gh, tmp_path):
+    registry = a_registry(gh, tmp_path)
+    previous = tmp_path / "previous.db"
+    build_serving(previous, [registry], None)
+    with closing(sqlite3.connect(previous)) as con:
+        con.execute("DROP TABLE change")
+        con.commit()
+    out = tmp_path / "out.db"
+
+    with pytest.raises(ValueError, match="change"):
+        build_serving(out, [carried(registry)], previous)
+    assert not out.exists()

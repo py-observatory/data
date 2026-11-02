@@ -112,34 +112,44 @@ def build_serving(
     An input with a stage is built from it. One without is carried from the database at
     `previous`: its tables with their ids, its `input` row marked carried, and its
     attribution. Raises CarryError when there is such an input and `previous` is None or
-    has no `input` row for its stream. `out` is removed when the build fails, so that no
+    has no `input` row for its stream, and ValueError when it lacks a table of the
+    schema. Raises FileExistsError, leaving the file alone, when `out` exists. `out` is
+    removed when the build fails, so that no
     half-made database is left to be taken for a build.
     """
+    # open_db refuses an `out` that exists, and removes the file when it fails to make
+    # one, so it stays outside the try: only a file that this call made is removed below.
+    con = open_db(out, SERVING_SCHEMA, create=True)
     try:
-        return _build(out, inputs, previous)
+        with closing(con):
+            carried, refused = _fill(con, inputs, previous)
+        return BuildReport(
+            carried=carried, unparsed_requirements=refused, tables=table_counts(out)
+        )
     except BaseException:
         out.unlink(missing_ok=True)
         raise
 
 
-def _build(out: Path, inputs: list[StreamInput], previous: Path | None) -> BuildReport:
+def _fill(
+    con: sqlite3.Connection, inputs: list[StreamInput], previous: Path | None
+) -> tuple[list[str], int]:
+    """Build or carry each input into `con`, then make the joint tables and the search
+    index. Returns the streams carried and the requirements that PEP 508 refused."""
     carried: list[str] = []
     refused = 0
-    with closing(open_db(out, SERVING_SCHEMA, create=True)) as con:
-        for item in inputs:
-            if item.staged is None:
-                _carry(con, item.stream, previous)
-                carried.append(item.stream)
-            else:
-                refused += BUILDERS[item.stream](con, item.staged)
-                _write_input(con, item)
-        expand_affected(con)
-        con.execute("INSERT INTO search(search) VALUES ('rebuild')")
-        con.commit()
-        con.execute("VACUUM")
-    return BuildReport(
-        carried=carried, unparsed_requirements=refused, tables=table_counts(out)
-    )
+    for item in inputs:
+        if item.staged is None:
+            _carry(con, item.stream, previous)
+            carried.append(item.stream)
+        else:
+            refused += BUILDERS[item.stream](con, item.staged)
+            _write_input(con, item)
+    expand_affected(con)
+    con.execute("INSERT INTO search(search) VALUES ('rebuild')")
+    con.commit()
+    con.execute("VACUUM")
+    return carried, refused
 
 
 def _write_input(con: sqlite3.Connection, item: StreamInput) -> None:
@@ -176,6 +186,9 @@ def _carry(con: sqlite3.Connection, stream: str, previous: Path | None) -> None:
     from one schema and the tables that link by id are carried together."""
     if previous is None:
         raise CarryError(f"{stream} could not be read, and there is no previous build")
+    # The previous build was downloaded, so it is checked against the schema before it is
+    # read: the copy below takes every column of each table.
+    open_db(previous, SERVING_SCHEMA).close()
     attach_read_only(con, previous, "previous")
     if con.execute(_PREVIOUS_INPUT, (stream,)).fetchone() is None:
         raise CarryError(f"{stream} could not be read, and the previous build lacks it")
