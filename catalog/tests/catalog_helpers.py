@@ -182,7 +182,11 @@ def publish_registry(
 
 
 def publish_osv(
-    gh: GitHub, *, advisories: Sequence[Mapping[str, object]], open_day: str
+    gh: GitHub,
+    *,
+    advisories: Sequence[Mapping[str, object]],
+    open_day: str,
+    generated_at: str | None = None,
 ) -> Manifest:
     """Publish osv-pypi as its run on `open_day`, given as YYYY-MM-DD, leaves it, and
     return the live manifest.
@@ -190,9 +194,20 @@ def publish_osv(
     `advisories` are the rows of the state's advisories table. The open delta is empty,
     because the catalog reads only the state of osv. The manifest is made as
     `publish_registry`'s is, but the data reaches the start of `open_day`, as an
-    instant (see `_osv_data_through`).
+    instant (see `_osv_data_through`). `generated_at`, when given, is the time that the
+    manifest says the publish was made, in place of the start of `open_day`, for a test
+    of a stream whose publish is older than its last.
     """
-    return _publish(gh, _OSV, {"advisories": advisories}, open_day, {}, {}, {})
+    return _publish(
+        gh,
+        _OSV,
+        {"advisories": advisories},
+        open_day,
+        {},
+        {},
+        {},
+        generated_at=generated_at,
+    )
 
 
 def _publish(
@@ -203,8 +218,11 @@ def _publish(
     open_delta: Rows,
     sealed: Mapping[str, Rows],
     parts: Mapping[str, Rows],
+    *,
+    generated_at: str | None = None,
 ) -> Manifest:
-    """Publish `stream` as `publish_registry` says, and return the manifest.
+    """Publish `stream` as `publish_registry` says, and return the manifest. Its
+    `generated_at` is the start of `open_day` unless `generated_at` gives another.
 
     The files go up as a run puts them up: first those of the month releases, each to
     the release that its entry names, and then the state and the open delta, which
@@ -217,7 +235,7 @@ def _publish(
     manifest = Manifest(
         stream=stream.id,
         producer=producer(gh.repo),
-        generated_at=f"{open_day}T00:00:00Z",
+        generated_at=generated_at or f"{open_day}T00:00:00Z",
         complete=True,
         coverage={},
         data_through=stream.data_through(open_day),
