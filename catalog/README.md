@@ -71,7 +71,7 @@ uv run --package catalog python -m catalog run
 
 ### On GitHub
 
-`tick.yml` has a job `catalog`. It waits for osv-pypi, which is short, and not for the registry's job, which can queue for hours behind the sweep, so it reads the registry's last publish. It runs after an osv-pypi that failed too, and has a concurrency group of its own. Its failures keep one rolling issue, `[catalog] scheduled run failed`, which gets a comment for each run that fails again and is closed by the first run that succeeds. Its last step, `scripts/keepalive.sh`, makes an empty commit on main when main's newest commit is 45 days old, because GitHub disables the scheduled workflows of a public repository after 60 days with no commit and the data lives in releases.
+`tick.yml` has a job `catalog`. It waits for osv-pypi, which is short, and not for the registry's job, which can queue for hours behind the sweep, so it reads the registry's last publish. It runs after an osv-pypi that failed too, and has a concurrency group of its own. Its failures keep one rolling issue, `[catalog] scheduled run failed`, which gets a comment for each run that fails again and is closed by the first run that succeeds. After the build, whatever its outcome, `scripts/keepalive.sh` makes an empty commit on main when main's newest commit is 45 days old, because GitHub disables the scheduled workflows of a public repository after 60 days with no commit and the data lives in releases. It runs before the issue is opened or closed, so a keepalive that fails opens the issue too.
 
 ### The first run
 

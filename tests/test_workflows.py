@@ -621,8 +621,10 @@ def test_the_catalog_job_runs_after_osv_whatever_its_outcome():
     """The catalog waits for osv-pypi, which takes half an hour at most, and runs
     whether or not it succeeded: a stream that failed is read from its last publish.
     It does not wait for the registry's job, which can queue for hours behind the sweep,
-    and so reads the registry's last publish. Its last step keeps the scheduled runs
-    enabled, and runs even when an earlier step failed."""
+    and so reads the registry's last publish. The step after the build keeps the
+    scheduled runs enabled, and runs whether or not the build failed. It comes before
+    the steps of the rolling issue, so that a keepalive that fails opens the issue
+    too, and is not left to fail after the issue was closed."""
     catalog = job_of("tick.yml", "catalog")
     registry = job_of("tick.yml", "pypi-registry")
     assert scalar(catalog, "needs", 4) == "osv-pypi"
@@ -637,9 +639,9 @@ def test_the_catalog_job_runs_after_osv_whatever_its_outcome():
         "astral-sh/setup-uv",
         "uv sync --locked --package catalog",
         "catalog run",
+        "scripts/keepalive.sh",
         "rolling-issue.sh catalog failure",
         "rolling-issue.sh catalog success",
-        "scripts/keepalive.sh",
     ]
     assert len(texts) == len(in_order)
     for text, mentions in zip(texts, in_order, strict=True):
@@ -649,11 +651,11 @@ def test_the_catalog_job_runs_after_osv_whatever_its_outcome():
     )
     assert [step_if(text) for text in texts[3:]] == [
         None,
+        "${{ !cancelled() }}",
         "failure()",
         "success()",
-        "${{ !cancelled() }}",
     ]
-    for text in (texts[3], texts[6]):
+    for text in (texts[3], texts[4]):
         token = re.search(r"(?m)^\s+(?:GITHUB|GH)_TOKEN:\s*(.*?)\s*$", text)
         assert token and token[1] == "${{ github.token }}", text
 

@@ -22,8 +22,8 @@ name: tick
 # osv-pypi, which takes half an hour at most, so that a build follows the fresh advisories,
 # and runs whether or not osv-pypi succeeded, because a stream that failed is read from
 # its last publish. It does not wait for the registry's job, which can queue for hours
-# behind the sweep, and so reads the registry's last publish. Its last step keeps the
-# scheduled runs enabled (scripts/keepalive.sh).
+# behind the sweep, and so reads the registry's last publish. The step after the build
+# keeps the scheduled runs enabled (scripts/keepalive.sh).
 #
 # Run a stream by hand with `bootstrap` to build its first state. The input names the one
 # stream that it is for, and is accepted only for a stream that has never published.
@@ -228,6 +228,13 @@ jobs:
             args+=(--override-reason "$OVERRIDE_REASON")
           fi
           uv run --package catalog python -m catalog run "${args[@]}"
+      # Whatever happened to the build, so that a month of failed builds does not also let
+      # GitHub disable the scheduled runs. It comes before the steps of the issue, so that
+      # a keepalive that fails opens the issue as a failed build does.
+      - if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/keepalive.sh
       - if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -236,9 +243,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh catalog success
-      # Last, and whatever happened before it, so that a month of failed builds does not
-      # also let GitHub disable the scheduled runs.
-      - if: ${{ !cancelled() }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: scripts/keepalive.sh
