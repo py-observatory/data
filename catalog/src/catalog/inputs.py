@@ -17,12 +17,21 @@ The admitted tables that the state lacks are the delta tables, and a delta part 
 sqlite asset that holds one: the open delta, a sealed delta, a month's part or a year's
 part. A base copy holds the state's tables, and a month's manifest is JSON, so neither is
 a delta part.
+
+`read_stream` fetches a stream's manifest and finds what the catalog needs of it. A
+stream that cannot be read does not stop a build, which keeps that stream's tables from
+the previous build, so `read_stream` gives the reason in place of the manifest.
 """
 
 import hashlib
+from dataclasses import dataclass
 from datetime import date, timedelta
+from pathlib import Path
 
+from catalog.config import StreamAdmission
+from obskit.github import GitHub, GitHubError
 from obskit.manifest import Asset, Manifest
+from obskit.release import PriorStateError, fetch_manifest
 from obskit.tags import current_tag
 
 _SQLITE = "sqlite+zstd"
@@ -176,6 +185,39 @@ def fingerprint(assets: list[Asset]) -> str:
     """
     lines = sorted(f"{a.tag}/{a.name}:{a.asset_sha256}" for a in assets)
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class StreamRead:
+    """What the catalog read of one stream: its manifest, the assets that it needs of it
+    (see `needed_assets`) and their fingerprint. When the stream could not be read,
+    `error` says why, and there is no manifest, no asset and no fingerprint."""
+
+    stream: str
+    manifest: Manifest | None
+    assets: list[Asset]
+    fingerprint: str | None
+    error: str | None
+
+
+def read_stream(gh: GitHub, admission: StreamAdmission, directory: Path) -> StreamRead:
+    """Read the stream that `admission` admits: fetch its manifest into `directory`,
+    which must exist, and find the assets that the catalog needs of it and their
+    fingerprint. No asset is downloaded.
+
+    The catalog fails open for its inputs, so a stream that cannot be read gives a
+    StreamRead whose `error` is the reason. That is any PriorStateError, which says that
+    the stream has never published or that its release holds no sound manifest of its
+    own, any GitHubError, a 502 that outlasted the retries among them, and any
+    ValueError, such as a ManifestError for a manifest that does not read or an
+    InputError for one that does not list what the catalog needs.
+    """
+    try:
+        manifest = fetch_manifest(gh, admission.stream, directory)
+        assets = needed_assets(manifest, admission.tables)
+    except (PriorStateError, GitHubError, ValueError) as exc:
+        return StreamRead(admission.stream, None, [], None, str(exc))
+    return StreamRead(admission.stream, manifest, assets, fingerprint(assets), None)
 
 
 def open_day(manifest: Manifest) -> date | None:
