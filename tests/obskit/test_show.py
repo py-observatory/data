@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from obskit.show import show
+from obskit.show import WITHHELD, show
 
 
 def built_nested(depth: int) -> list:
@@ -50,3 +50,29 @@ def test_show_cuts_a_long_text_and_says_so():
 )
 def test_show_a_short_value_as_repr_would(value):
     assert show(value) == repr(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("jane@example.org", id="an address"),
+        pytest.param({"id": "jane%40example.org"}, id="an encoded at"),
+        pytest.param(["jane [at] example [dot] org"], id="an at in brackets"),
+        # Cut to 60 characters, the address loses the end of its domain, and with it
+        # what makes it an address, but it keeps its at.
+        pytest.param(
+            {"a": "a" * 25, "z": "jane.doe@example.org"}, id="an address cut short"
+        ),
+        # Python writes the line breaks as escapes, which are no blanks to a filter.
+        pytest.param("jane [\nat\n] x [\ndot\n] org", id="blanks written as escapes"),
+        pytest.param("@", id="an at alone"),
+    ],
+)
+def test_show_holds_back_a_value_that_holds_an_at(value):
+    # An error message goes to the run's log, which is public for a public repository.
+    assert show(value) == "<not shown, as it may hold an email address>"
+    assert show(value) == WITHHELD
+
+
+def test_show_shows_a_word_at_that_is_not_alone_in_brackets():
+    assert show("look at numpy [at home]") == "'look at numpy [at home]'"

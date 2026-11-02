@@ -37,7 +37,6 @@ the deadline are left for the next run. A request that fails is Http's UpstreamE
 and it is not caught: the run fails and publishes nothing.
 """
 
-import re
 import sqlite3
 import sys
 import time
@@ -45,7 +44,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from obskit.emails import without_addresses
+from obskit.emails import holds_an_at, without_addresses
 from obskit.http import Http, UpstreamError
 from osv_pypi.index import Index, record_url
 from osv_pypi.records import parse_record
@@ -53,24 +52,6 @@ from osv_pypi.store import Delta
 
 # The replies that mean that OSV has no record: 404 for now, and 410 for good.
 _GONE = (404, 410)
-
-# The blanks that may stand inside the brackets of an at, as a refusal shows them. A
-# refusal shows the bad value as Python writes a value, which writes every blank but a
-# space as an escape, such as `\n` for a line break and `\xa0` for a no-break space.
-_BLANKS = r"(?:\s|\\(?:[nrt]|x[0-9a-f]{2}|u[0-9a-f]{4}))*+"
-_BRACKETS = ((r"\[", r"\]"), (r"\(", r"\)"), (r"\{", r"\}"), ("<", ">"))
-# Each form of the at that obskit.emails reads in an address: `@`, `%40`, and `at` alone
-# inside a pair of brackets, in any case. A refusal shows at most 60 characters of a
-# value, so it can cut an address short. Cut before the end of its domain, it is no
-# longer an address that `without_addresses` finds, but it keeps its at, so a reason
-# with an at left in it is not shown.
-_AT = re.compile(
-    "|".join(
-        ["@", "%40"]
-        + [f"{opening}{_BLANKS}at{_BLANKS}{closing}" for opening, closing in _BRACKETS]
-    ),
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -193,14 +174,15 @@ def _log_refusal(advisory_id: str, error: ValueError) -> None:
     """Say on stderr why the record of `advisory_id` was refused, so that whoever reads
     the run's log sees what to fix.
 
-    A refusal shows part of the bad value, which can be an email address, and the log
-    of a public repository is public. So every address is taken out first. The reason
-    is not shown when that cannot be done, nor when an at of any form is still in it:
-    what is left of an address that the refusal cut short keeps its at, and so does an
-    address whose blanks the refusal wrote as escapes.
+    A refusal shows part of the bad value, and the log of a public repository is
+    public. `show` holds back a value that holds an at, and this guards the whole
+    reason again, whatever made it. Every address is taken out first. The reason is not
+    shown when that cannot be done, nor when an at of any form is still in it
+    (`obskit.emails.holds_an_at`): what is left of an address cut short after its at
+    keeps the at, and so does an address whose blanks are written as escapes.
     """
     reason = without_addresses(str(error))
-    if reason is None or _AT.search(reason):
+    if reason is None or holds_an_at(reason):
         reason = "the reason is not shown, as it may hold an email address"
     print(f"skipped {advisory_id}: {reason}", file=sys.stderr)
 

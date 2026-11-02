@@ -8,6 +8,10 @@ An address may be written plainly or hidden, as in `jane%40x.org` or
 `jane [at] x [dot] org`. The hidden forms are written for nothing else, so they count.
 Plain words do not: `jane at x dot org` cannot be told apart from
 `look at numpy dot product`.
+
+A text that shows part of a value, as an error message does, can hold what is left of
+an address that was cut short, which no longer counts as one. `holds_an_at` finds the
+at that it keeps.
 """
 
 import re
@@ -122,3 +126,36 @@ def without_addresses(text: str | None) -> str | None:
 def is_mail_link(url: str) -> bool:
     """Whether `url` is a `mailto:` link. A scheme is not case sensitive."""
     return url.lstrip().lower().startswith("mailto:")
+
+
+# The blanks that may stand inside the brackets of an at in a text that shows a value.
+# Python writes every blank but a space as an escape where it shows a value, such as
+# `\n` for a line break and `\xa0` for a no-break space.
+_SHOWN_BLANKS = r"(?:\s|\\(?:[nrt]|x[0-9a-f]{2}|u[0-9a-f]{4}))*+"
+_BRACKETS = ((r"\[", r"\]"), (r"\(", r"\)"), (r"\{", r"\}"), ("<", ">"))
+# Each form of the at that ADDRESS reads in an address: `@`, `%40`, and `at` alone
+# inside a pair of brackets, in any case.
+_ANY_AT = re.compile(
+    "|".join(
+        ["@", "%40"]
+        + [
+            f"{opening}{_SHOWN_BLANKS}at{_SHOWN_BLANKS}{closing}"
+            for opening, closing in _BRACKETS
+        ]
+    ),
+    re.IGNORECASE,
+)
+
+
+def holds_an_at(text: str) -> bool:
+    """Whether `text` holds an at of any form that an address is written with: `@`,
+    `%40`, or `at` alone inside a pair of brackets, in any case. The blanks inside the
+    brackets may be of any kind, or the escapes that Python writes for them where it
+    shows a value (`\\n`, `\\r`, `\\t`, `\\xNN` and `\\uNNNN`).
+
+    This is for a text that shows part of a value, such as an error message. A value
+    cut short keeps its at after its domain is gone, and is then no longer an address
+    that `holds_address` finds. So a text with an at in it is not shown where an
+    address must never be.
+    """
+    return _ANY_AT.search(text) is not None

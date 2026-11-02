@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from obskit.emails import holds_an_at
 from obskit.http import Http, UpstreamError
 from obskit.testing import FakeHttp
 from osv_pypi import dump
@@ -68,6 +69,7 @@ _DIRECTORY_ENTRY = {
     "compress_size": (20, "<I"),
     "file_size": (24, "<I"),
 }
+_HEADER_SIZE = 30  # the fixed part of a member's local header
 _ENTRY_SIZE = 46  # the fixed part of an entry of the central directory
 _END_SIZE = 22  # the end record, which has no comment in an archive that zipfile wrote
 
@@ -123,6 +125,21 @@ def with_a_name_that_is_not_utf8() -> bytes:
     byte 0xFF, which UTF-8 cannot hold."""
     body = archive([(NAME, b"{}")]).replace(b"GHSA", b"\xffHSA")
     return patched(body, flags=0x800)
+
+
+def with_another_name_in_the_header(body: bytes, name: bytes) -> bytes:
+    """`body`, an archive of one member, with `name` in the member's local header in
+    place of the name that the central directory gives it. The directory comes after
+    the member, so it moves by as many bytes as the name grows, and the end record says
+    where it starts."""
+    (written,) = struct.unpack_from("<H", body, 26)  # the length of the header's name
+    header = bytearray(body[:_HEADER_SIZE])
+    struct.pack_into("<H", header, 26, len(name))
+    damaged = bytearray(header + name + body[_HEADER_SIZE + written :])
+    start_at = len(damaged) - _END_SIZE + 16
+    (start,) = struct.unpack_from("<I", damaged, start_at)
+    struct.pack_into("<I", damaged, start_at, start + len(name) - written)
+    return bytes(damaged)
 
 
 def with_a_directory_past_the_end(body: bytes) -> bytes:
@@ -478,17 +495,39 @@ def test_read_dump_refuses_hostile_archives(monkeypatch, body, limits, reason):
 )
 def test_read_dump_names_the_member_that_zipfile_fails_on(monkeypatch, error):
     # Whatever zipfile raises as it reads a member ends as a ValueError that names the
-    # member, with the error behind it. The archive is a good one, and the failure is
+    # member and shows what zipfile said. The archive is a good one, and the failure is
     # put in.
     def fail(self, size=-1):
         raise error
 
     monkeypatch.setattr(zipfile.ZipExtFile, "read", fail)
 
-    with pytest.raises(ValueError, match=f"'{NAME}' cannot be read") as caught:
+    with pytest.raises(ValueError, match=f"'{NAME}' cannot be read: ") as caught:
         list(read_dump(GOOD))
 
-    assert caught.value.__cause__ is error
+    assert (str(error) or "EOFError") in str(caught.value)
+    # zipfile's error is kept neither as the cause nor as the context, so a traceback
+    # never prints its text, which can quote a name from the archive in full.
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert caught.value.__suppress_context__
+
+
+def test_a_refused_dump_shows_no_at_from_the_archive():
+    # The central directory names a record, and the member's own header names an
+    # address. zipfile's error quotes both names whole, and the error goes to the run's
+    # log, which is public for a public repository.
+    named = "GHSA-aaaa-0000-0001.json"
+    body = with_another_name_in_the_header(archive([(named, RECORD)]), b"jane@x.org")
+
+    with pytest.raises(ValueError, match=f"'{named}' cannot be read") as caught:
+        list(read_dump(body))
+
+    refusal = caught.value
+    assert not holds_an_at(str(refusal))
+    for behind in (refusal.__cause__, refusal.__context__):
+        assert behind is None or not holds_an_at(str(behind))
+    assert refusal.__suppress_context__
 
 
 @pytest.mark.parametrize(

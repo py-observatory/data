@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from obskit.emails import holds_address
+from obskit.emails import holds_address, holds_an_at
 from obskit.http import Http, UpstreamError
+from obskit.show import WITHHELD
 from obskit.sqlite import open_db
 from obskit.testing import FakeHttp
 from osv_pypi.index import Index, instant_key, record_url
@@ -344,9 +345,10 @@ def test_unparsed_record_is_skipped_and_named(tmp_path):
     assert report == counts(unparsed=[second])
 
 
-# Addresses, each with another form of the at, that a refusal cuts short when it shows
-# one after 25 letters in an object, since it shows at most 60 characters of a value.
-# Each loses the end of its domain and keeps its at. With each is what is shown of it.
+# Addresses, each with another form of the at, that an error message cuts short when it
+# shows one after 25 letters in an object, since it shows at most 60 characters of a
+# value. Each loses the end of its domain and keeps its at. With each is what is left of
+# it.
 CUT_AT_THE_END = {
     "@": ("jane.doe@example.org", "'jane.doe@example..."),
     "%40": ("jane.doe%40example.org", "'jane.doe%40examp..."),
@@ -358,52 +360,32 @@ CUT_AT_THE_END = {
 
 
 @pytest.mark.parametrize(
-    ("alias", "shown", "kept"),
+    "alias",
     [
-        # The address is taken out, and the rest of the reason is shown.
-        pytest.param(
-            {"id": "jane@example.org"}, "jane@example.org", True, id="an address"
-        ),
-        # Taking out the address in brackets joins what is left into another one.
-        pytest.param(
-            {"id": "me@<a@b.cc>x.org"},
-            "me@<a@b.cc>x.org",
-            False,
-            id="an address in another",
-        ),
+        pytest.param({"id": "jane@example.org"}, id="an address"),
+        pytest.param({"id": "me@<a@b.cc>x.org"}, id="an address in another"),
         *(
-            pytest.param(
-                {"a": "a" * 25, "z": address},
-                shown,
-                False,
-                id=f"cut at the end, {form}",
-            )
-            for form, (address, shown) in CUT_AT_THE_END.items()
+            pytest.param({"a": "a" * 25, "z": address}, id=f"cut at the end, {form}")
+            for form, (address, _) in CUT_AT_THE_END.items()
         ),
         # A long text is shown by its two ends, and this one is cut after the at.
         pytest.param(
-            "x" * 14 + " jane.doe@example.org" + "1" * 165,
-            " jane.doe@exa...111",
-            False,
-            id="cut in the middle",
+            "x" * 14 + " jane.doe@example.org" + "1" * 165, id="cut in the middle"
         ),
         # Python writes a line break as \n where it shows a value, and the filter finds
         # no address where the blanks of its at are written so.
         pytest.param(
-            {"id": "jane [\nat\n] x [\xa0dot\xa0] org"},
-            r"'jane [\nat\n] x [\xa0dot\xa0] org'",
-            False,
-            id="blanks written as escapes",
+            {"id": "jane [\nat\n] x [\xa0dot\xa0] org"}, id="blanks written as escapes"
         ),
     ],
 )
-def test_a_refusal_is_logged_without_an_address(tmp_path, capsys, alias, shown, kept):
+def test_a_refusal_is_logged_without_an_address(tmp_path, capsys, alias):
     body = record(DEMO, INDEXED, aliases=[alias])
-    # The reason why the record is refused shows the bad value, address and all, or as
-    # much of it as a refusal shows.
+    # The refusal shows the bad value as `show` does, which holds back a value with an
+    # at of any form in it, whole or cut short.
     with pytest.raises(ValueError, match=r"aliases\[0\]") as refusal:
         parse_record(body, advisory_id=DEMO)
-    assert shown in str(refusal.value)
+    assert str(refusal.value).endswith(f", not {WITHHELD}")
     state = make_state(tmp_path)
     fake = FakeHttp()
     fake.add(record_url(DEMO), body=body)
@@ -411,18 +393,61 @@ def test_a_refusal_is_logged_without_an_address(tmp_path, capsys, alias, shown, 
 
     report, _ = day.run(listing({DEMO: INDEXED}))
 
-    # The log names the record, and says why it was refused only when that can be said
-    # with no address and no at left in it, since the log of a public repository is
-    # public. Nothing goes to stdout, which a run keeps for its report.
+    # The log names the record, and says why it was refused, with no address and no at
+    # in it, since the log of a public repository is public. Nothing goes to stdout,
+    # which a run keeps for its report.
     assert report.unparsed == [DEMO]
     logged = capsys.readouterr()
     assert logged.out == ""
+    assert not holds_an_at(logged.err)
+    assert logged.err == f"skipped {DEMO}: {refusal.value}\n"
+
+
+@pytest.mark.parametrize(
+    ("shown", "kept"),
+    [
+        # The address is taken out, and the rest of the reason is shown.
+        pytest.param("{'id': 'jane@example.org'}", True, id="an address"),
+        # Taking out the address in brackets joins what is left into another one.
+        pytest.param("{'id': 'me@<a@b.cc>x.org'}", False, id="an address in another"),
+        *(
+            pytest.param(shown, False, id=f"cut at the end, {form}")
+            for form, (_, shown) in CUT_AT_THE_END.items()
+        ),
+        pytest.param("'xxx jane.doe@exa...111'", False, id="cut in the middle"),
+        pytest.param(
+            r"{'id': 'jane [\nat\n] x [\xa0dot\xa0] org'}",
+            False,
+            id="blanks written as escapes",
+        ),
+    ],
+)
+def test_a_reason_that_shows_a_value_another_way_is_logged_without_an_address(
+    tmp_path, capsys, monkeypatch, shown, kept
+):
+    # A reason may show a value without `show`. The log takes every address out of it,
+    # and does not show it at all while an at of any form is left in it.
+    reason = f"aliases[0] must be a string, not {shown}"
+
+    def refuse(body: bytes, *, advisory_id: str) -> dict:
+        raise ValueError(reason)
+
+    monkeypatch.setattr("osv_pypi.process.parse_record", refuse)
+    state = make_state(tmp_path)
+    fake = FakeHttp()
+    fake.add(record_url(DEMO), body=record(DEMO, INDEXED))
+    day = Day(tmp_path, state, fake)
+
+    report, _ = day.run(listing({DEMO: INDEXED}))
+
+    assert report.unparsed == [DEMO]
+    logged = capsys.readouterr()
     assert not holds_address(logged.err)
     if kept:
-        reason = str(refusal.value).replace(shown, "")
+        said = reason.replace("jane@example.org", "")
     else:
-        reason = "the reason is not shown, as it may hold an email address"
-    assert logged.err == f"skipped {DEMO}: {reason}\n"
+        said = "the reason is not shown, as it may hold an email address"
+    assert logged.err == f"skipped {DEMO}: {said}\n"
 
 
 @pytest.mark.parametrize("status", [304, 403, 500])

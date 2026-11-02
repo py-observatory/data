@@ -83,9 +83,14 @@ def get_dump(http: Http) -> bytes:
 
 
 def _said(exc: Exception) -> str:
-    """What `zipfile` or `zlib` said, as an error message shows it. It is cut short,
-    because `zipfile` puts names from the archive into some of its messages, and a name
-    is up to 64 KiB. An EOFError has no text, so its name stands for it."""
+    """What `zipfile` or `zlib` said, as an error message shows it (see `show`). It is
+    cut short, because `zipfile` puts names from the archive into some of its messages,
+    and a name is up to 64 KiB, and it is not shown when it holds an at. An EOFError has
+    no text, so its name stands for it.
+
+    The error itself is dropped. The ValueError that takes its place is raised once the
+    handler has ended, and from None, so the error is neither its cause nor its context,
+    and a traceback never prints its text in full."""
     return show(str(exc) or type(exc).__name__)
 
 
@@ -95,9 +100,8 @@ def _open(body: bytes) -> zipfile.ZipFile:
     try:
         return zipfile.ZipFile(io.BytesIO(body))
     except _ZIP_ERRORS as exc:
-        raise ValueError(
-            f"the dump cannot be read as a zip file: {_said(exc)}"
-        ) from exc
+        said = _said(exc)
+    raise ValueError(f"the dump cannot be read as a zip file: {said}") from None
 
 
 def _advisory_id(name: str) -> str:
@@ -159,14 +163,15 @@ def _read_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
         with archive.open(info) as member:
             record = member.read(MAX_MEMBER_BYTES + 1)
     except _ZIP_ERRORS as exc:
-        raise ValueError(
-            f"the member {show(name)} cannot be read: {_said(exc)}"
-        ) from exc
-    if len(record) > MAX_MEMBER_BYTES:
-        raise ValueError(
-            f"the member {show(name)} is over the limit of {MAX_MEMBER_BYTES:,} bytes"
-        )
-    return record
+        said = _said(exc)
+    else:
+        if len(record) > MAX_MEMBER_BYTES:
+            raise ValueError(
+                f"the member {show(name)} is over the limit of "
+                f"{MAX_MEMBER_BYTES:,} bytes"
+            )
+        return record
+    raise ValueError(f"the member {show(name)} cannot be read: {said}") from None
 
 
 def read_dump(body: bytes) -> Iterator[tuple[str, bytes]]:
@@ -184,8 +189,9 @@ def read_dump(body: bytes) -> Iterator[tuple[str, bytes]]:
     up. Raises ValueError for a member of over MAX_MEMBER_BYTES, whatever its header
     claims, and for a total of over MAX_TOTAL_BYTES. Whatever `zipfile` or `zlib` raise
     over a damaged member (a CRC that does not match, members that overlap, a stream
-    that does not decompress) is a ValueError as well, which names the member and has
-    the error as its cause.
+    that does not decompress) is a ValueError as well, which names the member and shows
+    what was said. The error itself is not kept, as cause or as context, because its
+    text can quote a name from the archive in full.
 
     A ValueError refuses the whole dump and ends the iteration: the records yielded
     before it came from an archive that is refused.
