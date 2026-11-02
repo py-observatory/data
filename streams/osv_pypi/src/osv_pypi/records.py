@@ -20,10 +20,10 @@ this module does not name is dropped unread, because OSV's schema gains keys.
 import hashlib
 import json
 import math
-import re
 from collections.abc import Iterator
 
 from obskit.emails import holds_address, is_mail_link, without_addresses
+from obskit.names import canonical_name
 from obskit.show import show
 from osv_pypi.index import instant_key
 
@@ -73,9 +73,6 @@ _DATABASE_KEYS = (
 # The longest alias or related id. The longest real one is under 50 characters.
 _MAX_ID_LENGTH = 128
 
-# PEP 503: a run of hyphens, underscores and dots is one hyphen.
-_SEPARATORS = re.compile(r"[-_.]+")
-
 
 def _refuse(path: str, expected: str, value: object) -> ValueError:
     """The error for a value of the wrong shape: where it is and what was expected."""
@@ -86,12 +83,6 @@ def _compact(value: object) -> str:
     """`value` as a JSON column holds it: no spaces, the keys of each object in order,
     and characters outside ASCII written as they are."""
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
-
-
-def _canonical_name(name: str) -> str:
-    """The PEP 503 form of a project name: each run of `-`, `_` and `.` is one `-`, and
-    the letters are lowercase."""
-    return _SEPARATORS.sub("-", name).lower()
 
 
 def _load(body: bytes) -> dict:
@@ -278,7 +269,7 @@ def _pypi_entry(entry: dict, package: dict, where: str) -> dict[str, object]:
         for index, version in enumerate(_listed(entry, "versions", where))
     ]
     return {
-        "name": _canonical_name(name),
+        "name": canonical_name(name),
         "name_raw": name,
         "ranges": ranges,
         "versions": versions,
