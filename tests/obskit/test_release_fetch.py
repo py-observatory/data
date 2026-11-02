@@ -11,6 +11,7 @@ from obskit.manifest import Asset, Manifest, ManifestError, TableInfo, Watermark
 from obskit.release import (
     PriorStateError,
     fetch_assets,
+    fetch_manifest,
     fetch_prior,
     publish_current,
 )
@@ -678,6 +679,43 @@ def test_errors_after_the_release_is_found_propagate(
     assert caught.value.status == status
 
 
+# --- fetch_manifest: the manifest of -current, and nothing else ---
+
+
+def test_fetch_manifest_reads_only_the_manifest(gh, fake, tmp_path, workdir):
+    published = build(tmp_path, "v1", STATE, DELTA)
+    seed(gh, fake, published.files)
+
+    manifest = fetch_manifest(gh, STREAM, workdir)
+
+    assert manifest == published.manifest
+    assert downloads(fake) == [MANIFEST], "no data asset is downloaded"
+    assert contents(workdir) == [MANIFEST]
+    assert {method for method, _ in requests(fake)} == {"GET"}, "it only reads"
+
+
+def test_fetch_manifest_refuses_a_stream_with_no_release(gh, fake, workdir):
+    with pytest.raises(PriorStateError, match=TAG) as caught:
+        fetch_manifest(gh, STREAM, workdir)
+
+    assert "never published" in str(caught.value)
+    assert isinstance(caught.value.__cause__, NotFound), "the 404 is the evidence"
+    assert requests(fake) == [("GET", TAG_URL)]
+    assert contents(workdir) == []
+
+
+def test_fetch_manifest_refuses_another_streams_manifest(gh, fake, tmp_path, workdir):
+    published = build(tmp_path, "v1", STATE)
+    foreign = dataclasses.replace(published.manifest, stream="other")
+    published.files[MANIFEST].write_text(dumps(foreign), encoding="utf-8")
+    seed(gh, fake, published.files)
+
+    with pytest.raises(PriorStateError, match="other"):
+        fetch_manifest(gh, STREAM, workdir)
+
+    assert downloads(fake) == [MANIFEST], "no data asset is downloaded"
+
+
 # --- fetch_assets: assets of any release, found by tag and name ---
 
 NOVEMBER = "example-month-2026-11"
@@ -811,6 +849,27 @@ def test_fetch_assets_verifies_and_expands(gh, fake, tmp_path, workdir):
 def test_fetch_assets_of_nothing_asks_nothing(gh, fake, workdir):
     assert fetch_assets(gh, [], workdir) == []
     assert fake.calls == []
+
+
+def test_fetch_assets_keeps_downloads_when_asked(gh, fake, tmp_path, workdir):
+    month = closed_month(tmp_path)
+    seed_month(gh, fake, month)
+    asked = [month.entries[BASE], month.entries[DAY]]
+
+    fetch_assets(gh, asked, workdir)
+
+    for entry in asked:
+        assert not (workdir / entry.name).exists(), "by default a download is deleted"
+
+    # A run that copies what it fetched into another release needs the bytes that were
+    # published, and compressing the expansion again could give other bytes.
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    paths = fetch_assets(gh, asked, kept, keep_downloads=True)
+
+    for entry in asked:
+        assert sha256_file(kept / entry.name) == entry.asset_sha256
+    assert contents(kept) == sorted([BASE, DAY, *(path.name for path in paths)])
 
 
 # Each way that an asset of the month can fail to be what its entry says: the entry

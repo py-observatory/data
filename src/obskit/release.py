@@ -1,9 +1,10 @@
 """A stream's releases.
 
 `fetch_prior` reads a stream's prior state from `<stream>-current`, and
-`publish_current` swaps the next state into it. `add_create_once` adds files to a
-release whose assets are never replaced, and `fetch_assets` reads assets back from any
-release. `prepare_asset` compresses a database and describes it for the manifest.
+`fetch_manifest` reads only its manifest. `publish_current` swaps the next state into
+it. `add_create_once` adds files to a release whose assets are never replaced, and
+`fetch_assets` reads assets back from any release. `prepare_asset` compresses a
+database and describes it for the manifest.
 
 Reading prior state fails closed. An error once read as "no release yet" let a run
 publish over good data, so only a confirmed HTTP 404 of the `-current` release, with
@@ -156,7 +157,36 @@ def fetch_prior(
     return manifest
 
 
-def fetch_assets(gh: GitHub, assets: list[Asset], workdir: Path) -> list[Path]:
+def fetch_manifest(gh: GitHub, stream: str, directory: Path) -> Manifest:
+    """The manifest of the stream's last publish, read alone: none of the assets that
+    it lists is downloaded.
+
+    This is for a reader that wants to know what a stream holds, how far its data
+    reaches and whether it is complete, and has no use for the data. It is the manifest
+    that `fetch_prior` finds. It is downloaded to `directory`, which must exist, as
+    manifest.json, or as swap-next-manifest.json after an interrupted publish (see
+    `_read_manifest`). The release itself is never changed.
+
+    Raises PriorStateError when `<stream>-current` does not exist (GitHub answers HTTP
+    404), which means that the stream has never published, and when the manifest is
+    missing, not what GitHub lists or another stream's (see `_read_manifest`). Every
+    other error propagates, a 404 from any later request included.
+    """
+    tag = current_tag(stream)
+    try:
+        release = gh.release_by_tag(tag)
+    except NotFound as exc:
+        raise PriorStateError(
+            f"{gh.repo} has no release {tag}, so the stream {stream} has never "
+            "published"
+        ) from exc
+    listed = {asset["name"]: asset for asset in gh.assets(release)}
+    return _read_manifest(gh, stream, listed, directory)[1]
+
+
+def fetch_assets(
+    gh: GitHub, assets: list[Asset], workdir: Path, *, keep_downloads: bool = False
+) -> list[Path]:
     """Download the manifest entries `assets`, each from the release of its tag, and
     return the checked file that each expands to, in order.
 
@@ -164,8 +194,10 @@ def fetch_assets(gh: GitHub, assets: list[Asset], workdir: Path) -> list[Path]:
     without .zst>`, and both files are checked against the entry, as `fetch_prior`
     checks the state. Then the download is deleted, before the next asset is
     fetched: a month close fetches a month of deltas, and would otherwise hold each
-    one twice. A file that is not a `.zst` is checked as it is, and its own path is
-    returned. No release is changed.
+    one twice. With `keep_downloads` each download stays, as `fetch_prior` keeps the
+    state's, for a run that copies the bytes it fetched into another release:
+    compressing the expansion again could give other bytes. A file that is not a
+    `.zst` is checked as it is, and its own path is returned. No release is changed.
 
     Every asset is found, by its tag and its name, before any is downloaded. Raises
     PriorStateError when a tag has no release (GitHub answers 404), when a release
@@ -198,13 +230,19 @@ def fetch_assets(gh: GitHub, assets: list[Asset], workdir: Path) -> list[Path]:
             )
         sources.append(source)
     return [
-        _fetch_asset(gh, asset, source, workdir, keep_download=False)
+        _fetch_asset(gh, asset, source, workdir, keep_download=keep_downloads)
         for asset, source in zip(assets, sources, strict=True)
     ]
 
 
 def publish_current(
-    gh: GitHub, stream: str, files: list[Path], manifest: Manifest, *, bootstrap: bool
+    gh: GitHub,
+    stream: str,
+    files: list[Path],
+    manifest: Manifest,
+    *,
+    bootstrap: bool,
+    latest: bool = False,
 ) -> None:
     """Swap `files` and `manifest` into `<stream>-current`. The release then holds
     each file under its own name and `manifest` as manifest.json, and the assets that
@@ -219,10 +257,13 @@ def publish_current(
 
     The release must exist without `bootstrap`. With it, the release is created when
     GitHub answers 404, and refused when it holds any asset that is not a swap copy
-    (PriorStateError). Without it, the release is first put back to its live
-    manifest (see `_repair`). Then every swap copy is deleted. It refuses the publish
-    before uploading if the release would hold MAX_ASSETS assets (AssetLimitError),
-    and warns from WARN_ASSETS.
+    (PriorStateError). The release is created as a prerelease that is not Latest, or,
+    when `latest` is set, as a release that GitHub makes the Latest. `latest` applies
+    when the publish creates the release, and a release that exists is left as it is.
+    Without `bootstrap`, the release is first put back to its live manifest (see
+    `_repair`). Then every swap copy is deleted. It refuses the publish before
+    uploading if the release would hold MAX_ASSETS assets (AssetLimitError), and warns
+    from WARN_ASSETS.
 
     Each file is uploaded as `swap-next-<name>`, and the manifest last, and each
     upload must have its file's sha256 (UploadError). Then, data first and the
@@ -245,7 +286,7 @@ def publish_current(
                 f"{gh.repo} has no release {tag}. Run with --bootstrap only if the "
                 f"stream {stream} has never published."
             ) from exc
-        release = gh.create_release(tag, prerelease=True, latest=False)
+        release = gh.create_release(tag, prerelease=not latest, latest=latest)
         listed: dict[str, dict] = {}
     else:
         listed = {asset["name"]: asset for asset in gh.assets(release)}

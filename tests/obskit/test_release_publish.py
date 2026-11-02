@@ -207,6 +207,47 @@ def test_publish_creates_current_on_bootstrap(gh, fake, tmp_path, workdir):
     assert fetch_prior(gh, STREAM, workdir, bootstrap=False) == v1.manifest
 
 
+def test_publish_current_creates_a_prerelease_by_default(gh, fake, tmp_path):
+    publish(gh, build(tmp_path, "v1"), bootstrap=True)
+
+    created = fake.release(TAG)
+    assert created["prerelease"] is True
+    assert created["make_latest"] == "false"
+
+
+def test_publish_current_can_create_a_latest_release(gh, fake, tmp_path):
+    v1 = build(tmp_path, "v1")
+
+    publish_current(
+        gh, STREAM, list(v1.files.values()), v1.manifest, bootstrap=True, latest=True
+    )
+
+    created = fake.release(TAG)
+    assert created["prerelease"] is False
+    assert created["make_latest"] == "true"
+    assert names(fake) == sorted([STATE, MANIFEST])
+
+
+def test_publish_current_leaves_an_existing_release_as_it_was_created(
+    gh, fake, tmp_path
+):
+    # `latest` applies when a publish creates the release. A stream that asks for it on
+    # every run, whether or not the run creates the release, must find it unchanged.
+    v1, v2 = build(tmp_path, "v1"), build(tmp_path, "v2")
+    publish(gh, v1, bootstrap=True)
+    fake.calls.clear()
+
+    publish_current(
+        gh, STREAM, list(v2.files.values()), v2.manifest, bootstrap=False, latest=True
+    )
+
+    created = fake.release(TAG)
+    assert created["prerelease"] is True
+    assert created["make_latest"] == "false"
+    assert held(fake, STATE) == v2.files[STATE].read_bytes()
+    assert ("POST", f"{API}/releases") not in writes(fake), "no release is created"
+
+
 def test_publish_without_bootstrap_on_missing_release_refuses(gh, fake, tmp_path):
     v1 = build(tmp_path, "v1")
 
