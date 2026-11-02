@@ -4,7 +4,10 @@ the stream's published manifest alone.
 A release listing can show a publish half made, and the names of a stream's files are its
 own business. The manifest is swapped in last, after the files that it lists, and each of
 its entries gives the tag, role, period, format, closed flag and tables of an asset. So
-every rule here reads those and nothing else, and none reads a name.
+the choice of the assets to read, and of those that a pin names, rests on those and
+never on a name. A name still counts in two places: the order of assets breaks a tie of
+periods by name, so that it is the same every time, and the fingerprint hashes each
+asset's release and name with its sha256.
 
 The assets of `<stream>-current` that have the role state are the state, which has no
 period, and the open delta, whose period is the day of the stream's latest run. What a

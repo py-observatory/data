@@ -153,6 +153,15 @@ def select(db: Path, query: str) -> list[tuple]:
         return con.execute(query).fetchall()
 
 
+def assert_carried(out: Path, previous: Path, stream: str) -> None:
+    """Every table of `stream` in the database `out` holds what it held in `previous`,
+    row for row, and holds something, so that the comparison says something."""
+    for table in SOURCED[stream]:
+        query = f"SELECT * FROM {table} ORDER BY 1, 2"
+        assert select(out, query) == select(previous, query), table
+        assert select(out, query), table
+
+
 def a_registry(gh, tmp_path, *, day: str = FIRST) -> StreamInput:
     """A registry with a project, foo, at 1.0 and 1.1, and a removed and a quarantined
     one, with records and events that fill every table that a registry fills."""
@@ -246,10 +255,7 @@ def test_a_stream_without_input_keeps_its_tables_from_the_previous_build(gh, tmp
     report = build_serving(out, [carried(registry), osv], previous)
 
     assert report.carried == ["pypi-registry"]
-    for table in ("project", "release", "change", "event", "requirement"):
-        query = f"SELECT * FROM {table} ORDER BY 1, 2"
-        assert select(out, query) == select(previous, query)
-        assert select(out, query), table
+    assert_carried(out, previous, "pypi-registry")
     assert select(
         out, "SELECT stream, generated_at, data_through, carried FROM input"
         " WHERE stream = 'pypi-registry'"
@@ -283,6 +289,7 @@ def test_carried_advisories_meet_new_releases(gh, tmp_path):
     report = build_serving(out, [new, carried(osv)], previous)
 
     assert report.carried == ["osv-pypi"]
+    assert_carried(out, previous, "osv-pypi")
     assert select(out, "SELECT version FROM affected ORDER BY version") == [
         ("1.0",),
         ("1.5",),
