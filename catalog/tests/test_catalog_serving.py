@@ -93,6 +93,7 @@ def stream_input(stream: str, manifest: Manifest, assets, staged) -> StreamInput
         stream=stream,
         generated_at=manifest.generated_at,
         data_through=manifest.data_through,
+        complete=manifest.complete,
         fingerprint=fingerprint(assets),
         licences=manifest.licences,
         staged=staged,
@@ -129,11 +130,14 @@ def osv_input(
 
 
 def carried(item: StreamInput) -> StreamInput:
-    """The input as a build has it when the stream could not be read."""
+    """The input as a build has it when the stream could not be read. Its values are
+    not those of `item`, so that a test sees that the carried rows do not come from
+    it."""
     return StreamInput(
         stream=item.stream,
         generated_at="2099-01-01T00:00:00Z",
         data_through=Watermark("ignored", "day"),
+        complete=not item.complete,
         fingerprint="ignored",
         licences=[],
         staged=None,
@@ -257,9 +261,9 @@ def test_a_stream_without_input_keeps_its_tables_from_the_previous_build(gh, tmp
     assert report.carried == ["pypi-registry"]
     assert_carried(out, previous, "pypi-registry")
     assert select(
-        out, "SELECT stream, generated_at, data_through, carried FROM input"
+        out, "SELECT stream, generated_at, data_through, complete, carried FROM input"
         " WHERE stream = 'pypi-registry'"
-    ) == [("pypi-registry", registry.generated_at, registry.data_through.value, 1)]  # fmt: skip
+    ) == [("pypi-registry", registry.generated_at, registry.data_through.value, 1, 1)]  # fmt: skip
     assert select(
         out,
         "SELECT upstream FROM attribution WHERE stream = 'pypi-registry'",

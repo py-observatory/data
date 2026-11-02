@@ -33,15 +33,17 @@ STATUS_KINDS = (
     "status_changed",
 )
 
-# Every project of the state, numbered in name order. A project has no release yet, so it
-# counts none.
+# Every project of the state, numbered in name order. A project has no release yet, so a
+# swept one counts none. One that is not swept, whose page has not been read in full,
+# has a count that is not known, and 0 would read as a project with no release.
 _INSERT_PROJECTS = """
 INSERT INTO main.project (
-    project_id, name, incarnation, status, first_seen, first_seen_exact, releases
+    project_id, name, incarnation, status, first_seen, first_seen_exact, swept, releases
 )
 SELECT
     row_number() OVER (ORDER BY name),
-    name, incarnation, status, first_seen, first_seen_exact, 0
+    name, incarnation, status, first_seen, first_seen_exact, swept,
+    CASE WHEN swept THEN 0 END
 FROM state.projects
 """
 
@@ -83,11 +85,14 @@ ORDER BY project_id, version
 """
 
 # The totals of each project's releases. `releases` counts those that have a file now, a
-# yanked release among them. `first_uploaded` is the earliest upload of any release,
-# including one whose files have all gone.
+# yanked release among them, and stays unknown for a project that is not swept.
+# `first_uploaded` is the earliest upload of any release, including one whose files have
+# all gone.
 _SET_RELEASE_TOTALS = """
 UPDATE main.project
-SET releases = totals.releases, first_uploaded = totals.first_uploaded
+SET
+    releases = CASE WHEN project.swept THEN totals.releases END,
+    first_uploaded = totals.first_uploaded
 FROM (
     SELECT
         project_id,

@@ -14,9 +14,9 @@ Months and pins are prereleases, so they never show as Latest.
 
 Ids (`project_id`, `advisory_id`, `requirement_id`, `classifier_id`) are made afresh by each build, in name order for projects and in id order for advisories, so link rows by name, and by version, and not by id across builds.
 
-- `input`: one row for each stream that the build read, with the time of its manifest, its `data_through`, its fingerprint, and `carried`, which is 1 when the stream could not be read and its tables are the previous build's.
+- `input`: one row for each stream that the build read, with the time of its manifest, its `data_through`, its fingerprint, `complete`, which is 1 when the stream's manifest says that its data is complete, and `carried`, which is 1 when the stream could not be read and its tables are the previous build's. A carried stream keeps the row of the build that read it, `complete` included. The manifest's coverage says `complete` of each stream in the same way.
 - `attribution`: the upstreams of each stream and their licences and terms, as the stream's manifest gives them.
-- `project`: each project name (PEP 503) in its current incarnation, the removed and quarantined included, with its status, when it was first seen and first uploaded, how many releases have a file now, its latest version, and the fields of the release that `record_version` names.
+- `project`: each project name (PEP 503) in its current incarnation, the removed and quarantined included, with its status, when it was first seen and first uploaded, `swept`, which is 1 once the registry has read the project's own page in full, how many releases have a file now, its latest version, and the fields of the release that `record_version` names. A project that is not swept is known by its name alone, so it has no releases listed and its `releases` is empty, because 0 would read as a project with no release.
 - `release`: each release of a project's current incarnation, with the time of its earliest upload, how many files it has, whether every one is yanked, the reason, and whether its record is known.
 - `change`: for each recorded release, the fields that it changed from the release recorded before it. The first record lists every field that is not empty, with `compared_with` empty, so it is never a change.
 - `requirement_text` and `requirement`: the requirements of each project's `record_version`, with the text of each kept once, and the project that each one names.
@@ -35,6 +35,9 @@ A project's latest version is the highest PEP 440 version among its releases tha
 ## What is not there yet
 
 - Download numbers. They come from a stream that is not published yet, and the catalog adds their tables when it is.
+- All of PyPI, while a stream's data is not complete. The registry's manifest says `complete: false` until its sweep has read the page of every project, and the stream's `input` row then says `complete = 0`. Until then, what is counted over the whole of PyPI (`growth`, `licence` and the counts of `classifier`) covers only what the streams have read, and each project that the registry has not read has `swept = 0`.
+- Releases whose files carry no version that can be read (old eggs, `.exe` installers, legacy sdist names), which are about 0.15% of releases. Such a release has `files` and `uploaded` empty. It does not count in `releases` or `growth`, and it is never a project's latest version.
+- Releases deleted before the registry began. `growth` and `first_uploaded` leave them out until the registry's history fill.
 - The fields of a release's record (the summary, requirements, classifiers and the rest) exist only for releases uploaded since 2026-11-01. The registry's history fill will add the earlier ones, and the catalog picks them up as it lands. Until then `has_record` is 0 for them, a project whose releases all lack a record has empty fields, and `change` has no rows for them.
 
 ## When a stream cannot be read, and when it is stale

@@ -162,10 +162,10 @@ def _seen(read: StreamRead, last: dict[str, dict], now: datetime) -> dict:
     """What the run knows of a stream, as its coverage gives it, but for `stale`.
 
     `last` is the coverage of each stream in the last build. A stream that was read
-    gives its manifest's values. Its data_through_since is the last build's while its
-    data_through is unchanged, and `now` once it has changed, so it says when the
-    catalog first saw the value. A stream that could not be read keeps the last
-    build's values (see `_carried`).
+    gives its manifest's values, whether its data is complete among them. Its
+    data_through_since is the last build's while its data_through is unchanged, and
+    `now` once it has changed, so it says when the catalog first saw the value. A
+    stream that could not be read keeps the last build's values (see `_carried`).
     """
     if read.manifest is None or read.fingerprint is None:
         return _carried(read.stream, last, read.error or "")
@@ -177,6 +177,7 @@ def _seen(read: StreamRead, last: dict[str, dict], now: datetime) -> dict:
         since = instant(now)
     return {
         "carried": False,
+        "complete": read.manifest.complete,
         "data_through": data_through,
         "data_through_since": since,
         "error": None,
@@ -187,7 +188,8 @@ def _seen(read: StreamRead, last: dict[str, dict], now: datetime) -> dict:
 
 def _carried(stream: str, last: dict[str, dict], error: str) -> dict:
     """The coverage of a stream whose tables are carried from the last build: what the
-    last build read of it, and `error`, which says why it could not be read or staged.
+    last build read of it, whether its data was complete included, and `error`, which
+    says why it could not be read or staged.
 
     Raises CarryError when the last build lacks the stream, and so always on a
     bootstrap, which has no last build: there is nothing to carry.
@@ -200,6 +202,7 @@ def _carried(stream: str, last: dict[str, dict], error: str) -> dict:
         )
     return {
         "carried": True,
+        "complete": before["complete"],
         "data_through": before["data_through"],
         "data_through_since": before["data_through_since"],
         "error": error,
@@ -354,6 +357,7 @@ def _input(
         stream=stream,
         generated_at=known["generated_at"],
         data_through=Watermark(**known["data_through"]),
+        complete=known["complete"],
         fingerprint=known["fingerprint"],
         licences=licences,
         staged=staged,

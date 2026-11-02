@@ -107,7 +107,8 @@ def _osv_data_through(open_day: str) -> Watermark:
     return Watermark(f"{open_day}T00:00:00Z", "instant")
 
 
-# The first incarnation of a project is 1.
+# The first incarnation of a project is 1. A project is swept, its page read in full, as
+# every project that has a release is.
 _REGISTRY = _Stream(
     id=pypi_registry.STREAM,
     state_schema=registry_store.STATE_SCHEMA,
@@ -119,7 +120,7 @@ _REGISTRY = _Stream(
             "incarnation": 1,
             "last_serial": 0,
             "status": "active",
-            "swept": 0,
+            "swept": 1,
             "first_seen": TIME,
             "first_seen_exact": 0,
         },
@@ -158,6 +159,7 @@ def publish_registry(
     open_delta: Rows,
     sealed: Mapping[str, Rows] | None = None,
     parts: Mapping[str, Rows] | None = None,
+    complete: bool = True,
 ) -> Manifest:
     """Publish pypi-registry as its run on `open_day` leaves it, and return the live
     manifest.
@@ -173,11 +175,20 @@ def publish_registry(
     The manifest says that the publish was made at the start of `open_day`, and that the
     data reaches the serial of that day (see `_registry_data_through`). Its licences are
     the upstreams that the stream's stream.toml names, as a run gives them. The catalog
-    reads nothing more of a stream's manifest than those and the assets, so the coverage
-    is empty, there is no cursor, and the data is complete.
+    reads nothing more of a stream's manifest than those, the assets and whether the
+    data is complete, so the coverage is empty and there is no cursor. The data is
+    complete unless `complete` says otherwise, as the registry's is not until its sweep
+    has read every project.
     """
     return _publish(
-        gh, _REGISTRY, state, open_day, open_delta, sealed or {}, parts or {}
+        gh,
+        _REGISTRY,
+        state,
+        open_day,
+        open_delta,
+        sealed or {},
+        parts or {},
+        complete=complete,
     )
 
 
@@ -189,6 +200,7 @@ def publish_osv(
     generated_at: str | None = None,
     sealed: Mapping[str, Rows] | None = None,
     parts: Mapping[str, Rows] | None = None,
+    complete: bool = True,
 ) -> Manifest:
     """Publish osv-pypi as its run on `open_day`, given as YYYY-MM-DD, leaves it, and
     return the live manifest.
@@ -201,6 +213,7 @@ def publish_osv(
     start of `open_day`, as an instant (see `_osv_data_through`). `generated_at`, when
     given, is the time that the manifest says the publish was made, in place of the
     start of `open_day`, for a test of a stream whose publish is older than its last.
+    `complete` is as `publish_registry`'s.
     """
     return _publish(
         gh,
@@ -211,6 +224,7 @@ def publish_osv(
         sealed or {},
         parts or {},
         generated_at=generated_at,
+        complete=complete,
     )
 
 
@@ -224,9 +238,11 @@ def _publish(
     parts: Mapping[str, Rows],
     *,
     generated_at: str | None = None,
+    complete: bool = True,
 ) -> Manifest:
     """Publish `stream` as `publish_registry` says, and return the manifest. Its
-    `generated_at` is the start of `open_day` unless `generated_at` gives another.
+    `generated_at` is the start of `open_day` unless `generated_at` gives another, and
+    it says that the data is complete unless `complete` is False.
 
     The files go up as a run puts them up: first those of the month releases, each to
     the release that its entry names, and then the state and the open delta, which
@@ -240,7 +256,7 @@ def _publish(
         stream=stream.id,
         producer=producer(gh.repo),
         generated_at=generated_at or f"{open_day}T00:00:00Z",
-        complete=True,
+        complete=complete,
         coverage={},
         data_through=stream.data_through(open_day),
         cursor=None,

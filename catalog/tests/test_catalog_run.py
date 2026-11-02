@@ -77,11 +77,13 @@ def registry(
     *names: str,
     sealed: tuple[str, ...] = (),
     created: tuple[str, ...] = (),
+    complete: bool = True,
 ) -> Manifest:
     """Publish the registry as its run on `day` leaves it, with a project of each of
     `names` that has a release 1.0, with its file and its record, an empty sealed delta
     of each day of `sealed`, and an event in the open delta for the creation of each
-    project of `created`."""
+    project of `created`. Its manifest says that the data is complete unless
+    `complete` is False."""
     state: dict[str, list[dict]] = {
         "projects": [],
         "versions_seen": [],
@@ -112,6 +114,7 @@ def registry(
         open_day=day,
         open_delta=delta,
         sealed={sealed_day: {} for sealed_day in sealed},
+        complete=complete,
     )
 
 
@@ -244,6 +247,7 @@ def test_bootstrap_publishes_catalog_current_as_the_latest_release(gh, fake, tmp
         "streams": {
             "pypi-registry": {
                 "carried": False,
+                "complete": True,
                 "data_through": {"granularity": "serial", "value": "20261102"},
                 "data_through_since": "2026-11-02T12:00:00Z",
                 "error": None,
@@ -253,6 +257,7 @@ def test_bootstrap_publishes_catalog_current_as_the_latest_release(gh, fake, tmp
             },
             "osv-pypi": {
                 "carried": False,
+                "complete": True,
                 "data_through": {
                     "granularity": "instant",
                     "value": "2026-11-01T00:00:00Z",
@@ -588,6 +593,47 @@ def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path, broken, err
     ]
     # What it had downloaded is gone.
     assert not (workdir / "osv-pypi").exists()
+
+
+def test_each_stream_says_whether_its_data_is_complete(gh, fake, tmp_path):
+    # The registry's sweep has not read every project yet.
+    registry(gh, FIRST, "foo", complete=False)
+    osv(gh, FIRST, "PYSEC-1")
+
+    assert run(gh, tmp_path, T0, bootstrap=True) == report(
+        built=True, reason="bootstrap"
+    )
+
+    manifest = published(fake)
+    streams = manifest.coverage["streams"]
+    assert (streams["pypi-registry"]["complete"], streams["osv-pypi"]["complete"]) == (
+        False,
+        True,
+    )
+    # The catalog read every stream, and none is stale, so its own data is complete.
+    assert manifest.complete is True
+    db = serving_db(fake, tmp_path)
+    assert select(db, "SELECT stream, complete FROM input ORDER BY stream") == [
+        ("osv-pypi", 1),
+        ("pypi-registry", 0),
+    ]
+
+    # The registry publishes data that it calls complete, and fails to stage, so the
+    # build carries it, with what the last build read of it.
+    registry(gh, SECOND, "foo")
+    fake.fail("GET", "name=pypi-registry-state.db.zst", 502, times=6)
+    assert run(gh, tmp_path, T0 + 24 * HOUR) == report(
+        built=True, reason="inputs changed", complete=False, carried=["pypi-registry"]
+    )
+
+    assert published(fake).coverage["streams"]["pypi-registry"]["complete"] is False
+    db = serving_db(fake, tmp_path)
+    assert select(
+        db, "SELECT stream, complete, carried FROM input ORDER BY stream"
+    ) == [
+        ("osv-pypi", 1, 0),
+        ("pypi-registry", 0, 1),
+    ]
 
 
 def test_a_stream_whose_data_through_stands_still_turns_stale(gh, fake, tmp_path):

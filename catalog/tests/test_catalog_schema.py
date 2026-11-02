@@ -78,9 +78,9 @@ def test_serving_schema_makes_every_table(serving_db):
 
 def test_search_is_fts5_over_project(serving_db):
     serving_db.executemany(
-        "INSERT INTO project "
-        "(name, incarnation, status, first_seen, first_seen_exact, releases, summary) "
-        "VALUES (?, 1, 'active', '2026-01-01T00:00:00Z', 1, 1, ?)",
+        "INSERT INTO project (name, incarnation, status, first_seen, "
+        "first_seen_exact, swept, releases, summary) "
+        "VALUES (?, 1, 'active', '2026-01-01T00:00:00Z', 1, 1, 1, ?)",
         [
             ("arrayfun", "Fast arrays for science"),
             ("webframe", "A small web framework"),

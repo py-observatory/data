@@ -284,6 +284,34 @@ def test_a_release_without_readable_files_has_no_upload_and_no_count(gh, tmp_pat
     ) == [(0, None, None)]
 
 
+def test_a_project_never_read_counts_no_releases(gh, tmp_path):
+    db = build(
+        gh,
+        tmp_path,
+        state={
+            "projects": [
+                {"name": "emptied"},
+                {"name": "kept"},
+                # Its page has not been read in full, so nothing is known of its
+                # releases.
+                {"name": "unread", "swept": 0},
+            ]
+        },
+        releases=[
+            release("emptied", "1.0", UPLOADED, removed=True),
+            release("kept", "1.0", UPLOADED),
+        ],
+    )
+
+    # A project that was read and has no file now has no release, which is 0. One
+    # that was never read has a count that is not known.
+    assert select(db, "SELECT name, swept, releases FROM project ORDER BY name") == [
+        ("emptied", 1, 0),
+        ("kept", 1, 1),
+        ("unread", 0, None),
+    ]
+
+
 def test_latest_version_prefers_finals_and_skips_yanked_and_removed(gh, tmp_path):
     assert latest_version(["1.0", "2.0rc1"]) == "1.0"
     assert latest_version(["2.0rc1"]) == "2.0rc1"

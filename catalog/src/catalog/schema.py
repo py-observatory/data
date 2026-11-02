@@ -13,13 +13,19 @@ CATALOG = "catalog"
 SERVING_DB = "catalog.db"
 
 SERVING_SCHEMA = """
--- What the build read: one row for each admitted stream.
+-- What the build read: one row for each admitted stream. A carried stream keeps the row
+-- that the previous build wrote, `complete` included, with `carried` set. A stream's data
+-- is complete when its manifest says so: the registry's is not until its sweep has read
+-- the page of every project. While a stream's data is not complete, what is counted over
+-- the whole of PyPI (`growth`, `licence` and `classifier.projects`) counts only what the
+-- streams have read.
 CREATE TABLE input (
     stream TEXT PRIMARY KEY,
     generated_at TEXT NOT NULL,        -- the stream's manifest
     data_through TEXT NOT NULL,
     granularity TEXT NOT NULL,
     fingerprint TEXT NOT NULL,         -- of the assets read (inputs.fingerprint)
+    complete INTEGER NOT NULL,         -- 1: the stream's manifest says that its data is complete
     carried INTEGER NOT NULL           -- 1: the stream could not be read, and its tables are the previous build's
 ) WITHOUT ROWID;
 
@@ -34,6 +40,8 @@ CREATE TABLE attribution (
 ) WITHOUT ROWID;
 
 -- Each project name in its current incarnation, the removed and quarantined included.
+-- A project whose own page the registry has not read in full (`swept` 0) is known by its
+-- name alone, so it has no release rows, and its count of releases is not known.
 CREATE TABLE project (
     project_id INTEGER PRIMARY KEY,    -- in name order, for this build only
     name TEXT NOT NULL UNIQUE,         -- PEP 503
@@ -42,8 +50,9 @@ CREATE TABLE project (
     status_since TEXT,                 -- when the last event that sets a status was observed
     first_seen TEXT NOT NULL,
     first_seen_exact INTEGER NOT NULL,
+    swept INTEGER NOT NULL,            -- 1 once the registry has read the project's own page in full
     first_uploaded INTEGER,            -- the earliest upload of any release, Unix seconds
-    releases INTEGER NOT NULL,         -- releases that have a file now
+    releases INTEGER,                  -- releases that have a file now (see release); NULL while swept is 0
     latest_version TEXT,
     record_version TEXT,               -- the release whose record gives the fields below
     name_raw TEXT,
@@ -56,7 +65,12 @@ CREATE TABLE project (
     keywords TEXT
 );
 
--- Each release of a project's current incarnation.
+-- Each release of a project's current incarnation. A release whose files carry no
+-- version that can be read (old eggs, .exe installers, legacy sdist names) has `uploaded`
+-- and `files` NULL: it does not count in `project.releases` or `growth`, and it is never
+-- the latest version. That is about 0.15% of releases. `growth` and
+-- `project.first_uploaded` leave out the releases deleted before the registry began,
+-- until its history fill.
 CREATE TABLE release (
     project_id INTEGER NOT NULL,
     version TEXT NOT NULL,             -- canonical PEP 440, or as written when PEP 440 refuses it

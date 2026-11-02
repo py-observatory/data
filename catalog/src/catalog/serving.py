@@ -34,13 +34,15 @@ BUDGET_BYTES = 200_000_000
 @dataclass(frozen=True)
 class StreamInput:
     """What the build has of one stream: its manifest's time, the watermark of its data,
-    the fingerprint of the assets read, and its licences as its manifest lists them.
-    `staged` is what the builders read, or None when the stream could not be read and
-    its tables are to be carried over from the previous build."""
+    whether its manifest says that the data is complete, the fingerprint of the assets
+    read, and its licences as its manifest lists them. `staged` is what the builders
+    read, or None when the stream could not be read and its tables are to be carried
+    over from the previous build."""
 
     stream: str
     generated_at: str
     data_through: Watermark
+    complete: bool
     fingerprint: str
     licences: list[dict]
     staged: RegistryStage | OsvStage | None
@@ -80,8 +82,10 @@ BUILDERS: dict[str, Callable[..., int]] = {
 }
 
 _INSERT_INPUT = """
-INSERT INTO main.input (stream, generated_at, data_through, granularity, fingerprint, carried)
-VALUES (?, ?, ?, ?, ?, 0)
+INSERT INTO main.input (
+    stream, generated_at, data_through, granularity, fingerprint, complete, carried
+)
+VALUES (?, ?, ?, ?, ?, ?, 0)
 """
 
 _INSERT_ATTRIBUTION = """
@@ -92,8 +96,10 @@ VALUES (?, ?, ?, ?, ?)
 _PREVIOUS_INPUT = "SELECT 1 FROM previous.input WHERE stream = ?"
 
 _CARRY_INPUT = """
-INSERT INTO main.input (stream, generated_at, data_through, granularity, fingerprint, carried)
-SELECT stream, generated_at, data_through, granularity, fingerprint, 1
+INSERT INTO main.input (
+    stream, generated_at, data_through, granularity, fingerprint, complete, carried
+)
+SELECT stream, generated_at, data_through, granularity, fingerprint, complete, 1
 FROM previous.input WHERE stream = ?
 """
 
@@ -162,6 +168,7 @@ def _write_input(con: sqlite3.Connection, item: StreamInput) -> None:
             item.data_through.value,
             item.data_through.granularity,
             item.fingerprint,
+            int(item.complete),
         ),
     )
     con.executemany(
