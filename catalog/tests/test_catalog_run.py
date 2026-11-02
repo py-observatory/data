@@ -1,8 +1,10 @@
+import hashlib
 import json
 import sqlite3
 import tempfile
 from collections.abc import Callable
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +20,7 @@ from catalog_helpers import REPO, TOKEN, no_sleep, publish_osv, publish_registry
 from obskit.gates import GateError
 from obskit.github import GitHub, GitHubError
 from obskit.manifest import Manifest, Watermark, instant, loads
-from obskit.release import CreateOnceError, add_create_once
+from obskit.release import CreateOnceError, add_create_once, publish_current
 from obskit.testing import FakeGitHub
 from obskit.zst import decompress_file
 
@@ -446,13 +448,70 @@ def test_a_carried_stream_that_can_be_read_again_is_rebuilt(
     ]
 
 
-def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path):
+def damage_osv_state(
+    gh: GitHub, fake: FakeGitHub, tmp_path: Path, damage: Callable[[bytes], bytes]
+) -> None:
+    """Publish osv-pypi again with the compressed bytes of its state put through
+    `damage`, and a manifest that gives the damaged bytes' sha256, as a stream that
+    published a damaged file would. The download then matches its entry, and only
+    expanding it fails."""
+    tag = "osv-pypi-current"
+    manifest = loads(fake.asset_bytes(tag, "manifest.json").decode())
+    work = Path(tempfile.mkdtemp(prefix="damaged-", dir=tmp_path))
+    files = []
+    assets = []
+    for asset in manifest.assets:
+        if asset.tag == tag:
+            data = fake.asset_bytes(tag, asset.name)
+            if asset.name == "osv-pypi-state.db.zst":
+                data = damage(data)
+                asset = replace(asset, asset_sha256=hashlib.sha256(data).hexdigest())
+            (work / asset.name).write_bytes(data)
+            files.append(work / asset.name)
+        assets.append(asset)
+    publish_current(
+        gh, "osv-pypi", files, replace(manifest, assets=assets), bootstrap=False
+    )
+
+
+def osv_state_502(gh: GitHub, fake: FakeGitHub, tmp_path: Path) -> None:
+    """Every attempt to download osv's state gets a 502."""
+    fake.fail("GET", "name=osv-pypi-state.db.zst", 502, times=6)
+
+
+def osv_state_cut_short(gh: GitHub, fake: FakeGitHub, tmp_path: Path) -> None:
+    """osv's state is published cut off halfway, so zstd finds no end to it."""
+    damage_osv_state(gh, fake, tmp_path, lambda data: data[: len(data) // 2])
+
+
+def osv_state_not_zstd(gh: GitHub, fake: FakeGitHub, tmp_path: Path) -> None:
+    """osv's state is published as bytes that are not zstd at all."""
+    damage_osv_state(gh, fake, tmp_path, lambda data: b"not zstd " * 16)
+
+
+@pytest.mark.parametrize(
+    ("broken", "error"),
+    [
+        pytest.param(osv_state_502, "HTTP 502", id="a failed download"),
+        pytest.param(
+            osv_state_cut_short,
+            "ended before the end-of-stream marker",
+            id="a file cut short",
+        ),
+        pytest.param(
+            osv_state_not_zstd,
+            "Unable to decompress Zstandard data",
+            id="a file that is not zstd",
+        ),
+    ],
+)
+def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path, broken, error):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
     run(gh, tmp_path, T0, bootstrap=True)
     before = published(fake).coverage["streams"]["osv-pypi"]
     osv(gh, SECOND, "PYSEC-1", "PYSEC-2")
-    fake.fail("GET", "name=osv-pypi-state.db.zst", 502, times=6)
+    broken(gh, fake, tmp_path)
     workdir = tmp_path / "work"
     workdir.mkdir()
 
@@ -469,7 +528,7 @@ def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path):
     assert result == report(built=True, reason="inputs changed", carried=["osv-pypi"])
     entry = published(fake).coverage["streams"]["osv-pypi"]
     assert entry["carried"] is True
-    assert "HTTP 502" in entry["error"]
+    assert error in entry["error"]
     # What the catalog knows of the stream is what the last build read, and not what
     # the manifest that it could not stage says.
     kept = ("data_through", "data_through_since", "generated_at", "fingerprint")

@@ -44,6 +44,7 @@ import os
 import shutil
 import sqlite3
 import warnings
+from compression.zstd import ZstdError
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -87,10 +88,19 @@ from catalog.stage import STAGERS, OsvStage, RegistryStage
 _BUILDS = frozenset({"bootstrap", "month began", "inputs changed", "heartbeat"})
 
 # What makes a stream that was read fail to stage, and so be carried: a release that
-# does not hold what its manifest lists, a failed download, a database that is not of
-# its stream's schema, a record or an event in two parts, a part that lacks a column,
-# and a full disk.
-_STAGE_ERRORS = (PriorStateError, GitHubError, ValueError, sqlite3.Error, OSError)
+# does not hold what its manifest lists, a failed download, a file that matches its
+# digest but will not expand (cut short, which is an EOFError, or not zstd at all), a
+# database that is not of its stream's schema, a record or an event in two parts, a part
+# that lacks a column, and a full disk.
+_STAGE_ERRORS = (
+    PriorStateError,
+    GitHubError,
+    ZstdError,
+    EOFError,
+    ValueError,
+    sqlite3.Error,
+    OSError,
+)
 
 
 @dataclass(frozen=True)
