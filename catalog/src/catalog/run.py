@@ -123,10 +123,11 @@ class RunReport:
     unchanged. `complete` is what the manifest that catalog-current holds once the run
     ends says of the data: the new manifest for a build, and the last build's for a run
     that builds nothing, which can still say that a stream was carried or stale.
-    `carried` names the streams whose tables the build took from the last build, `stale` those whose data_through has stood still for too long, and
-    `unreadable` those whose release could not be read, each in the order of
-    catalog.toml. `pins` names the releases of the daily pins that the run wrote, in
-    day order, and `month_copy` the release of the month's copy that it made, or None.
+    `carried` names the streams whose tables the build took from the last build,
+    `stale` those whose data_through has stood still for too long, and `unreadable`
+    those whose release could not be read, each in the order of catalog.toml. `pins`
+    names the releases of the daily pins that the run wrote, in day order, and
+    `month_copy` the release of the month's copy that it made, or None.
     `unparsed_requirements` counts the requirements in the registry's records that PEP
     508 refused.
     """
@@ -634,5 +635,5 @@ def main(argv: list[str] | None = None) -> int:
             override_reason=args.override_reason or None,
         )
     print(json.dumps(asdict(report)))
-    found = report.carried or report.stale or report.unreadable
-    return 2 if found or not report.complete else 0
+    unwell = report.carried or report.stale or report.unreadable
+    return 2 if unwell or not report.complete else 0
