@@ -161,11 +161,13 @@ def run(
 
 
 def report(**changed) -> RunReport:
-    """The report of a run that built nothing and found every stream readable and
-    fresh, with the fields in `changed` changed."""
+    """The report of a run that built nothing, found every stream readable and fresh,
+    and left a catalog-current that says its data is complete, with the fields in
+    `changed` changed."""
     fields = {
         "built": False,
         "reason": "unchanged",
+        "complete": True,
         "carried": [],
         "stale": [],
         "unreadable": [],
@@ -397,6 +399,7 @@ def test_an_unreadable_stream_is_carried_from_the_previous_build(
     assert json.loads(capsys.readouterr().out) == {
         "built": True,
         "reason": "inputs changed",
+        "complete": False,
         "carried": ["pypi-registry"],
         "stale": [],
         "unreadable": ["pypi-registry"],
@@ -439,6 +442,7 @@ def test_a_carried_stream_that_can_be_read_again_is_rebuilt(
     assert run(gh, tmp_path, carried_at) == report(
         built=True,
         reason="inputs changed",
+        complete=False,
         carried=["pypi-registry"],
         unreadable=["pypi-registry"],
     )
@@ -446,7 +450,9 @@ def test_a_carried_stream_that_can_be_read_again_is_rebuilt(
     # The registry can be read again, with the assets that the last good build read,
     # so its fingerprint is the one recorded. It changed all the same, since the build
     # says that it was carried, and it waits for the min gap as any change does.
-    assert run(gh, tmp_path, carried_at + 30 * MINUTE) == report(reason="too soon")
+    assert run(gh, tmp_path, carried_at + 30 * MINUTE) == report(
+        reason="too soon", complete=False
+    )
     assert main_at(carried_at + HOUR, ["run"]) == 0
 
     printed = json.loads(capsys.readouterr().out)
@@ -462,6 +468,32 @@ def test_a_carried_stream_that_can_be_read_again_is_rebuilt(
         ("osv-pypi", 0),
         ("pypi-registry", 0),
     ]
+
+
+def test_a_run_that_builds_nothing_fails_while_the_catalog_is_incomplete(
+    gh, fake, tmp_path, main_at, capsys
+):
+    registry(gh, FIRST, "foo")
+    osv(gh, FIRST, "PYSEC-1")
+    run(gh, tmp_path, T0, bootstrap=True)
+    a_registry_502(fake)
+    carried_at = T0 + HOUR
+    assert main_at(carried_at, ["run"]) == 2
+    capsys.readouterr()
+
+    # The registry can be read again, and it is too soon to build. The run finds
+    # nothing wrong, but catalog-current still says that the registry was carried, so
+    # the run fails, and the catalog's issue stays open until a build says otherwise.
+    assert main_at(carried_at + 30 * MINUTE, ["run"]) == 2
+
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["built"], printed["reason"]) == (False, "too soon")
+    assert (printed["carried"], printed["stale"], printed["unreadable"]) == ([], [], [])
+    assert printed["complete"] is False
+
+    assert main_at(carried_at + HOUR, ["run"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["built"], printed["complete"]) == (True, True)
 
 
 def damage_osv_state(
@@ -541,7 +573,9 @@ def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path, broken, err
     )
 
     # It was read, so it is not unreadable, but its tables are the last build's.
-    assert result == report(built=True, reason="inputs changed", carried=["osv-pypi"])
+    assert result == report(
+        built=True, reason="inputs changed", complete=False, carried=["osv-pypi"]
+    )
     entry = published(fake).coverage["streams"]["osv-pypi"]
     assert entry["carried"] is True
     assert error in entry["error"]
@@ -572,7 +606,7 @@ def test_a_stream_whose_data_through_stands_still_turns_stale(gh, fake, tmp_path
     # which is longer than its 30.
     osv(gh, SECOND, "PYSEC-1", "PYSEC-2")
     assert run(gh, tmp_path, T0 + 31 * HOUR) == report(
-        built=True, reason="inputs changed", stale=["pypi-registry"]
+        built=True, reason="inputs changed", complete=False, stale=["pypi-registry"]
     )
     manifest = published(fake)
     streams = manifest.coverage["streams"]
@@ -583,7 +617,9 @@ def test_a_stream_whose_data_through_stands_still_turns_stale(gh, fake, tmp_path
     assert manifest.complete is False
 
     # A run that builds nothing still finds it stale.
-    assert run(gh, tmp_path, T0 + 32 * HOUR) == report(stale=["pypi-registry"])
+    assert run(gh, tmp_path, T0 + 32 * HOUR) == report(
+        complete=False, stale=["pypi-registry"]
+    )
 
 
 def test_a_stream_that_turns_stale_counts_as_a_change(gh, fake, tmp_path):
@@ -600,7 +636,7 @@ def test_a_stream_that_turns_stale_counts_as_a_change(gh, fake, tmp_path):
         reason="too soon", stale=["pypi-registry"]
     )
     assert run(gh, tmp_path, last_build + 50 * MINUTE) == report(
-        built=True, reason="inputs changed", stale=["pypi-registry"]
+        built=True, reason="inputs changed", complete=False, stale=["pypi-registry"]
     )
 
     manifest = published(fake)
@@ -623,6 +659,7 @@ def test_a_stream_that_turns_unreadable_counts_as_a_change(gh, fake, tmp_path):
     assert run(gh, tmp_path, T0 + 50 * MINUTE) == report(
         built=True,
         reason="inputs changed",
+        complete=False,
         carried=["pypi-registry"],
         unreadable=["pypi-registry"],
     )
@@ -633,7 +670,9 @@ def test_a_stream_that_turns_unreadable_counts_as_a_change(gh, fake, tmp_path):
 
     # Now the manifest says so, and a stream that stays unreadable changes nothing.
     a_registry_502(fake)
-    assert run(gh, tmp_path, T0 + 2 * HOUR) == report(unreadable=["pypi-registry"])
+    assert run(gh, tmp_path, T0 + 2 * HOUR) == report(
+        complete=False, unreadable=["pypi-registry"]
+    )
 
 
 def test_data_through_is_the_oldest_input_generated_at(gh, fake, tmp_path):
@@ -725,6 +764,7 @@ def test_main_prints_the_report_and_returns_its_code(
     assert json.loads(capsys.readouterr().out) == {
         "built": True,
         "reason": "bootstrap",
+        "complete": True,
         "carried": [],
         "stale": [],
         "unreadable": [],

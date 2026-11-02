@@ -206,9 +206,9 @@ jobs:
         # three minutes before the job does, which is time enough to open the issue.
         #
         # The run exits with 2 after it has published when a stream was carried from the
-        # last build, or is stale, or could not be read. That fails the step on purpose:
-        # the catalog's issue opens, and the first run that finds every stream well closes
-        # it.
+        # last build, or is stale, or could not be read, and a run that builds nothing
+        # exits with 2 while the last build says so. That fails the step on purpose: the
+        # catalog's issue opens, and the first run that finds every stream well closes it.
         #
         # The inputs name the stream that they are for, so this job takes `bootstrap`, and
         # the reason, only when they name catalog. On a scheduled run every input is an

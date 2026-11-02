@@ -36,7 +36,9 @@ records them.
 
 A first build needs every stream, so on a bootstrap a stream that cannot be read or
 staged stops the run. `main` exits 2, after the publish, when a stream was carried,
-stale or unreadable, so that the workflow opens its failure issue.
+stale or unreadable, so that the workflow opens its failure issue. A run that builds
+nothing exits 2 as well while the last build's manifest says that the data is
+incomplete, so that the issue stays open until a build says otherwise.
 """
 
 import argparse
@@ -118,8 +120,10 @@ class RunReport:
     `built` says whether it built and published, and `reason` why or why not:
     bootstrap, month began (the first run of a month), inputs changed, heartbeat, too
     soon (an input changed, and the last build is less than min_gap_minutes old) or
-    unchanged. `carried` names the streams whose tables the build took from the last
-    build, `stale` those whose data_through has stood still for too long, and
+    unchanged. `complete` is what the manifest that catalog-current holds once the run
+    ends says of the data: the new manifest for a build, and the last build's for a run
+    that builds nothing, which can still say that a stream was carried or stale.
+    `carried` names the streams whose tables the build took from the last build, `stale` those whose data_through has stood still for too long, and
     `unreadable` those whose release could not be read, each in the order of
     catalog.toml. `pins` names the releases of the daily pins that the run wrote, in
     day order, and `month_copy` the release of the month's copy that it made, or None.
@@ -129,6 +133,7 @@ class RunReport:
 
     built: bool
     reason: str
+    complete: bool
     carried: list[str]
     stale: list[str]
     unreadable: list[str]
@@ -500,6 +505,7 @@ def run_once(
         return RunReport(
             built=False,
             reason=reason,
+            complete=prior.complete,
             carried=[],
             stale=_stale(known),
             unreadable=unreadable,
@@ -555,6 +561,7 @@ def run_once(
     return RunReport(
         built=True,
         reason=reason,
+        complete=manifest.complete,
         carried=built.carried,
         stale=stale,
         unreadable=unreadable,
@@ -573,9 +580,11 @@ def main(argv: list[str] | None = None) -> int:
     removed afterwards, and SQLite's temporary files go in that folder too, unless
     SQLITE_TMPDIR is set. It prints the report as JSON. Every error propagates.
 
-    It returns 2 when a stream was carried, is stale or could not be read, so that the
-    workflow opens its failure issue, and 0 otherwise. A run that builds returns
-    either after its publish.
+    It returns 2 when a stream was carried, is stale or could not be read, and when a
+    run that builds nothing leaves catalog-current saying that the data is incomplete,
+    so that the workflow opens its failure issue, or keeps it open until a build finds
+    every stream well. It returns 0 otherwise. A run that builds returns either after
+    its publish.
     """
     parser = argparse.ArgumentParser(
         prog="python -m catalog",
@@ -621,4 +630,5 @@ def main(argv: list[str] | None = None) -> int:
             override_reason=args.override_reason or None,
         )
     print(json.dumps(asdict(report)))
-    return 2 if report.carried or report.stale or report.unreadable else 0
+    found = report.carried or report.stale or report.unreadable
+    return 2 if found or not report.complete else 0
