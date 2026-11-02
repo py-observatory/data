@@ -1,17 +1,30 @@
 name: tick
 
-# The daily run of the pypi-registry stream, every six hours. A run reads what changed on
-# PyPI since the last one and publishes it to the pypi-registry-current release. A normal
-# run takes 30 to 40 minutes, and one that has much to read stops starting projects after
-# 250 minutes (15,000 s, passed below). The step that runs it gives up after 327 minutes,
-# which leaves 77 to finish the project in hand, compress the state and publish. The job's
-# own limit is 330.
+# The daily run of two streams, every six hours, each in a job of its own: pypi-registry
+# and osv-pypi. The jobs do not wait for each other, and one that fails leaves the other
+# alone.
 #
-# Run it by hand with `bootstrap` to build the stream's first state. That is accepted only
-# for a stream that has never published. `override_reason` publishes although a publish
-# gate failed, and the manifest logs the reason.
+# pypi-registry reads what changed on PyPI since the last run and publishes it to the
+# pypi-registry-current release. A normal run takes 30 to 40 minutes, and one that has
+# much to read stops starting projects after 250 minutes (15,000 s, passed below). The
+# step that runs it gives up after 327 minutes, which leaves 77 to finish the project in
+# hand, compress the state and publish. The job's own limit is 330.
 #
-# The order of the first runs is in streams/pypi_registry/README.md, under "On GitHub".
+# osv-pypi reads OSV's index of changed advisories, fetches the records that moved since
+# the last run and publishes the changes to the osv-pypi-current release. It stops
+# fetching records after 20 minutes (1,200 s, passed below). The step that runs it gives
+# up after 27 minutes, which leaves 7 to finish the record in hand, compress the state
+# and publish. The job's own limit is 30.
+#
+# Run a stream by hand with `bootstrap` to build its first state. The input names the one
+# stream that it is for, and is accepted only for a stream that has never published.
+# `override_reason` publishes although a publish gate failed, and the manifest logs the
+# reason. It is for the one stream that `override_for` names, and a reason with no stream
+# named overrides nothing. On a scheduled run every input is empty, so it never
+# bootstraps or overrides either stream.
+#
+# The order of the first runs is in streams/pypi_registry/README.md and
+# streams/osv_pypi/README.md, under "On GitHub".
 
 on:
   schedule:
@@ -19,9 +32,21 @@ on:
   workflow_dispatch:
     inputs:
       bootstrap:
-        description: Build the first state (only for a stream that has never published)
-        type: boolean
-        default: false
+        description: Build this stream's first state (only if it has never published)
+        type: choice
+        options:
+          - none
+          - pypi-registry
+          - osv-pypi
+        default: none
+      override_for:
+        description: The stream that override_reason is for
+        type: choice
+        options:
+          - none
+          - pypi-registry
+          - osv-pypi
+        default: none
       override_reason:
         description: Publish although a gate failed, for this reason (the manifest logs it)
         type: string
@@ -53,17 +78,22 @@ jobs:
         # A hung run should end as a failed step, which `failure()` below matches, and not
         # as a job that timed out, which GitHub may count as cancelled. The step gives up
         # three minutes before the job does, which is time enough to open the issue.
+        #
+        # The inputs name the stream that they are for, so this job takes `bootstrap`, and
+        # the reason, only when they name pypi-registry. On a scheduled run every input is
+        # an empty string, so it takes neither.
         timeout-minutes: 327
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BOOTSTRAP: ${{ inputs.bootstrap }}
+          OVERRIDE_FOR: ${{ inputs.override_for }}
           OVERRIDE_REASON: ${{ inputs.override_reason }}
         run: |
           args=()
-          if [ "$BOOTSTRAP" = "true" ]; then
+          if [ "$BOOTSTRAP" = "pypi-registry" ]; then
             args+=(--bootstrap)
           fi
-          if [ -n "$OVERRIDE_REASON" ]; then
+          if [ -n "$OVERRIDE_REASON" ] && [ "$OVERRIDE_FOR" = "pypi-registry" ]; then
             args+=(--override-reason "$OVERRIDE_REASON")
           fi
           uv run --package pypi-registry python -m pypi_registry run \
@@ -76,3 +106,59 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh pypi-registry success
+
+  osv-pypi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+    # Only this job publishes osv-pypi-current, so its runs go one at a time. A run that
+    # is waiting is never started over one that is running. The group is the stream's
+    # own, so it never waits for a run of the registry, or for its sweep.
+    concurrency:
+      group: stream-osv-pypi
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - run: uv sync --locked --package osv-pypi
+      - name: Run osv-pypi
+        # A hung run should end as a failed step, which `failure()` below matches, and not
+        # as a job that timed out, which GitHub may count as cancelled. The step gives up
+        # three minutes before the job does, which is time enough to open the issue.
+        #
+        # The run exits with 2 after it has published when some records did not parse.
+        # That fails the step on purpose: the stream's issue opens, and the next run tries
+        # those records again.
+        #
+        # The inputs name the stream that they are for, so this job takes `bootstrap`, and
+        # the reason, only when they name osv-pypi. On a scheduled run every input is an
+        # empty string, so it takes neither.
+        timeout-minutes: 27
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          OVERRIDE_FOR: ${{ inputs.override_for }}
+          OVERRIDE_REASON: ${{ inputs.override_reason }}
+        run: |
+          args=()
+          if [ "$BOOTSTRAP" = "osv-pypi" ]; then
+            args+=(--bootstrap)
+          fi
+          if [ -n "$OVERRIDE_REASON" ] && [ "$OVERRIDE_FOR" = "osv-pypi" ]; then
+            args+=(--override-reason "$OVERRIDE_REASON")
+          fi
+          uv run --package osv-pypi python -m osv_pypi run --max-seconds 1200 "${args[@]}"
+      - if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh osv-pypi failure
+      - if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh osv-pypi success

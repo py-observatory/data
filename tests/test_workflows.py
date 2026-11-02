@@ -29,6 +29,7 @@ EXPECTED = ("backfill.yml", "smoke.yml", "test.yml", "tick.yml")
 # Every job that writes: the token's `contents: write` is for these alone.
 PUBLISH_JOBS = {
     ("tick.yml", "pypi-registry"),
+    ("tick.yml", "osv-pypi"),
     ("backfill.yml", "sweep"),
     ("smoke.yml", "smoke"),
 }
@@ -37,6 +38,7 @@ REPORT_JOB = ("backfill.yml", "report")
 # top level's, which is nothing or `contents: read`.
 PERMISSIONS = {
     ("tick.yml", "pypi-registry"): {"contents": "write", "issues": "write"},
+    ("tick.yml", "osv-pypi"): {"contents": "write", "issues": "write"},
     ("backfill.yml", "sweep"): {"contents": "write", "issues": "write"},
     ("backfill.yml", "redispatch"): {"actions": "write"},
     REPORT_JOB: {"actions": "write", "contents": "read", "issues": "write"},
@@ -45,6 +47,20 @@ PERMISSIONS = {
 # The jobs that dispatch a sweep: the next one, and one replaced while it waited.
 DISPATCH_JOBS = {("backfill.yml", "redispatch"), REPORT_JOB}
 REGISTRY_GROUP = {"group": "stream-pypi-registry", "cancel-in-progress": "false"}
+OSV_GROUP = {"group": "stream-osv-pypi", "cancel-in-progress": "false"}
+# The streams that tick.yml runs, each in a job named for it, and the command that the
+# run step of the job starts. `--bootstrap`, and `--override-reason` with its reason,
+# come after it when they are asked for.
+TICK_COMMANDS = {
+    "pypi-registry": [
+        *["uv", "run", "--package", "pypi-registry", "python", "-m", "pypi_registry"],
+        *["run", "--max-seconds", "15000"],
+    ],
+    "osv-pypi": [
+        *["uv", "run", "--package", "osv-pypi", "python", "-m", "osv_pypi"],
+        *["run", "--max-seconds", "1200"],
+    ],
+}
 SWEEP_COMMAND = [
     *["uv", "run", "--package", "pypi-registry", "python", "-m", "pypi_registry"],
     *["sweep", "--max-seconds", "15000"],
@@ -193,6 +209,23 @@ def one_script(file: str, name: str, mentions: str) -> str:
     """The one `run:` script of a job that contains `mentions`."""
     [script] = [s for s in run_scripts(job_of(file, name)) if mentions in s]
     return script
+
+
+def tick_run(stream: str) -> str:
+    """What the run step of a stream's job in tick.yml mentions, to find it by: the
+    stream's module and `run`."""
+    return f"{stream.replace('-', '_')} run"
+
+
+def tick_script(stream: str) -> str:
+    """The script of the step that runs `stream` in its job of tick.yml."""
+    return one_script("tick.yml", stream, tick_run(stream))
+
+
+def tick_step(stream: str) -> str:
+    """The text of the step that runs `stream` in its job of tick.yml."""
+    [step] = [s for s in steps(job_of("tick.yml", stream)) if tick_run(stream) in s]
+    return step
 
 
 def step_limit(file: str, job: str, mentions: str) -> int:
@@ -377,28 +410,38 @@ def test_job_timeouts_leave_room_after_the_run_budget():
     its job's so that the step fails and the failure issue is opened (a job that times
     out may count as cancelled). So the limits that apply are the steps'.
 
-    A tick and a sweep both stop starting projects after 15,000 s (250 minutes), and
-    then only the project in hand, the apply and the publish remain. A sweep always runs
-    to its deadline, and so does a tick that has much to read. The publish compresses a
-    state of about 2 GB late in the backfill, at 4 MB/s on a Mac and slower on a runner.
-    The tick's step of 327 minutes leaves 77 for that, and the sweep's of 297 leaves 47.
+    The registry's tick and sweep both stop starting projects after 15,000 s (250
+    minutes), and then only the project in hand, the apply and the publish remain. A
+    sweep always runs to its deadline, and so does a tick that has much to read. The
+    publish compresses a state of about 2 GB late in the backfill, at 4 MB/s on a Mac
+    and slower on a runner. The tick's step of 327 minutes leaves 77 for that, and the
+    sweep's of 297 leaves 47.
+
+    The osv-pypi tick stops fetching records after 1,200 s (20 minutes). Its state and
+    its open delta are each under the 81 MB that OSV's records add up to, which takes
+    a few minutes at most to compress on a runner. Its step of 27 minutes leaves 7 for
+    that and for the record in hand, so it needs none of the registry's room.
     """
     assert scalar(job_of("tick.yml", "pypi-registry"), "timeout-minutes", 4) == "330"
+    assert scalar(job_of("tick.yml", "osv-pypi"), "timeout-minutes", 4) == "30"
     assert scalar(job_of("backfill.yml", "sweep"), "timeout-minutes", 4) == "300"
     assert scalar(job_of("smoke.yml", "smoke"), "timeout-minutes", 4) == "15"
 
     assert step_limit("tick.yml", "pypi-registry", "pypi_registry run") == 327
+    assert step_limit("tick.yml", "osv-pypi", "osv_pypi run") == 27
     assert step_limit("backfill.yml", "sweep", "pypi_registry sweep") == 297
     assert step_limit("smoke.yml", "smoke", "obskit.smoke") == 12
 
-    for file, job, mentions in [
-        ("tick.yml", "pypi-registry", "pypi_registry run"),
-        ("backfill.yml", "sweep", "pypi_registry sweep"),
+    # The least room, in minutes, that each run leaves after its deadline.
+    for file, job, mentions, least in [
+        ("tick.yml", "pypi-registry", "pypi_registry run", 45),
+        ("tick.yml", "osv-pypi", "osv_pypi run", 5),
+        ("backfill.yml", "sweep", "pypi_registry sweep", 45),
     ]:
         budget = re.findall(r"--max-seconds (\d+)", one_script(file, job, mentions))
-        assert len(budget) == 1, f"{file}: --max-seconds must be passed once"
+        assert len(budget) == 1, f"{file}: {job}: --max-seconds must be passed once"
         room = step_limit(file, job, mentions) - int(budget[0]) / 60
-        assert room >= 45, f"{file}: {room:.0f} minutes are left after the deadline"
+        assert room >= least, f"{file}: {job}: {room:.0f} minutes are left"
 
 
 def test_actions_pinned_by_sha():
@@ -480,6 +523,55 @@ def test_registry_jobs_share_concurrency_group():
     assert set(registry) == {("tick.yml", "pypi-registry"), ("backfill.yml", "sweep")}
     for (file, name), body in registry.items():
         assert mapping(body, "concurrency", 4) == REGISTRY_GROUP, f"{file}: {name}"
+
+
+def test_the_osv_job_has_its_own_concurrency_group():
+    """Only the tick publishes osv-pypi-current, so it must never run twice at once,
+    and a run that has begun is never cancelled by a newer one. The group is not the
+    registry's: a run of one stream never waits for the other's, nor for a sweep."""
+    osv = {
+        (file, name): body
+        for file, name, body in all_jobs()
+        if "python -m osv_pypi" in body
+    }
+    assert set(osv) == {("tick.yml", "osv-pypi")}
+    assert mapping(osv["tick.yml", "osv-pypi"], "concurrency", 4) == OSV_GROUP
+    assert OSV_GROUP["group"] != REGISTRY_GROUP["group"]
+
+
+def test_the_osv_job_runs_beside_the_registry_job():
+    """osv-pypi is the tick's second stream. It is set up as the registry is, with the
+    same pinned checkout, which keeps no token, and the same pinned uv. It syncs its own
+    package only, publishes with the workflow's token and reports to its own rolling
+    issue. Nothing makes it wait for the registry's job or skip it: a registry run that
+    takes hours or fails must not hold the other stream back."""
+    jobs = split_jobs(workflows()["tick.yml"])[1]
+    assert list(jobs) == ["pypi-registry", "osv-pypi"]
+    registry, osv = jobs["pypi-registry"], jobs["osv-pypi"]
+    for job in (registry, osv):
+        assert entry(job, "needs", 4) is None
+        assert entry(job, "if", 4) is None
+    assert (
+        scalar(osv, "runs-on", 4) == scalar(registry, "runs-on", 4) == "ubuntu-latest"
+    )
+
+    texts = steps(osv)
+    in_order = [
+        "actions/checkout",
+        "astral-sh/setup-uv",
+        "uv sync --locked --package osv-pypi",
+        "osv_pypi run",
+        "rolling-issue.sh osv-pypi failure",
+        "rolling-issue.sh osv-pypi success",
+    ]
+    assert len(texts) == len(in_order)
+    for text, mentions in zip(texts, in_order, strict=True):
+        assert mentions in text
+    assert texts[:2] == steps(registry)[:2], (
+        "the registry's checkout and uv, as they are"
+    )
+    token = re.search(r"(?m)^\s+GITHUB_TOKEN:\s*(.*?)\s*$", texts[3])
+    assert token and token[1] == "${{ github.token }}", "the run publishes with it"
 
 
 def test_smoke_job_has_its_own_concurrency_group():
@@ -804,44 +896,80 @@ def test_sweep_passes_its_time_budget(tmp_path):
     assert call[call.index("sweep") :] == ["sweep", "--max-seconds", "15000"]
 
 
-def test_tick_passes_its_time_budget(tmp_path):
-    """15,000 s is 250 minutes, which leaves the rest of the step to publish."""
-    script = one_script("tick.yml", "pypi-registry", "pypi_registry run")
-    _, calls = run_step(tmp_path, script)
-    [call] = calls
-    assert call[call.index("pypi_registry") :] == [
-        *["pypi_registry", "run", "--max-seconds", "15000"]
-    ]
+@pytest.mark.parametrize("stream", sorted(TICK_COMMANDS))
+def test_tick_passes_its_time_budget(tmp_path, stream):
+    """The registry's 15,000 s is 250 minutes, which leaves the rest of its step to
+    publish. osv-pypi's 1,200 s is 20 of the 27 minutes of its step."""
+    _, calls = run_step(tmp_path, tick_script(stream))
+    assert calls == [TICK_COMMANDS[stream]]
 
 
-def test_tick_passes_bootstrap_and_a_reason_only_when_asked(tmp_path):
-    script = one_script("tick.yml", "pypi-registry", "pypi_registry run")
-    base = ["uv", "run", "--package", "pypi-registry", "python", "-m"]
-    base += ["pypi_registry", "run", "--max-seconds", "15000"]
+def tick_inputs(
+    bootstrap: str = "none", override_for: str = "none", reason: str = ""
+) -> dict[str, str]:
+    """What the inputs of a dispatch of tick.yml come to in the environment of a step.
+    The defaults are those of the dispatch: `none` for the two choices."""
+    return {
+        "BOOTSTRAP": bootstrap,
+        "OVERRIDE_FOR": override_for,
+        "OVERRIDE_REASON": reason,
+    }
+
+
+@pytest.mark.parametrize("stream", sorted(TICK_COMMANDS))
+def test_tick_passes_bootstrap_and_a_reason_only_for_its_own_stream(tmp_path, stream):
+    """`bootstrap` and `override_for` each name the one stream that they are for, so a
+    dispatch meant for one stream can never bootstrap the other, or publish it past its
+    gates. A job passes `--bootstrap`, and the reason, only when its own stream is the
+    one that is named, and a reason that names no stream overrides nothing.
+
+    A scheduled run has every input as an empty string, and a dispatch that leaves them
+    alone has `none` for the two choices. Neither may bootstrap or override a stream.
+    """
+    script = tick_script(stream)
+    other = next(name for name in TICK_COMMANDS if name != stream)
+    why = "PyPI removed 2,000 names"
+    odd = 'it\'s "odd" $HOME; ls'
     cases = [
-        # (what the inputs hold, the arguments after `run`)
-        ({}, []),  # a scheduled run has no inputs
-        ({"BOOTSTRAP": "false", "OVERRIDE_REASON": ""}, []),
-        ({"BOOTSTRAP": "true", "OVERRIDE_REASON": ""}, ["--bootstrap"]),
+        # (what the inputs hold, the arguments after the command)
+        ({}, []),  # no variable is set at all
+        (tick_inputs("", "", ""), []),  # a scheduled run
+        (tick_inputs(), []),  # a dispatch that leaves the inputs alone
+        (tick_inputs(bootstrap=stream), ["--bootstrap"]),
+        (tick_inputs(bootstrap=other), []),
+        (tick_inputs(bootstrap="true"), []),  # what the boolean input once said
+        (tick_inputs(override_for=stream, reason=why), ["--override-reason", why]),
+        (tick_inputs(override_for=other, reason=why), []),
+        (tick_inputs(reason=why), []),  # a reason that names no stream
+        (tick_inputs("", "", why), []),  # and one that a scheduled run could not have
+        (tick_inputs(override_for=stream), []),  # a stream, and no reason
         (
-            {"BOOTSTRAP": "false", "OVERRIDE_REASON": "PyPI removed 2,000 names"},
-            ["--override-reason", "PyPI removed 2,000 names"],
+            tick_inputs(bootstrap=stream, override_for=other, reason=why),
+            ["--bootstrap"],
         ),
         (
-            {"BOOTSTRAP": "true", "OVERRIDE_REASON": 'it\'s "odd" $HOME; ls'},
-            ["--bootstrap", "--override-reason", 'it\'s "odd" $HOME; ls'],
+            tick_inputs(bootstrap=other, override_for=stream, reason=why),
+            ["--override-reason", why],
+        ),
+        (
+            tick_inputs(bootstrap=stream, override_for=stream, reason=odd),
+            ["--bootstrap", "--override-reason", odd],
         ),
     ]
     for number, (inputs, extra) in enumerate(cases):
         done, calls = run_step(tmp_path / str(number), script, **inputs)
         assert done.returncode == 0, done.stderr
-        assert calls == [[*base, *extra]], inputs
+        assert calls == [[*TICK_COMMANDS[stream], *extra]], inputs
 
 
-def test_a_failing_run_fails_the_tick_step(tmp_path):
-    script = one_script("tick.yml", "pypi-registry", "pypi_registry run")
-    done, _ = run_step(tmp_path, script, STUB_EXIT="1")
-    assert done.returncode == 1
+@pytest.mark.parametrize("stream", sorted(TICK_COMMANDS))
+@pytest.mark.parametrize("code", [1, 2])
+def test_a_failing_run_fails_the_tick_step(tmp_path, stream, code):
+    """Any code that the run exits with fails the step, so that the step that opens the
+    issue runs. osv-pypi exits with 2 after it has published, when some records did not
+    parse, and that opens the issue too."""
+    done, _ = run_step(tmp_path, tick_script(stream), STUB_EXIT=str(code))
+    assert done.returncode == code
 
 
 def test_smoke_passes_bootstrap_only_when_asked(tmp_path):
@@ -861,20 +989,44 @@ def test_smoke_passes_bootstrap_only_when_asked(tmp_path):
 def test_inputs_reach_scripts_through_the_environment():
     """`${{ }}` inside a script is pasted into the shell before it runs, so an input
     holding `"; curl ...` would run. The expression goes in `env:` and the script reads
-    the variable."""
+    the variable. The tests that run the scripts set those variables themselves, so
+    this is where the step of each stream is held to getting each of the tick's three
+    inputs under the name that its script reads."""
     scripts = [s for _, _, body in all_jobs() for s in run_scripts(body)]
     assert len(scripts) >= 10
     assert [s for s in scripts if "${{" in s] == []
+
+    wanted = {
+        "BOOTSTRAP": "${{ inputs.bootstrap }}",
+        "OVERRIDE_FOR": "${{ inputs.override_for }}",
+        "OVERRIDE_REASON": "${{ inputs.override_reason }}",
+    }
+    for stream in TICK_COMMANDS:
+        env = dict(
+            re.findall(r"(?m)^\s+(\w+):\s*(\$\{\{.*\}\})\s*$", tick_step(stream))
+        )
+        assert {name: env.get(name) for name in wanted} == wanted, stream
 
 
 def test_triggers():
     tick = split_jobs(workflows()["tick.yml"])[0]
     assert re.search(r"(?m)^    - cron: [\"']23 \*/6 \* \* \*[\"']\s*$", tick)
     inputs = entry(entry(tick, "workflow_dispatch", 2)[1], "inputs", 4)[1]
-    bootstrap = entry(inputs, "bootstrap", 6)[1]
+    assert sorted(re.findall(r"(?m)^ {6}(\w+):", inputs)) == [
+        *["bootstrap", "override_for", "override_reason"]
+    ]
+    # Two choices, each of which names the one stream that it is for: `none` leaves both
+    # streams as they are, and a choice has no other value.
+    jobs = list(split_jobs(workflows()["tick.yml"])[1])
+    for name in ("bootstrap", "override_for"):
+        choice = entry(inputs, name, 6)[1]
+        assert scalar(choice, "type", 8) == "choice", name
+        assert sequence(choice, "options", 8) == ["none", "pypi-registry", "osv-pypi"]
+        assert scalar(choice, "default", 8) == "none", name
+        # A job of the tick that no option names could never be bootstrapped, and an
+        # option that no job has would bootstrap nothing.
+        assert sequence(choice, "options", 8)[1:] == jobs, name
     reason = entry(inputs, "override_reason", 6)[1]
-    assert scalar(bootstrap, "type", 8) == "boolean"
-    assert scalar(bootstrap, "default", 8) == "false"
     assert scalar(reason, "type", 8) == "string"
     assert scalar(reason, "default", 8) in ('""', "''")
 
@@ -895,11 +1047,13 @@ def test_triggers():
 
 def test_every_stream_job_reports_to_the_rolling_issue():
     """A run that fails opens (or adds to) the issue of its stream, and one that
-    succeeds closes it. The backfill has an issue of its own, and not the tick's: a good
-    tick says nothing about a sweep chain that stopped, and a good sweep says nothing
-    about whether the daily run is well. A sweep that exits with 0 or 3 is a success."""
+    succeeds closes it. Each stream of the tick has an issue of its own, and so has the
+    backfill: a good osv-pypi run says nothing about the registry's, a good tick says
+    nothing about a sweep chain that stopped, and a good sweep says nothing about
+    whether the daily run is well. A sweep that exits with 0 or 3 is a success."""
     expected = {
         ("tick.yml", "pypi-registry"): ("pypi-registry", ["failure", "success"]),
+        ("tick.yml", "osv-pypi"): ("osv-pypi", ["failure", "success"]),
         ("backfill.yml", "sweep"): ("pypi-registry-backfill", ["failure", "success"]),
         ("smoke.yml", "smoke"): ("kit-smoke", ["failure", "success"]),
     }

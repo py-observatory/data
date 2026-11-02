@@ -72,7 +72,9 @@ A sweep waits 1.25 seconds between requests, about 0.8 a second, so that the pag
 
 ### On GitHub
 
-`tick.yml` runs the daily run every six hours, `backfill.yml` runs the sweep as a chain of runs that each dispatch the next, and `smoke.yml` runs the kit's weekly smoke test. Start them in this order: push the repository, dispatch `tick.yml` with `bootstrap`, dispatch `smoke.yml` with `bootstrap`, and then dispatch `backfill.yml` to start the sweep. A scheduled tick or smoke run that comes before its bootstrap fails closed and opens its rolling issue. That is expected, and the first run that succeeds closes it.
+`tick.yml` runs the daily run every six hours, and the [osv-pypi](../osv_pypi/README.md) stream's run beside it, in a job of its own. `backfill.yml` runs the sweep as a chain of runs that each dispatch the next, and `smoke.yml` runs the kit's weekly smoke test. Start them in this order: push the repository, dispatch `tick.yml` with `bootstrap` set to `pypi-registry`, dispatch `smoke.yml` with `bootstrap`, and then dispatch `backfill.yml` to start the sweep. A scheduled tick or smoke run that comes before its bootstrap fails closed and opens its rolling issue. That is expected, and the first run that succeeds closes it.
+
+The tick's `bootstrap` names the one stream that it is for, and so does an override. `override_reason` publishes although a gate failed, and only for the stream that `override_for` names, so give both: `gh workflow run tick.yml -f override_for=pypi-registry -f override_reason='the reason'`. A reason without `override_for` overrides nothing. A bootstrap or an override that names osv-pypi leaves the registry's run an ordinary one, and the other way round.
 
 The tick and the sweep share one concurrency group, which holds one running job and one waiting job, and a job that queues replaces the one that waits. So during the two-week sweep the Actions page shows some cancelled ticks: a tick that queues behind a waiting tick replaces it, and so can a sweep that the backfill dispatches. This is harmless, because the next tick catches up.
 
