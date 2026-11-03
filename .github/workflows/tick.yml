@@ -2,7 +2,7 @@ name: tick
 
 # The daily run of two streams, every six hours, each in a job of its own: pypi-registry
 # and osv-pypi. The jobs do not wait for each other, and one that fails leaves the other
-# alone.
+# alone. The catalog's job follows them.
 #
 # pypi-registry reads what changed on PyPI since the last run and publishes it to the
 # pypi-registry-current release. A normal run takes 30 to 40 minutes, and one that has
@@ -16,12 +16,22 @@ name: tick
 # up after 27 minutes, which leaves 7 to finish the record in hand, compress the state
 # and publish. The job's own limit is 30.
 #
+# The catalog builds one serving database from what the two streams last published, and
+# publishes it to the catalog-current release. It has no time budget of its own: its step
+# gives up after 57 minutes, three before the job's limit of 60. Its job waits for
+# osv-pypi, which takes half an hour at most, so that a build follows the fresh advisories,
+# and runs whether or not osv-pypi succeeded, because a stream that failed is read from
+# its last publish. It does not wait for the registry's job, which can queue for hours
+# behind the sweep, and so reads the registry's last publish. The step after the build
+# keeps the scheduled runs enabled (scripts/keepalive.sh).
+#
 # Run a stream by hand with `bootstrap` to build its first state. The input names the one
 # stream that it is for, and is accepted only for a stream that has never published.
 # `override_reason` publishes although a publish gate failed, and the manifest logs the
 # reason. It is for the one stream that `override_for` names, and a reason with no stream
 # named overrides nothing. On a scheduled run every input is empty, so it never
-# bootstraps or overrides either stream.
+# bootstraps or overrides any stream. The first run of the catalog is a dispatch with
+# `bootstrap` set to catalog, once both streams have published.
 #
 # The order of the first runs is in streams/pypi_registry/README.md and
 # streams/osv_pypi/README.md, under "On GitHub".
@@ -38,6 +48,7 @@ on:
           - none
           - pypi-registry
           - osv-pypi
+          - catalog
         default: none
       override_for:
         description: The stream that override_reason is for
@@ -46,6 +57,7 @@ on:
           - none
           - pypi-registry
           - osv-pypi
+          - catalog
         default: none
       override_reason:
         description: Publish although a gate failed, for this reason (the manifest logs it)
@@ -162,3 +174,72 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh osv-pypi success
+
+  catalog:
+    # It waits for osv-pypi, which is short, and not for the registry's job, which can
+    # queue for hours behind the sweep: it reads the registry's last publish, and says in
+    # its manifest how old that is. `!cancelled()` runs it after an osv-pypi that failed
+    # too, because that stream is then read from its last publish.
+    needs: osv-pypi
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      issues: write
+    # Only this job publishes catalog-current, so its runs go one at a time. A run that
+    # is waiting is never started over one that is running.
+    concurrency:
+      group: catalog
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - run: uv sync --locked --package catalog
+      - name: Build the catalog
+        # A hung run should end as a failed step, which `failure()` below matches, and not
+        # as a job that timed out, which GitHub may count as cancelled. The step gives up
+        # three minutes before the job does, which is time enough to open the issue.
+        #
+        # The run exits with 2 after it has published when a stream was carried from the
+        # last build, or is stale, or could not be read, and a run that builds nothing
+        # exits with 2 while the last build says so. That fails the step on purpose: the
+        # catalog's issue opens, and the first run that finds every stream well closes it.
+        #
+        # The inputs name the stream that they are for, so this job takes `bootstrap`, and
+        # the reason, only when they name catalog. On a scheduled run every input is an
+        # empty string, so it takes neither.
+        timeout-minutes: 57
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          OVERRIDE_FOR: ${{ inputs.override_for }}
+          OVERRIDE_REASON: ${{ inputs.override_reason }}
+        run: |
+          args=()
+          if [ "$BOOTSTRAP" = "catalog" ]; then
+            args+=(--bootstrap)
+          fi
+          if [ -n "$OVERRIDE_REASON" ] && [ "$OVERRIDE_FOR" = "catalog" ]; then
+            args+=(--override-reason "$OVERRIDE_REASON")
+          fi
+          uv run --package catalog python -m catalog run "${args[@]}"
+      # Whatever happened to the build, so that a month of failed builds does not also let
+      # GitHub disable the scheduled runs. It comes before the steps of the issue, so that
+      # a keepalive that fails opens the issue as a failed build does.
+      - if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/keepalive.sh
+      - if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh catalog failure
+      - if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/rolling-issue.sh catalog success

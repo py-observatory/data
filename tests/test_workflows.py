@@ -16,6 +16,7 @@ import subprocess
 import sys
 import textwrap
 from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 SCRIPT = ROOT / "scripts" / "rolling-issue.sh"
+KEEPALIVE = ROOT / "scripts" / "keepalive.sh"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 EXPECTED = ("backfill.yml", "smoke.yml", "test.yml", "tick.yml")
 
@@ -30,6 +32,7 @@ EXPECTED = ("backfill.yml", "smoke.yml", "test.yml", "tick.yml")
 PUBLISH_JOBS = {
     ("tick.yml", "pypi-registry"),
     ("tick.yml", "osv-pypi"),
+    ("tick.yml", "catalog"),
     ("backfill.yml", "sweep"),
     ("smoke.yml", "smoke"),
 }
@@ -39,6 +42,7 @@ REPORT_JOB = ("backfill.yml", "report")
 PERMISSIONS = {
     ("tick.yml", "pypi-registry"): {"contents": "write", "issues": "write"},
     ("tick.yml", "osv-pypi"): {"contents": "write", "issues": "write"},
+    ("tick.yml", "catalog"): {"contents": "write", "issues": "write"},
     ("backfill.yml", "sweep"): {"contents": "write", "issues": "write"},
     ("backfill.yml", "redispatch"): {"actions": "write"},
     REPORT_JOB: {"actions": "write", "contents": "read", "issues": "write"},
@@ -48,6 +52,7 @@ PERMISSIONS = {
 DISPATCH_JOBS = {("backfill.yml", "redispatch"), REPORT_JOB}
 REGISTRY_GROUP = {"group": "stream-pypi-registry", "cancel-in-progress": "false"}
 OSV_GROUP = {"group": "stream-osv-pypi", "cancel-in-progress": "false"}
+CATALOG_GROUP = {"group": "catalog", "cancel-in-progress": "false"}
 # The streams that tick.yml runs, each in a job named for it, and the command that the
 # run step of the job starts. `--bootstrap`, and `--override-reason` with its reason,
 # come after it when they are asked for.
@@ -60,6 +65,8 @@ TICK_COMMANDS = {
         *["uv", "run", "--package", "osv-pypi", "python", "-m", "osv_pypi"],
         *["run", "--max-seconds", "1200"],
     ],
+    # The catalog has no budget of its own: its limits are its job's and its step's.
+    "catalog": ["uv", "run", "--package", "catalog", "python", "-m", "catalog", "run"],
 }
 SWEEP_COMMAND = [
     *["uv", "run", "--package", "pypi-registry", "python", "-m", "pypi_registry"],
@@ -315,6 +322,13 @@ if name == "gh" and args[:2] == ["run", "list"]:
     answer(json.dumps(runs))
 if name == "gh" and args[:2] == ["workflow", "run"]:
     fail_first("STUB_DISPATCH_FAILS", "gh", "workflow", "run")
+if name == "gh" and args[:1] == ["api"]:
+    # The API's replies by endpoint, as JSON text, and the one endpoint that fails.
+    endpoint = next(arg for arg in args if arg.startswith("repos/"))
+    if os.environ.get("STUB_API_FAILS") == endpoint:
+        print("gh: HTTP 502", file=sys.stderr)
+        sys.exit(1)
+    answer(json.loads(os.environ.get("STUB_API_REPLIES", "{{}}")).get(endpoint, ""))
 sys.exit(int(os.environ.get("STUB_EXIT", "0")))
 """
 needs_jq = pytest.mark.skipif(
@@ -381,6 +395,7 @@ def test_no_gh_release_outside_kit():
         ".github": through_gh + through_the_api,
         "scripts": through_gh + through_the_api,
         "streams": through_gh,
+        "catalog": through_gh,
     }
     skipped = {"__pycache__", ".ruff_cache", ".pytest_cache", ".venv"}
     found = []
@@ -421,14 +436,21 @@ def test_job_timeouts_leave_room_after_the_run_budget():
     its open delta are each under the 81 MB that OSV's records add up to, which takes
     a few minutes at most to compress on a runner. Its step of 27 minutes leaves 7 for
     that and for the record in hand, so it needs none of the registry's room.
+
+    The catalog has no budget to pass: it reads what the streams published, builds one
+    database and publishes it. Its step of 57 minutes ends it three minutes before its
+    job's 60, which is time enough to open the issue.
     """
     assert scalar(job_of("tick.yml", "pypi-registry"), "timeout-minutes", 4) == "330"
     assert scalar(job_of("tick.yml", "osv-pypi"), "timeout-minutes", 4) == "30"
+    assert scalar(job_of("tick.yml", "catalog"), "timeout-minutes", 4) == "60"
     assert scalar(job_of("backfill.yml", "sweep"), "timeout-minutes", 4) == "300"
     assert scalar(job_of("smoke.yml", "smoke"), "timeout-minutes", 4) == "15"
 
     assert step_limit("tick.yml", "pypi-registry", "pypi_registry run") == 327
     assert step_limit("tick.yml", "osv-pypi", "osv_pypi run") == 27
+    assert step_limit("tick.yml", "catalog", "catalog run") == 57
+    assert "--max-seconds" not in tick_script("catalog")
     assert step_limit("backfill.yml", "sweep", "pypi_registry sweep") == 297
     assert step_limit("smoke.yml", "smoke", "obskit.smoke") == 12
 
@@ -539,6 +561,19 @@ def test_the_osv_job_has_its_own_concurrency_group():
     assert OSV_GROUP["group"] != REGISTRY_GROUP["group"]
 
 
+def test_the_catalog_job_has_its_own_concurrency_group():
+    """Only the tick publishes catalog-current, so it must never run twice at once, and
+    a run that has begun is never cancelled by a newer one."""
+    catalog = {
+        (file, name): body
+        for file, name, body in all_jobs()
+        if "python -m catalog" in body
+    }
+    assert set(catalog) == {("tick.yml", "catalog")}
+    assert mapping(catalog["tick.yml", "catalog"], "concurrency", 4) == CATALOG_GROUP
+    assert CATALOG_GROUP["group"] not in {REGISTRY_GROUP["group"], OSV_GROUP["group"]}
+
+
 def test_the_osv_job_runs_beside_the_registry_job():
     """osv-pypi is the tick's second stream. It is set up as the registry is, with the
     same pinned checkout, which keeps no token, and the same pinned uv. It syncs its own
@@ -546,7 +581,7 @@ def test_the_osv_job_runs_beside_the_registry_job():
     issue. Nothing makes it wait for the registry's job or skip it: a registry run that
     takes hours or fails must not hold the other stream back."""
     jobs = split_jobs(workflows()["tick.yml"])[1]
-    assert list(jobs) == ["pypi-registry", "osv-pypi"]
+    assert list(jobs) == ["pypi-registry", "osv-pypi", "catalog"]
     registry, osv = jobs["pypi-registry"], jobs["osv-pypi"]
     for job in (registry, osv):
         assert entry(job, "needs", 4) is None
@@ -580,6 +615,49 @@ def test_smoke_job_has_its_own_concurrency_group():
         "group": "stream-kit-smoke",
         "cancel-in-progress": "false",
     }
+
+
+def test_the_catalog_job_runs_after_osv_whatever_its_outcome():
+    """The catalog waits for osv-pypi, which takes half an hour at most, and runs
+    whether or not it succeeded: a stream that failed is read from its last publish.
+    It does not wait for the registry's job, which can queue for hours behind the sweep,
+    and so reads the registry's last publish. The step after the build keeps the
+    scheduled runs enabled, and runs whether or not the build failed. It comes before
+    the steps of the rolling issue, so that a keepalive that fails opens the issue
+    too, and is not left to fail after the issue was closed."""
+    catalog = job_of("tick.yml", "catalog")
+    registry = job_of("tick.yml", "pypi-registry")
+    assert scalar(catalog, "needs", 4) == "osv-pypi"
+    assert scalar(catalog, "if", 4) == "${{ !cancelled() }}"
+    assert scalar(catalog, "runs-on", 4) == "ubuntu-latest"
+    assert mapping(catalog, "permissions", 4) == PERMISSIONS["tick.yml", "catalog"]
+    assert mapping(catalog, "concurrency", 4) == CATALOG_GROUP
+
+    texts = steps(catalog)
+    in_order = [
+        "actions/checkout",
+        "astral-sh/setup-uv",
+        "uv sync --locked --package catalog",
+        "catalog run",
+        "scripts/keepalive.sh",
+        "rolling-issue.sh catalog failure",
+        "rolling-issue.sh catalog success",
+    ]
+    assert len(texts) == len(in_order)
+    for text, mentions in zip(texts, in_order, strict=True):
+        assert mentions in text
+    assert texts[:2] == steps(registry)[:2], (
+        "the registry's checkout and uv, as they are"
+    )
+    assert [step_if(text) for text in texts[3:]] == [
+        None,
+        "${{ !cancelled() }}",
+        "failure()",
+        "success()",
+    ]
+    for text in (texts[3], texts[4]):
+        token = re.search(r"(?m)^\s+(?:GITHUB|GH)_TOKEN:\s*(.*?)\s*$", text)
+        assert token and token[1] == "${{ github.token }}", text
 
 
 def test_only_the_stream_jobs_join_a_concurrency_group():
@@ -1021,7 +1099,9 @@ def test_triggers():
     for name in ("bootstrap", "override_for"):
         choice = entry(inputs, name, 6)[1]
         assert scalar(choice, "type", 8) == "choice", name
-        assert sequence(choice, "options", 8) == ["none", "pypi-registry", "osv-pypi"]
+        assert sequence(choice, "options", 8) == [
+            *["none", "pypi-registry", "osv-pypi", "catalog"]
+        ]
         assert scalar(choice, "default", 8) == "none", name
         # A job of the tick that no option names could never be bootstrapped, and an
         # option that no job has would bootstrap nothing.
@@ -1054,6 +1134,7 @@ def test_every_stream_job_reports_to_the_rolling_issue():
     expected = {
         ("tick.yml", "pypi-registry"): ("pypi-registry", ["failure", "success"]),
         ("tick.yml", "osv-pypi"): ("osv-pypi", ["failure", "success"]),
+        ("tick.yml", "catalog"): ("catalog", ["failure", "success"]),
         ("backfill.yml", "sweep"): ("pypi-registry-backfill", ["failure", "success"]),
         ("smoke.yml", "smoke"): ("kit-smoke", ["failure", "success"]),
     }
@@ -1315,6 +1396,99 @@ def test_rolling_issue_refuses_other_arguments(tmp_path, args):
 
 
 # --- .github/dependabot.yml ---
+
+
+# --- scripts/keepalive.sh ---
+
+HEAD_SHA = "a" * 40
+TREE_SHA = "b" * 40
+NEW_SHA = "c" * 40
+REPO = "repos/py-observatory/data"
+HEAD_COMMIT = f"{REPO}/commits/main"
+TREE_READ = f"{REPO}/git/commits/{HEAD_SHA}"
+COMMIT_CREATE = f"{REPO}/git/commits"
+MAIN_REF = f"{REPO}/git/refs/heads/main"
+
+
+def run_keepalive(tmp_path: Path, age_days: int, **env: str):
+    """Run the script with a stand-in for gh whose main is `age_days` days and an hour
+    old, with the head, tree and new commit named above."""
+    made = datetime.now(UTC) - timedelta(days=age_days, hours=1)
+    replies = {
+        HEAD_COMMIT: {
+            "sha": HEAD_SHA,
+            "commit": {"committer": {"date": made.strftime("%Y-%m-%dT%H:%M:%SZ")}},
+        },
+        TREE_READ: {"tree": {"sha": TREE_SHA}},
+        COMMIT_CREATE: {"sha": NEW_SHA},
+    }
+    return run_shell(
+        tmp_path,
+        [str(KEEPALIVE)],
+        ("gh",),
+        STUB_API_REPLIES=json.dumps({k: json.dumps(v) for k, v in replies.items()}),
+        **env,
+    )
+
+
+def test_keepalive_script_is_executable_and_strict():
+    text = KEEPALIVE.read_text(encoding="utf-8")
+    assert text.startswith("#!/usr/bin/env bash\n")
+    assert os.access(KEEPALIVE, os.X_OK), "the workflow runs it directly"
+    assert re.search(r"(?m)^set -euo pipefail$", text)
+    assert "60 days" in text, "the header says why the script exists"
+    assert "--force" not in text and "force=" not in text, "main must not be forced"
+
+
+@needs_jq
+def test_keepalive_leaves_a_recent_main_alone(tmp_path):
+    done, calls = run_keepalive(tmp_path, 44)
+    assert done.returncode == 0, done.stderr
+    assert [call[:4] for call in calls] == [["gh", "api", HEAD_COMMIT, "--jq"]]
+    assert "44" in done.stdout
+
+
+@needs_jq
+def test_keepalive_commits_when_main_is_45_days_old(tmp_path):
+    done, calls = run_keepalive(tmp_path, 45)
+    assert done.returncode == 0, done.stderr
+    assert [c for c in calls if "-X" in c or "-f" in c] == [
+        [
+            *["gh", "api", COMMIT_CREATE],
+            *["-f", "message=Keep the scheduled workflows enabled"],
+            *["-f", f"tree={TREE_SHA}", "-f", f"parents[]={HEAD_SHA}"],
+            *["--jq", ".sha"],
+        ],
+        ["gh", "api", "-X", "PATCH", MAIN_REF, "-f", f"sha={NEW_SHA}"],
+    ]
+    assert [call[2] if call[2] != "-X" else call[4] for call in calls] == [
+        HEAD_COMMIT,
+        TREE_READ,
+        COMMIT_CREATE,
+        MAIN_REF,
+    ]
+
+
+@needs_jq
+@pytest.mark.parametrize(
+    ("failing", "calls_made"),
+    [(HEAD_COMMIT, 1), (TREE_READ, 2), (COMMIT_CREATE, 3), (MAIN_REF, 4)],
+)
+def test_keepalive_fails_when_a_call_fails(tmp_path, failing, calls_made):
+    """A call that fails stops the script, so it never goes on with an empty tree or an
+    empty commit, and it exits with an error for the step to show."""
+    done, calls = run_keepalive(tmp_path, 45, STUB_API_FAILS=failing)
+    assert done.returncode != 0
+    assert len(calls) == calls_made
+
+
+def test_keepalive_needs_the_repository(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_REPOSITORY"}
+    done = subprocess.run(
+        [str(KEEPALIVE)], env=env, capture_output=True, text=True, check=False
+    )
+    assert done.returncode != 0
+    assert "GITHUB_REPOSITORY" in done.stderr
 
 
 def test_dependabot_groups_actions_monthly():

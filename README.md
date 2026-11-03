@@ -6,3 +6,4 @@ This repository publishes public data about every PyPI project, as SQLite databa
 
 - [pypi-registry](streams/pypi_registry/README.md): the registry of PyPI: every project, its releases and files, which files are yanked and why, and the status of each project.
 - [osv-pypi](streams/osv_pypi/README.md): every advisory in OSV.dev that affects a PyPI project, vulnerabilities and malware reports.
+- [catalog](catalog/README.md): the two streams read together into one database, with each project's releases, requirements, classifiers, events and advisories, and a search index.
