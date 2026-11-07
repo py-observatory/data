@@ -40,6 +40,8 @@ from pypi_downloads.run import (
 from pypi_downloads.store import STATE_SCHEMA, STATE_TABLES, day_number
 
 from obskit import cycle
+from obskit.gcp import GoogleError
+from obskit.github import GitHubError
 from obskit.manifest import TableInfo, Watermark
 from obskit.release import fetch_assets
 from obskit.sqlite import diff_tables, open_db
@@ -200,6 +202,15 @@ def test_a_bootstrap_held_by_the_budget_starts_no_execution(tmp_path):
 
     assert stream.started == []
     assert stream.github.release(CURRENT) is None
+    # Nothing was published to hold the spend, so the notification is not
+    # acknowledged, and Pub/Sub delivers it again to a rerun before the budget's next.
+    assert stream.cloud.acked == []
+
+    with pytest.raises(BootstrapError, match=r"\$0.01 spent"):
+        stream.bootstrap("2026-11-11T09:30:00Z")
+
+    assert stream.started == []
+    assert stream.cloud.acked == []
 
 
 # ---- the runs after it
@@ -255,10 +266,12 @@ def test_later_run_counts_forward_days_before_backfill(tmp_path):
         "projects": 7,
     }
     assert manifest.complete is False
-    # The notification is kept in the state, and the series breaks go on.
+    # The notification is kept in the state, and acknowledged once the state that
+    # holds it is published. The series breaks go on.
     assert state.execute("SELECT * FROM spend").fetchall() == [
         ("2026-11", 0.0, 1.0, "2026-11-13T08:00:00Z")
     ]
+    assert stream.cloud.acked == ["ack-1"]
     assert len(manifest.series_breaks) == 2
 
 
@@ -394,6 +407,49 @@ def test_spend_above_zero_counts_nothing_and_exits_2(tmp_path, monkeypatch, caps
     assert days_after_bootstrap(stream) == []
     assert printed_report(capsys)["held_kind"] == "spend"
     assert stream.manifest().generated_at == "2026-11-12T15:00:00Z"
+
+
+def test_a_run_that_fails_after_the_pull_acknowledges_nothing(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.notify(0.25, at="2026-11-12T08:00:00Z")
+    # The run fails after it has pulled the notification: BigQuery refuses the query
+    # of the partition sizes.
+    stream.cloud.fail_next(403, url_contains="bigquery")
+
+    with pytest.raises(GoogleError, match="HTTP 403"):
+        stream.run("2026-11-12T09:00:00Z")
+
+    assert stream.manifest().generated_at == BOOTSTRAP_AT
+    assert stream.cloud.acked == []
+
+    # The next run is given the notification again, and holds for the spend, but its
+    # publish fails as the manifest goes up. That acknowledges nothing either.
+    stream.github.fail("POST", "name=swap-next-manifest.json", 422)
+
+    with pytest.raises(GitHubError):
+        stream.run("2026-11-12T12:00:00Z")
+
+    assert stream.manifest().generated_at == BOOTSTRAP_AT
+    assert stream.cloud.acked == []
+
+    # The run after it is given the notification once more, and holds for the spend.
+    # It acknowledges the notification once its publish holds the spend.
+    report = stream.run("2026-11-12T15:00:00Z")
+
+    assert (report.counted, report.held_kind) == ([], "spend")
+    assert days_after_bootstrap(stream) == []
+    assert stream.cloud.acked == ["ack-3"]
+    state = stream.open(CURRENT, STATE)
+    assert state.execute("SELECT * FROM spend").fetchall() == [
+        ("2026-11", 0.25, 1.0, "2026-11-12T08:00:00Z")
+    ]
+
+    # Acknowledged, it is not given again, and the state still holds the spend.
+    report = stream.run("2026-11-12T21:00:00Z")
+
+    assert (report.counted, report.held_kind) == ([], "spend")
+    assert stream.cloud.acked == ["ack-3"]
 
 
 def test_a_day_whose_partition_moved_is_reported(tmp_path, monkeypatch, capsys):

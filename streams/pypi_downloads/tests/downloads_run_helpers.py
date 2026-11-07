@@ -296,7 +296,9 @@ class Stream:
 
     def begin(self, at: str) -> datetime:
         """Note that a run starts at `at`, a UTC time, for the times of its
-        executions."""
+        executions. Runs are far enough apart that the lease of every notification
+        pulled and not acknowledged has run out, so Pub/Sub delivers it again."""
+        self.cloud.expire_leases()
         self.at = datetime.fromisoformat(at)
         self.run_began = self.clock.now
         return self.at

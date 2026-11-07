@@ -24,6 +24,10 @@ shows any spend in the billing month, or once the next execution could take a me
 of the free tier to 98%, and the backfill starts only below the budget line and with a
 recent budget notification. A run also stops starting days once its time is up.
 
+The budget's notifications are acknowledged only once a publish holds their spend. A
+run that publishes nothing leaves them to Pub/Sub, which delivers them again to the next
+run, so a spend above $0 is never forgotten.
+
 Each later run reads the sizes of the partitions of the newest days counted from launch
 on, and names each day whose partition has changed since it was counted. Late rows are
 detected, not recounted.
@@ -351,12 +355,24 @@ def _take(
     return ensured.outcome
 
 
-def _record_spend(google: Google, config: Config, delta: Delta) -> None:
-    """Pull the budget's notifications, and write the newest of each billing month to
-    the open delta. The state keeps the newest of each month across runs (see
-    `store.apply`)."""
-    for spend in spend_from(google.pull(config.project, config.subscription)):
+def _record_spend(google: Google, config: Config, delta: Delta) -> list[str]:
+    """Pull the budget's notifications without acknowledging them, write the newest of
+    each billing month to the open delta, and return the ackIds of every one.
+
+    The run acknowledges them once its publish holds their spend (`_acknowledge`). A
+    run that publishes nothing acknowledges nothing, so Pub/Sub delivers them again to
+    the next run, and a spend above $0 is never forgotten. The state keeps the newest
+    of each month whichever way round they come (see `store.apply`)."""
+    messages = google.pull(config.project, config.subscription, acknowledge=False)
+    for spend in spend_from(messages):
         delta.spend(spend.month, spend.cost, spend.budget, spend.notified_at)
+    return [message["ackId"] for message in messages]
+
+
+def _acknowledge(google: Google, config: Config, ack_ids: list[str]) -> None:
+    """Acknowledge the notifications that the run pulled, once the state that holds
+    their spend is published."""
+    google.acknowledge(config.project, config.subscription, ack_ids)
 
 
 def _spend(state: sqlite3.Connection, now: datetime) -> Spend | None:
@@ -527,9 +543,11 @@ def _bootstrap(
     notifications. The launch day is ensured (see `_ensure`) once the guard allows it,
     as for a day after launch, and written. The state is copied as the base of today's
     month, and published with the open delta and a manifest that lists the breaks.
+    Only then are the notifications acknowledged.
 
     Raises BootstrapError, and publishes nothing, when the guard refuses the launch
-    day or the day fails: a stream with no day counted has nothing to publish.
+    day or the day fails: a stream with no day counted has nothing to publish. The
+    notifications are then not acknowledged, so a rerun is given them again.
     """
     launch = latest_due(today)
     days = _Days()
@@ -551,7 +569,7 @@ def _bootstrap(
         delta = Delta(conn, moment, first_seq=1)
         for day, note in BREAKS:
             delta.series_break(day_number(day), note)
-        _record_spend(google, config, delta)
+        pulled = _record_spend(google, config, delta)
         _commit_and_apply(state, conn)
         usage = _usage(google, config, state, now)
         held = _held(usage, config, state, now, backfill=False)
@@ -588,6 +606,7 @@ def _bootstrap(
         complete=complete,
         series_breaks=[{"day": day.isoformat(), "note": note} for day, note in BREAKS],
     )
+    _acknowledge(google, config, pulled)
     return _report(days, held=None, drift=[], usage=usage, failures=[])
 
 
@@ -609,8 +628,8 @@ def run_once(
     and then a bootstrap builds and publishes the first state (see `_bootstrap`).
     Otherwise the prior manifest must list the state and the open delta
     (PriorStateError). The run rolls over (`cycle.roll_over`), writes the budget's
-    notifications to the delta and applies it, names the days whose partition moved,
-    and measures what the billing month has used.
+    notifications to the delta, without acknowledging them, and applies it, names the
+    days whose partition moved, and measures what the billing month has used.
 
     Then it takes the days from launch on that are due and not counted, oldest first,
     and the backfill, newest first, one at a time (see `_take`). Before each it asks
@@ -618,11 +637,13 @@ def run_once(
     execution counted. It stops at a refusal, at a day that failed, and once
     `max_seconds` from its start on `clock` have passed. It then publishes
     (`cycle.publish`): the manifest is checked with the gates, and the state, the open
-    delta and the manifest are swapped into the current release.
+    delta and the manifest are swapped into the current release. Only then are the
+    notifications acknowledged.
 
     Every error other than a failed day propagates, and an error before the publish
-    publishes nothing to the current release. What a rollover already added to a
-    month's release stays, as in `obskit.cycle`.
+    publishes nothing to the current release and acknowledges no notification, so the
+    next run is given them again. What a rollover already added to a month's release
+    stays, as in `obskit.cycle`.
     """
     deadline = clock() + max_seconds
     moment = instant(now)
@@ -646,7 +667,7 @@ def run_once(
         # A new day's delta is numbered on from what the state has applied, and
         # today's goes on after its own last row.
         delta = Delta(conn, moment, first_seq=resume.applied + 1)
-        _record_spend(google, config, delta)
+        pulled = _record_spend(google, config, delta)
         _commit_and_apply(state, conn)
         drift = _drift(google, config, state, launch)
         usage = _usage(google, config, state, now)
@@ -694,6 +715,7 @@ def run_once(
         extra=[],
         override_reason=override_reason,
     )
+    _acknowledge(google, config, pulled)
     return _report(days, held=held, drift=drift, usage=usage, failures=failures)
 
 
