@@ -5,11 +5,17 @@ token, and that is used to impersonate a service account, which gives the access
 that every Google call carries. The token is kept until 5 minutes before it ends and then
 exchanged again, so a run that lasts longer than the token's hour keeps working.
 
+`Google` is the few calls that a stream makes with that token: run a Cloud Run job and
+wait for it, list its executions, deploy it, read a Cloud Storage object, pull Pub/Sub
+messages and run a BigQuery metadata query.
+
 A reply that is not a success is a GoogleError. No token, and no reply body that could
 hold one, is ever put in an error message.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -20,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import quote
 
-from obskit.github import Transport, UrllibTransport
+from obskit.github import _BACKOFF, Transport, UrllibTransport, _retry_after
 from obskit.http import USER_AGENT
 
 SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -29,10 +35,18 @@ _IAM_URL = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts"
 _JWT = "urn:ietf:params:oauth:token-type:jwt"
 _ACCESS_TOKEN = "urn:ietf:params:oauth:token-type:access_token"
 _TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+_RUN_URL = "https://run.googleapis.com/v2"
+_STORAGE_URL = "https://storage.googleapis.com/storage/v1/b"
+_PUBSUB_URL = "https://pubsub.googleapis.com/v1/projects"
+_BIGQUERY_URL = "https://bigquery.googleapis.com/bigquery/v2/projects"
 _LIFETIME = "3600s"
 # A token is exchanged again once it has this many seconds left, so that a request that
 # starts just before the end still finishes inside the token's life.
 _MARGIN = 300
+# How long deploying a job may take to finish, and how often that is looked at.
+_DEPLOY_TIMEOUT = 600
+# How long BigQuery may work on a query before it gives up, in milliseconds.
+_QUERY_TIMEOUT_MS = 60_000
 
 # The fractional seconds of an RFC 3339 time, which Google writes with up to 9 digits.
 _FRACTION = re.compile(r"\.[0-9]+")
@@ -169,25 +183,8 @@ class Credentials:
         status outside 200-299, a network failure, and a body that is not an object. The
         message says which call failed, and never quotes the URL or a body: the OIDC
         request's URL holds a secret, and a reply may hold a token."""
-        sent = {"User-Agent": USER_AGENT, **headers}
-        body = None
-        if payload is not None:
-            sent["Content-Type"] = "application/json"
-            body = json.dumps(payload).encode()
-        label = f"{method} {url.split('?')[0]}"
-        try:
-            status, _, raw = self._transport.request(method, url, sent, body)
-        except OSError as exc:
-            raise GoogleError(f"{label} failed: {type(exc).__name__}") from exc
-        if not 200 <= status <= 299:
-            raise GoogleError(f"{label} returned HTTP {status}{_why(raw)}", status)
-        try:
-            reply = json.loads(raw)
-        except ValueError:
-            reply = None
-        if not isinstance(reply, dict):
-            raise GoogleError(f"{label} did not reply with a JSON object", status)
-        return reply
+        status, _, raw = _transmit(self._transport, method, url, headers, payload)
+        return _object_reply(method, url, status, raw)
 
     @staticmethod
     def _field(reply: dict, name: str, what: str) -> str:
@@ -195,6 +192,56 @@ class Credentials:
         if not isinstance(value, str) or not value:
             raise GoogleError(f"{what} has no `{name}`")
         return value
+
+
+def _label(method: str, url: str) -> str:
+    """How an error names a call: the method and the URL without its query, which may
+    hold a secret."""
+    return f"{method} {url.split('?')[0]}"
+
+
+def _transmit(
+    transport: Transport,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    payload: dict | None,
+) -> tuple[int, dict[str, str], bytes]:
+    """One request, whatever its status. A network failure is a GoogleError with no
+    status, and its text is left out of the message because it may quote the URL."""
+    sent = {"User-Agent": USER_AGENT, **headers}
+    body = None
+    if payload is not None:
+        sent["Content-Type"] = "application/json"
+        body = json.dumps(payload).encode()
+    try:
+        return transport.request(method, url, sent, body)
+    except OSError as exc:
+        raise GoogleError(
+            f"{_label(method, url)} failed: {type(exc).__name__}"
+        ) from exc
+
+
+def _refusal(method: str, url: str, status: int, raw: bytes) -> GoogleError:
+    """The error for a reply that is not a success, with Google's own message."""
+    return GoogleError(
+        f"{_label(method, url)} returned HTTP {status}{_why(raw)}", status
+    )
+
+
+def _object_reply(method: str, url: str, status: int, raw: bytes) -> dict:
+    """The JSON object in a reply, or the GoogleError that the reply amounts to."""
+    if not 200 <= status <= 299:
+        raise _refusal(method, url, status, raw)
+    try:
+        reply = json.loads(raw)
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict):
+        raise GoogleError(
+            f"{_label(method, url)} did not reply with a JSON object", status
+        )
+    return reply
 
 
 def _why(raw: bytes) -> str:
@@ -212,6 +259,230 @@ def _why(raw: bytes) -> str:
     if message is None:
         message = reply.get("error_description")
     return f": {message}" if isinstance(message, str) and message else ""
+
+
+class Google:
+    """The Google Cloud calls of a stream, made with the bearer token that `token` gives.
+
+    `token` is asked for on every request, so a Credentials renews it as it runs out.
+    `sleep` and `clock` (in seconds, and only ever ticking) are for tests.
+
+    A request that fails with 429, a 5xx status or a network error is tried again after
+    2, 4, 8, 16 and 32 seconds, or after the wait that the reply's `retry-after` asks
+    for, up to 5 minutes, and then fails. A 401 is tried once more at once with a fresh
+    `token()`, in case the token ran out in flight.
+    """
+
+    def __init__(
+        self,
+        token: Callable[[], str],
+        *,
+        transport: Transport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._token = token
+        self._transport = transport if transport is not None else UrllibTransport()
+        self._sleep = sleep
+        self._clock = clock
+
+    def run_job(self, project: str, region: str, job: str, env: dict[str, str]) -> str:
+        """Start an execution of a Cloud Run job with `env` added to its environment,
+        and return the name of the operation that tracks it."""
+        url = f"{_RUN_URL}/{_job_path(project, region, job)}:run"
+        variables = [{"name": name, "value": value} for name, value in env.items()]
+        body = {"overrides": {"containerOverrides": [{"env": variables}]}}
+        return self._operation_name(self._json("POST", url, body))
+
+    def wait(
+        self, operation: str, *, timeout_seconds: float, poll_seconds: float = 30
+    ) -> dict:
+        """Wait for a Cloud Run operation and return the Execution that is its response.
+        An operation that ended in an error, and one still running after
+        `timeout_seconds`, raise a GoogleError."""
+        url = f"{_RUN_URL}/{operation}"
+        started = self._clock()
+        while True:
+            reply = self._json("GET", url)
+            if reply.get("done"):
+                return _operation_result(operation, reply)
+            if self._clock() - started >= timeout_seconds:
+                raise GoogleError(
+                    f"{operation} was still running after {timeout_seconds:g} seconds"
+                )
+            self._sleep(poll_seconds)
+
+    def executions(self, project: str, region: str, job: str) -> list[dict]:
+        """Every Execution of a job, following the pages."""
+        base = f"{_RUN_URL}/{_job_path(project, region, job)}/executions"
+        found: list[dict] = []
+        page = ""
+        while True:
+            url = f"{base}?pageToken={quote(page, safe='')}" if page else base
+            reply = self._json("GET", url)
+            found.extend(_list_of_objects(reply, "executions", _label("GET", url)))
+            page = reply.get("nextPageToken") or ""
+            if not page:
+                return found
+
+    def deploy_job(self, project: str, region: str, job: str, template: dict) -> None:
+        """Make the job exist with `template`: create it when it is not there, and
+        otherwise patch it. This returns once the change has finished."""
+        parent = f"{_RUN_URL}/projects/{project}/locations/{region}/jobs"
+        path = f"{parent}/{quote(job, safe='')}"
+        status, _ = self._request("GET", path, accept=(404,))
+        body = {"template": template}
+        if status == 404:
+            created = f"{parent}?jobId={quote(job, safe='')}"
+            reply = self._json("POST", created, body)
+        else:
+            reply = self._json("PATCH", path, body)
+        self.wait(self._operation_name(reply), timeout_seconds=_DEPLOY_TIMEOUT)
+
+    def get_object(self, bucket: str, name: str, *, max_bytes: int) -> bytes | None:
+        """The bytes of a Cloud Storage object, None when there is no such object, and a
+        GoogleError for one longer than `max_bytes`."""
+        url = f"{_STORAGE_URL}/{quote(bucket, safe='')}/o/{quote(name, safe='')}"
+        status, raw = self._request("GET", f"{url}?alt=media", accept=(404,))
+        if status == 404:
+            return None
+        if len(raw) > max_bytes:
+            raise GoogleError(
+                f"GET {url} is {len(raw)} bytes, over the limit of {max_bytes}"
+            )
+        return raw
+
+    def pull(
+        self, project: str, subscription: str, *, max_messages: int = 100
+    ) -> list[dict]:
+        """Every message waiting in a Pub/Sub subscription, decoded from its JSON, with
+        the time Pub/Sub published it added as `publishTime`. Each batch is acknowledged
+        once it is decoded, so a message is delivered to a run only once. A message that
+        is not a JSON object raises a GoogleError and is left unacknowledged."""
+        base = f"{_PUBSUB_URL}/{project}/subscriptions/{subscription}"
+        messages: list[dict] = []
+        while True:
+            reply = self._json("POST", f"{base}:pull", {"maxMessages": max_messages})
+            where = f"POST {base}:pull"
+            received = _list_of_objects(reply, "receivedMessages", where)
+            if not received:
+                return messages
+            messages.extend(_decoded(item, where) for item in received)
+            ack_ids = [item["ackId"] for item in received]
+            self._json("POST", f"{base}:acknowledge", {"ackIds": ack_ids})
+
+    def query(
+        self, project: str, sql: str, *, location: str = "US"
+    ) -> list[list[str | None]]:
+        """Run a BigQuery query and return its rows, each as a list of cell values. A
+        query that has not finished within a minute raises a GoogleError."""
+        url = f"{_BIGQUERY_URL}/{project}/queries"
+        body = {
+            "query": sql,
+            "useLegacySql": False,
+            "location": location,
+            "timeoutMs": _QUERY_TIMEOUT_MS,
+        }
+        reply = self._json("POST", url, body)
+        if reply.get("jobComplete") is not True:
+            raise GoogleError(f"POST {url} did not finish within a minute")
+        rows = _list_of_objects(reply, "rows", f"POST {url}")
+        try:
+            return [[cell["v"] for cell in row["f"]] for row in rows]
+        except (KeyError, TypeError) as exc:
+            raise GoogleError(
+                f"POST {url} replied with rows of an unknown shape"
+            ) from exc
+
+    def _json(self, method: str, url: str, payload: dict | None = None) -> dict:
+        _, raw = self._request(method, url, payload)
+        return _object_reply(method, url, 200, raw)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        payload: dict | None = None,
+        *,
+        accept: tuple[int, ...] = (),
+    ) -> tuple[int, bytes]:
+        """One request with its retries: the status and body of a 2xx reply, or of one
+        whose status is in `accept`. Any other reply is a GoogleError."""
+        retries = 0
+        renewed = False
+        while True:
+            try:
+                status, headers, raw = _transmit(
+                    self._transport,
+                    method,
+                    url,
+                    {"Authorization": f"Bearer {self._token()}"},
+                    payload,
+                )
+            except GoogleError:
+                if retries == len(_BACKOFF):
+                    raise
+                self._sleep(_BACKOFF[retries])
+                retries += 1
+                continue
+            if status == 401 and not renewed:
+                renewed = True
+                continue
+            if 200 <= status <= 299 or status in accept:
+                return status, raw
+            if (status == 429 or status >= 500) and retries < len(_BACKOFF):
+                wait = _retry_after(headers)
+                self._sleep(_BACKOFF[retries] if wait is None else wait)
+                retries += 1
+                continue
+            raise _refusal(method, url, status, raw)
+
+    @staticmethod
+    def _operation_name(reply: dict) -> str:
+        name = reply.get("name")
+        if not isinstance(name, str) or not name:
+            raise GoogleError("the reply has no operation `name`")
+        return name
+
+
+def _job_path(project: str, region: str, job: str) -> str:
+    return f"projects/{project}/locations/{region}/jobs/{quote(job, safe='')}"
+
+
+def _operation_result(operation: str, reply: dict) -> dict:
+    """The Execution in a finished operation, or the error it ended with."""
+    error = reply.get("error")
+    if error:
+        message = error.get("message") if isinstance(error, dict) else None
+        detail = f": {message}" if isinstance(message, str) and message else ""
+        raise GoogleError(f"{operation} ended in an error{detail}")
+    response = reply.get("response")
+    if not isinstance(response, dict):
+        raise GoogleError(f"{operation} finished with no response")
+    return response
+
+
+def _list_of_objects(reply: dict, field: str, where: str) -> list[dict]:
+    """The list under `field` of a reply, empty when Google left it out."""
+    items = reply.get(field, [])
+    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+        raise GoogleError(f"{where} replied with an odd `{field}`")
+    return items
+
+
+def _decoded(item: dict, where: str) -> dict:
+    """A received Pub/Sub message as the JSON object in its data plus `publishTime`."""
+    message = item.get("message")
+    ack_id = item.get("ackId")
+    if not isinstance(message, dict) or not isinstance(ack_id, str):
+        raise GoogleError(f"{where} replied with an odd message")
+    try:
+        data = json.loads(base64.b64decode(message.get("data", ""), validate=True))
+    except (binascii.Error, ValueError) as exc:
+        raise GoogleError("a Pub/Sub message does not hold JSON") from exc
+    if not isinstance(data, dict):
+        raise GoogleError("a Pub/Sub message does not hold a JSON object")
+    return {**data, "publishTime": message.get("publishTime")}
 
 
 def main(

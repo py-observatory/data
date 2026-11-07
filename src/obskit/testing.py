@@ -4,6 +4,7 @@ Cloud APIs, all held in memory. The
 lists at the end are the texts that the tests of obskit.emails share with the tests of
 each stream that uses it."""
 
+import base64
 import itertools
 import json
 import re
@@ -443,6 +444,26 @@ class FakeGoogle:
     GitHub, and `last_sts_body`, the JSON body of the latest STS request.
     `oidc_tokens_issued` counts the OIDC tokens. `fail_next` makes a request fail.
 
+    Cloud Run, Cloud Storage, Pub/Sub and BigQuery are served from stores that a test
+    fills and reads:
+
+    - `objects` maps (bucket, name) to bytes.
+    - `jobs` maps a job's name to the template it was deployed with.
+    - `executions` is the list of Executions, newest last. `run_job` calls `on_run` with
+      the env dict of the run (name to value), and `on_run` may add to `objects`; it
+      returns the Execution to finish with, and without one a finished Execution that
+      succeeded once is used. The Execution is given a `name` when it has none.
+    - `operations` maps an operation's name to the operation, so a test can make one
+      that never finishes, or ends in an error.
+    - `messages` holds the Pub/Sub messages as JSON objects, and `pull` drains them. The
+      ackIds it was sent are in `acked`, and `publish_time` is what it says it was
+      published at.
+    - `partitions` maps a partition id (such as "20261109") to (total_rows, modified),
+      and the one BigQuery query that is served, a read of INFORMATION_SCHEMA.PARTITIONS,
+      answers with a row `[partition_id, str(total_rows), modified]` for each id it
+      lists that is held. The SQL of every query is in `queries`. Any other SQL raises
+      NotImplementedError: nothing may scan table data.
+
     Routes are a table of (method, URL prefix, handler), tried in order, and `route`
     adds one. A request that no route takes raises NotImplementedError, never a 404.
     """
@@ -457,6 +478,17 @@ class FakeGoogle:
         self._failures: list[tuple[int, str]] = []
         self._federated: set[str] = set()
         self._access_tokens_issued = 0
+        self.objects: dict[tuple[str, str], bytes] = {}
+        self.jobs: dict[str, dict] = {}
+        self.executions: list[dict] = []
+        self.on_run: Callable[[dict[str, str]], dict] | None = None
+        self.operations: dict[str, dict] = {}
+        self.messages: list[dict] = []
+        self.acked: list[str] = []
+        self.publish_time = "2026-11-06T07:00:00.000Z"
+        self.partitions: dict[str, tuple[int, str]] = {}
+        self.queries: list[str] = []
+        self._pulled = 0
         self._routes: list[tuple[str, str, Callable[[_GoogleCall], _Reply]]] = []
         self.route("GET", oidc_url, self._oidc)
         self.route("POST", "https://sts.googleapis.com/v1/token", self._sts)
@@ -464,6 +496,15 @@ class FakeGoogle:
             "POST",
             "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/",
             self._impersonate,
+        )
+        run = "https://run.googleapis.com/v2/projects/"
+        self.route("POST", run, self._run_post)
+        self.route("PATCH", run, self._run_patch)
+        self.route("GET", run, self._run_get)
+        self.route("GET", "https://storage.googleapis.com/storage/v1/b/", self._object)
+        self.route("POST", "https://pubsub.googleapis.com/v1/projects/", self._pubsub)
+        self.route(
+            "POST", "https://bigquery.googleapis.com/bigquery/v2/projects/", self._query
         )
 
     def route(
@@ -520,6 +561,149 @@ class FakeGoogle:
                 "expireTime": ends.strftime("%Y-%m-%dT%H:%M:%SZ"),
             },
         )
+
+    def _run_post(self, call: _GoogleCall) -> _Reply:
+        path, _, query = call.url.partition("?")
+        parts = path.removeprefix("https://run.googleapis.com/v2/").split("/")
+        # projects/P/locations/R/jobs/J:run, or projects/P/locations/R/jobs?jobId=J
+        if len(parts) == 6 and parts[4] == "jobs" and parts[5].endswith(":run"):
+            return self._run(call, parts[1], parts[3], parts[5].removesuffix(":run"))
+        if len(parts) == 5 and parts[4] == "jobs":
+            job = parse_qs(query).get("jobId", [""])[0]
+            return self._deploy(call, parts[1], parts[3], job, create=True)
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _run_patch(self, call: _GoogleCall) -> _Reply:
+        parts = call.url.removeprefix("https://run.googleapis.com/v2/").split("/")
+        if len(parts) == 6 and parts[4] == "jobs":
+            return self._deploy(
+                call, parts[1], parts[3], unquote(parts[5]), create=False
+            )
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _run_get(self, call: _GoogleCall) -> _Reply:
+        path, _, query = call.url.partition("?")
+        parts = path.removeprefix("https://run.googleapis.com/v2/").split("/")
+        if len(parts) == 6 and parts[4] == "jobs":
+            job = self.jobs.get(unquote(parts[5]))
+            return (
+                _google_error(404, "the job is not there")
+                if job is None
+                else _reply(200, job)
+            )
+        if len(parts) == 7 and parts[6] == "executions":
+            return self._execution_page(parse_qs(query).get("pageToken", [""])[0])
+        if len(parts) == 6 and parts[4] == "operations":
+            return self._operation(path.removeprefix("https://run.googleapis.com/v2/"))
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _operation(self, name: str) -> _Reply:
+        operation = self.operations.get(name)
+        if operation is None:
+            return _google_error(404, "the operation is not there")
+        return _reply(200, operation)
+
+    def _new_operation(self, project: str, region: str, response: dict) -> _Reply:
+        name = f"projects/{project}/locations/{region}/operations/op-{len(self.operations) + 1}"
+        self.operations[name] = {"name": name, "done": True, "response": response}
+        return _reply(200, {"name": name})
+
+    def _run(self, call: _GoogleCall, project: str, region: str, job: str) -> _Reply:
+        body = _json_object(call.body) or {}
+        containers = body.get("overrides", {}).get("containerOverrides", [{}])
+        env = {item["name"]: item["value"] for item in containers[0].get("env", [])}
+        if self.on_run is not None:
+            execution = dict(self.on_run(env))
+        else:
+            execution = {"succeededCount": 1, "failedCount": 0}
+        number = len(self.executions) + 1
+        execution.setdefault(
+            "name",
+            f"projects/{project}/locations/{region}/jobs/{job}/executions/{job}-{number}",
+        )
+        self.executions.append(execution)
+        return self._new_operation(project, region, execution)
+
+    def _deploy(
+        self, call: _GoogleCall, project: str, region: str, job: str, *, create: bool
+    ) -> _Reply:
+        if create == (job in self.jobs):
+            return _google_error(409 if create else 404, "the job is not as expected")
+        self.jobs[job] = (_json_object(call.body) or {}).get("template", {})
+        return self._new_operation(project, region, {"name": job})
+
+    def _execution_page(self, token: str) -> _Reply:
+        # Pages of two, so that a test sees the page tokens followed. The token is the
+        # index of the page's first Execution.
+        start = int(token) if token else 0
+        page = self.executions[start : start + 2]
+        reply: dict[str, object] = {"executions": page}
+        if start + 2 < len(self.executions):
+            reply["nextPageToken"] = str(start + 2)
+        return _reply(200, reply)
+
+    def _object(self, call: _GoogleCall) -> _Reply:
+        path = urlsplit(call.url).path.removeprefix("/storage/v1/b/")
+        bucket, _, name = path.partition("/o/")
+        data = self.objects.get((unquote(bucket), unquote(name)))
+        if data is None:
+            return _google_error(404, "no such object")
+        return 200, {"content-type": "application/octet-stream"}, data
+
+    def _pubsub(self, call: _GoogleCall) -> _Reply:
+        body = _json_object(call.body) or {}
+        if call.url.endswith(":pull"):
+            batch = self.messages[: body.get("maxMessages", 100)]
+            del self.messages[: len(batch)]
+            received = []
+            for message in batch:
+                self._pulled += 1
+                data = base64.b64encode(json.dumps(message).encode()).decode()
+                received.append(
+                    {
+                        "ackId": f"ack-{self._pulled}",
+                        "message": {"data": data, "publishTime": self.publish_time},
+                    }
+                )
+            return _reply(200, {"receivedMessages": received} if received else {})
+        if call.url.endswith(":acknowledge"):
+            self.acked.extend(body.get("ackIds", []))
+            return _reply(200, {})
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _query(self, call: _GoogleCall) -> _Reply:
+        sql = (_json_object(call.body) or {}).get("query", "")
+        self.queries.append(sql)
+        if "INFORMATION_SCHEMA.PARTITIONS" not in sql:
+            raise NotImplementedError(
+                f"FakeGoogle serves no SQL but INFORMATION_SCHEMA.PARTITIONS: {sql}"
+            )
+        listed = re.findall(r"'([0-9]{8})'", sql)
+        rows = [
+            {
+                "f": [
+                    {"v": pid},
+                    {"v": str(self.partitions[pid][0])},
+                    {"v": self.partitions[pid][1]},
+                ]
+            }
+            for pid in listed
+            if pid in self.partitions
+        ]
+        return _reply(200, {"jobComplete": True, "rows": rows})
+
+
+def _google_error(status: int, message: str) -> _Reply:
+    """An error reply shaped like Google's: an `error` with a message."""
+    return _reply(status, {"error": {"message": message}})
 
 
 # ---- Texts for the tests of obskit.emails, and of every stream that uses it.
