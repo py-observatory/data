@@ -1,0 +1,19 @@
+[project]
+name = "counter"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "pyarrow>=26",
+    "google-cloud-bigquery-storage>=2.43",
+    "google-cloud-storage>=3",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8.4"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

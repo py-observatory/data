@@ -21,3 +21,5 @@ jobs:
           version: "0.13.6"
       - run: uv sync --all-packages --locked
       - run: uv run pytest
+      - run: uv run --locked pytest
+        working-directory: streams/pypi_downloads/counter

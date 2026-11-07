@@ -13,7 +13,8 @@ dev = ["pytest>=8.4"]
 
 [tool.uv.workspace]
 members = ["streams/pypi_registry", "streams/osv_pypi", "catalog"]
+exclude = ["streams/pypi_downloads/counter"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "streams", "catalog"]
-addopts = "-q"
+addopts = "-q --ignore=streams/pypi_downloads/counter"
