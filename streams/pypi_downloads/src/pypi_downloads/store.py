@@ -323,8 +323,8 @@ def apply(state: sqlite3.Connection, delta: sqlite3.Connection) -> None:
 
     A `projects`, `days` or `breaks` row whose key is in the state already raises
     sqlite3.IntegrityError, a `spend` row replaces the month's only when it was notified
-    later, and a `clearances` row replaces the month's. Raises ValueError when the state has no applied_seq, which a
-    bootstrap writes, and as `apply_rows` does.
+    later, and a `clearances` row replaces the month's. Raises ValueError when the state
+    has no applied_seq, which a bootstrap writes, and as `apply_rows` does.
     """
     applied = meta(state, "applied_seq")
     if applied is None:
