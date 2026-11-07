@@ -111,25 +111,40 @@ def _time(text: str) -> datetime:
     return datetime.fromisoformat(text)
 
 
-def execution_cost(execution: dict, now: datetime) -> tuple[float, float]:
+def execution_cost(
+    execution: dict, now: datetime, *, since: datetime | None = None
+) -> tuple[float, float]:
     """The vCPU-seconds and GiB-seconds of one Cloud Run execution at its own limits,
-    over `(completionTime or now) - startTime`."""
+    over `max(startTime, since)` to `completionTime or now`. `since` is the start of a
+    billing month: Google bills the part of an execution after that instant to the new
+    month's free tier."""
     limits = execution["template"]["containers"][0]["resources"]["limits"]
     start = _time(execution["startTime"])
+    if since is not None:
+        start = max(start, since)
     end = _time(execution["completionTime"]) if execution.get("completionTime") else now
-    seconds = (end - start).total_seconds()
+    seconds = max((end - start).total_seconds(), 0.0)
     return _vcpus(limits["cpu"]) * seconds, _gib(limits["memory"]) * seconds
 
 
 def execution_usage(executions: list[dict], start: datetime, now: datetime) -> Usage:
-    """The compute used by the executions that started at or after `start`, finished or
-    still running. An execution with no start time has not used any yet. Read bytes are
-    counted elsewhere, from the days counted."""
+    """The compute used from `start` on by executions that were running then or began
+    after, finished or still running. One that began before `start` counts only its part
+    after it, and one that finished before `start` counts nothing. An execution with no
+    start time has not used any yet. Read bytes are counted elsewhere, from the days
+    counted."""
     vcpu = gib = 0.0
     for execution in executions:
-        if "startTime" not in execution or _time(execution["startTime"]) < start:
+        if "startTime" not in execution:
             continue
-        cost = execution_cost(execution, now)
+        end = (
+            _time(execution["completionTime"])
+            if execution.get("completionTime")
+            else now
+        )
+        if end <= start:
+            continue
+        cost = execution_cost(execution, now, since=start)
         vcpu += cost[0]
         gib += cost[1]
     return Usage(vcpu, gib, 0)
@@ -155,10 +170,14 @@ def spend_from(messages: list[dict]) -> list[Spend]:
 
 
 def refusal(
-    usage: Usage, spend: Spend | None, now: datetime, *, backfill: bool
+    usage: Usage, spend: Spend | None, now: datetime, *, backfill: bool, reserve: Usage
 ) -> Refusal | None:
     """None to go on, or why counting must not start. `spend` is the newest report in
-    hand, of any month; only one for the billing month of `now` counts."""
+    hand, of any month; only one for the billing month of `now` counts. The caller
+    passes `reserve`, the worst case of the execution about to start (its cpu times the
+    task timeout, its memory times the task timeout, and the largest read bytes of a
+    counted day), and the stop share applies to `usage + reserve`. The budget line
+    applies to `usage` alone."""
     start, end = billing_month(now)
     month = now.astimezone(PACIFIC).strftime("%Y-%m")
     current = spend if spend is not None and spend.month == month else None
@@ -166,9 +185,13 @@ def refusal(
         return Refusal(
             "spend", f"the budget shows ${current.cost:.2f} spent in {month}"
         )
-    for name, used, free in _measures(usage):
-        if used >= STOP_SHARE * free:
-            return Refusal("stop", f"{name} is at {used / free:.1%} of the free tier")
+    for (name, used, free), (_, extra, _) in zip(_measures(usage), _measures(reserve)):
+        if used + extra >= STOP_SHARE * free:
+            return Refusal(
+                "stop",
+                f"{name} would reach {(used + extra) / free:.1%} of the free tier "
+                f"({used:,.0f} used, {extra:,.0f} reserved for the next execution)",
+            )
     if not backfill:
         return None
     if current is None or now - _time(current.notified_at) >= timedelta(
