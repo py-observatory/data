@@ -1,6 +1,7 @@
 import compression.zstd
 import hashlib
 import sqlite3
+from contextlib import closing
 
 import pyarrow as pa
 import pytest
@@ -35,11 +36,10 @@ def test_write_counts_and_summary(tmp_path):
     path = tmp_path / "2026-11-04.db"
     table = make_table([("boto3", 1, 0), ("numpy", 3, 1)])
     write_counts(table, META, path)
-    db = sqlite3.connect(path)
-    assert dict(db.execute("SELECT key, value FROM meta")) == META
-    assert db.execute("SELECT project, downloads, mirror_downloads FROM counts "
-                      "ORDER BY project").fetchall() == [("boto3", 1, 0), ("numpy", 3, 1)]
-    db.close()
+    with closing(sqlite3.connect(path)) as db:
+        assert dict(db.execute("SELECT key, value FROM meta")) == META
+        assert db.execute("SELECT project, downloads, mirror_downloads FROM counts "
+                          "ORDER BY project").fetchall() == [("boto3", 1, 0), ("numpy", 3, 1)]
     zst, size, digest = compress(path)
     info = summary(META, size, digest)
     assert set(info) == {"day", "db_bytes", "db_sha256", "rows_counted", "rows_bigquery",
@@ -58,8 +58,9 @@ def test_summary_numbers_are_integers():
 def test_the_database_has_the_counts_file_tables(tmp_path):
     path = tmp_path / "d.db"
     write_counts(make_table([("a", 1, 0)]), META, path)
-    db = sqlite3.connect(path)
-    names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    with closing(sqlite3.connect(path)) as db:
+        names = {row[0] for row in
+                 db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert names == {"meta", "counts"}
     assert "WITHOUT ROWID" in COUNTS_SCHEMA
 
@@ -89,5 +90,5 @@ def test_write_counts_replaces_a_half_written_file(tmp_path):
     path = tmp_path / "d.db"
     path.write_bytes(b"junk")
     write_counts(make_table([("a", 1, 0)]), META, path)
-    db = sqlite3.connect(path)
-    assert db.execute("SELECT count(*) FROM counts").fetchone() == (1,)
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT count(*) FROM counts").fetchone() == (1,)
