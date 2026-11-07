@@ -136,3 +136,58 @@ def test_main_names_a_missing_environment_variable(monkeypatch, env, capsys):
     assert job.main() == 2
     assert json.loads(capsys.readouterr().out)["variable"] == "DAY"
 
+
+
+def test_the_partition_read_bypasses_the_query_cache(monkeypatch):
+    import google.auth
+    import google.auth.transport.requests as transport
+    from datetime import date
+
+    sent = {}
+
+    class Reply:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"jobComplete": True, "rows": [{"f": [{"v": "5"}, {"v": "2026-11-05T00:36:50Z"}]}]}
+
+    class Session:
+        def __init__(self, credentials):
+            pass
+
+        def post(self, url, json, timeout):
+            sent["body"] = json
+            return Reply()
+
+    monkeypatch.setattr(google.auth, "default", lambda: (object(), "p"))
+    monkeypatch.setattr(transport, "AuthorizedSession", Session)
+    assert job.read_partition(date(2026, 11, 4), "py-observatory") == (5, "2026-11-05T00:36:50Z")
+    assert sent["body"]["useQueryCache"] is False
+    assert sent["body"]["queryParameters"][0]["parameterValue"] == {"value": "20261104"}
+
+
+def test_each_upload_carries_a_bounded_retry(monkeypatch, tmp_path):
+    from google.cloud import storage
+
+    calls = []
+
+    class Blob:
+        def upload_from_filename(self, filename, **kwargs):
+            calls.append((filename, kwargs))
+
+    class Bucket:
+        def blob(self, name):
+            return Blob()
+
+    class Client:
+        def __init__(self, project):
+            pass
+
+        def bucket(self, name):
+            return Bucket()
+
+    monkeypatch.setattr(storage, "Client", Client)
+    job.upload("b", "p", "counts/x.json", tmp_path / "x.json")
+    (_, kwargs), = calls
+    assert kwargs["retry"].timeout == job.UPLOAD_RETRY_SECONDS

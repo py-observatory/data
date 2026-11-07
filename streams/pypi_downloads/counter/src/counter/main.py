@@ -30,6 +30,7 @@ PARTITIONS_SQL = (
 # the workers evenly busy when some streams hold more rows than others.
 STREAMS_PER_WORKER = 4
 ATTEMPTS = 3
+UPLOAD_RETRY_SECONDS = 300
 
 
 class SnapshotMoved(RuntimeError):
@@ -123,6 +124,8 @@ def read_partition(day: date, project: str) -> tuple[int, str]:
         json={
             "query": PARTITIONS_SQL,
             "useLegacySql": False,
+            # The snapshot check compares two reads, so neither may come from cache.
+            "useQueryCache": False,
             "location": "US",
             "parameterMode": "NAMED",
             "queryParameters": [
@@ -144,9 +147,14 @@ def read_partition(day: date, project: str) -> tuple[int, str]:
 
 
 def upload(bucket: str, project: str, name: str, path: Path) -> None:
+    """Upload one file. Overwriting the same object is safe, so a transient failure retries."""
     from google.cloud import storage
+    from google.cloud.storage.retry import DEFAULT_RETRY
 
-    storage.Client(project=project).bucket(bucket).blob(name).upload_from_filename(str(path))
+    # By default the library retries an upload only when it carries a generation
+    # precondition; a failed upload here would waste the whole day's count.
+    blob = storage.Client(project=project).bucket(bucket).blob(name)
+    blob.upload_from_filename(str(path), retry=DEFAULT_RETRY.with_timeout(UPLOAD_RETRY_SECONDS))
 
 
 def _now() -> str:
