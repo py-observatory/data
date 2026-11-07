@@ -1,0 +1,36 @@
+id = "pypi-downloads"
+description = "Each PyPI project's downloads for each UTC day, counted from PyPI's public BigQuery table."
+
+[[upstreams]]
+name = "PyPI downloads in BigQuery (bigquery-public-data.pypi.file_downloads)"
+url = "https://docs.pypi.org/api/bigquery/"
+licence = "NOASSERTION"
+terms = "https://docs.pypi.org/api/bigquery/"
+
+[tables]
+meta = "snapshot"
+projects = "append"
+days = "append"
+breaks = "append"
+spend = "snapshot"
+counts = "append"
+
+[gcp]
+project = "py-observatory"
+project_number = "893320255656"
+region = "us-central1"
+bucket = "py-observatory-counts"
+job = "counter"
+subscription = "budget-alerts-pull"
+pool = "github"
+provider = "data"
+service_account = "downloads-github@py-observatory.iam.gserviceaccount.com"
+deployer = "counter-deployer@py-observatory.iam.gserviceaccount.com"
+counter_service_account = "counter-runtime@py-observatory.iam.gserviceaccount.com"
+image_repo = "us-central1-docker.pkg.dev/py-observatory/counter/counter"
+
+[counter]
+cpu = 4
+memory_gib = 2
+task_timeout_seconds = 1800
+workers = 4

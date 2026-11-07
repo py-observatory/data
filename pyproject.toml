@@ -12,7 +12,7 @@ build-backend = "uv_build"
 dev = ["pytest>=8.4"]
 
 [tool.uv.workspace]
-members = ["streams/pypi_registry", "streams/osv_pypi", "catalog"]
+members = ["streams/pypi_registry", "streams/osv_pypi", "streams/pypi_downloads", "catalog"]
 exclude = ["streams/pypi_downloads/counter"]
 
 [tool.pytest.ini_options]
