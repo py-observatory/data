@@ -103,7 +103,11 @@ def _expand(db_zst: Path, db: Path) -> None:
         raise CountsError(f"the database is not valid zstd: {e}") from None
 
 
-def _check_name(name: str) -> None:
+def _check_name(name: object) -> None:
+    # The column is TEXT, but SQLite stores whatever it is given, so a name may be a
+    # number or a blob.
+    if not isinstance(name, str):
+        raise CountsError(f"a project name is not text: {name!r:.40}")
     if not name or len(name) > _MAX_NAME_LENGTH or not name.isprintable():
         raise CountsError(
             f"a project name is empty, over {_MAX_NAME_LENGTH} characters or not "
@@ -120,9 +124,17 @@ def _merged(conn: sqlite3.Connection) -> tuple[dict[str, tuple[int, int]], int]:
         "SELECT project, downloads, mirror_downloads FROM counts"
     ):
         _check_name(name)
-        if not isinstance(downloads, int) or downloads < 1:
+        if not isinstance(downloads, int):
+            raise CountsError(
+                f"{name!r} has a downloads count that is not an integer: {downloads!r}"
+            )
+        if downloads < 1:
             raise CountsError(f"{name!r} has a downloads count below 1: {downloads!r}")
-        if not isinstance(mirror, int) or not 0 <= mirror <= downloads:
+        if not isinstance(mirror, int):
+            raise CountsError(
+                f"{name!r} has a mirror count that is not an integer: {mirror!r}"
+            )
+        if not 0 <= mirror <= downloads:
             raise CountsError(
                 f"{name!r} has a mirror count outside 0..downloads: {mirror!r}"
             )

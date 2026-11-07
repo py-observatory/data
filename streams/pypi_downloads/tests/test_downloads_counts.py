@@ -137,6 +137,9 @@ def sqlite_bytes(tmp_path, schema, rows):
         (("a", -1, 0), "below 1"),
         (("a", 2, 3), "outside 0..downloads"),
         (("a", 2, -1), "outside 0..downloads"),
+        (("a", 2.5, 0), "downloads count that is not an integer"),
+        (("a", 3, 1.5), "mirror count that is not an integer"),
+        ((b"blob", 3, 0), "name is not text"),
     ],
 )
 def test_counts_out_of_range_are_refused(tmp_path, work, row, reason):
@@ -147,7 +150,7 @@ def test_counts_out_of_range_are_refused(tmp_path, work, row, reason):
     raw = sqlite_bytes(tmp_path, loose, [row])
     summary, db = counts_file(DAY, {}, raw_db=raw, null_project_rows=0)
     parsed = json.loads(summary)
-    parsed |= {"rows_counted": row[1], "rows_bigquery": row[1]}
+    parsed |= {"rows_counted": 3, "rows_bigquery": 3}
     with pytest.raises(CountsError, match=reason):
         read_counts(json.dumps(parsed).encode(), db, DAY, work)
 
