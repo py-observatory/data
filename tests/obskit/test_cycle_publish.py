@@ -152,6 +152,36 @@ def test_publish_first_makes_base_and_current(tmp_path, monkeypatch):
     )
 
 
+def test_publish_first_writes_series_breaks(tmp_path):
+    stream = ToyStream(tmp_path)
+    workdir = stream.workdir()
+    write_state(workdir / TOY.state_db, BASE, applied_seq=2)
+    write_delta(workdir / TOY.open_delta_db, [(1, "a", "1"), (2, "b", "2")])
+    breaks = [
+        {"day": "2018-07-26", "note": "Earlier days are undercounted."},
+        {"day": "2026-08-24", "note": "The upstream stopped counting a kind."},
+    ]
+
+    publish_first(
+        stream.gh,
+        TOY,
+        workdir,
+        today=date(2026, 11, 2),
+        moment="2026-11-02T06:00:00Z",
+        data_through=Watermark("2026-11-02", "day"),
+        cursor="2",
+        coverage={"items": 2},
+        complete=True,
+        series_breaks=breaks,
+    )
+
+    # The stream's known breaks are in its first manifest, and every later manifest
+    # goes on from them.
+    assert stream.manifest().series_breaks == breaks
+    stream.run("2026-11-02T12:00:00Z", [("c", "3")])
+    assert stream.manifest().series_breaks == breaks
+
+
 def test_publish_blocks_on_a_gate_failure_unless_overridden(tmp_path):
     stream = ToyStream(tmp_path)
     seeded = stream.seed(BASE, LAST_TWO_DAYS)

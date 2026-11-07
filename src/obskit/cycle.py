@@ -639,6 +639,7 @@ def publish_first(
     cursor: str | None,
     coverage: dict,
     complete: bool,
+    series_breaks: list[dict] | None = None,
 ) -> None:
     """Publish a stream's first state, which its first run left in `workdir` with the
     open delta.
@@ -646,6 +647,9 @@ def publish_first(
     Both are compressed, and the state is copied as the base of today's month and
     added to the month's release. Then both are swapped into the current release,
     which is created, with a manifest that has no prior (see `build_manifest`).
+    `series_breaks` starts the manifest's log of series breaks, for a stream that
+    knows of breaks in its upstream before its first run. Every later manifest goes
+    on from it.
 
     It does not check that the stream has never published: only a first run calls it,
     once `fetch_prior` with `bootstrap` has found no current release. The base copy is
@@ -668,4 +672,5 @@ def publish_first(
         complete=complete,
         moment=moment,
     )
+    manifest = replace(manifest, series_breaks=list(series_breaks or []))
     publish_current(gh, store.stream, files, manifest, bootstrap=True)

@@ -8,7 +8,7 @@ The stream is event sourced on the kit's delta (`obskit.delta`). The state has:
 - `projects`: each project's id, name and first day.
 - `days`: one row for each day counted, with what the counter reported.
 - `breaks`: the days where the series changes meaning.
-- `spend`: the latest budget notification of each billing month.
+- `spend`: the newest budget notification of each billing month.
 
 Days are stored as the number of days since 1970-01-01.
 
@@ -192,11 +192,15 @@ def _apply_break(state: sqlite3.Connection, row: tuple) -> None:
 
 
 def _apply_spend(state: sqlite3.Connection, row: tuple) -> None:
-    # A later notice for a month replaces the earlier one.
+    # A newer notice for a month replaces the one held, and an older one is dropped:
+    # Pub/Sub can deliver an older notice after a newer one, and its lower cost would
+    # lift a stop. The times are Pub/Sub's, in UTC, so they compare as text to the
+    # second.
     state.execute(
         "INSERT INTO spend (month, cost, budget, notified_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT (month) DO UPDATE SET cost = excluded.cost, "
-        "budget = excluded.budget, notified_at = excluded.notified_at",
+        "budget = excluded.budget, notified_at = excluded.notified_at "
+        "WHERE excluded.notified_at > spend.notified_at",
         row[1:],
     )
 
@@ -282,9 +286,9 @@ def apply(state: sqlite3.Connection, delta: sqlite3.Connection) -> None:
     every replay does. This is the stream's `Store.apply`. It never reads `counts`.
 
     A `projects`, `days` or `breaks` row whose key is in the state already raises
-    sqlite3.IntegrityError, and a `spend` row replaces the month's. Raises ValueError
-    when the state has no applied_seq, which a bootstrap writes, and as `apply_rows`
-    does.
+    sqlite3.IntegrityError, and a `spend` row replaces the month's only when it was
+    notified later. Raises ValueError when the state has no applied_seq, which a
+    bootstrap writes, and as `apply_rows` does.
     """
     applied = meta(state, "applied_seq")
     if applied is None:

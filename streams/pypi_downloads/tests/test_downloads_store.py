@@ -89,6 +89,24 @@ def test_apply_adds_projects_days_breaks_and_upserts_spend(state, delta_conn):
     assert meta(state, "applied_seq") == "6"
 
 
+def test_an_older_notice_never_replaces_a_newer_one(state, delta_conn):
+    # Pub/Sub can deliver an older notice after a newer one, in the same run or a
+    # later one. The older notice's lower cost must not lift a stop.
+    d = Delta(delta_conn, NOW)
+    d.spend("2026-11", 0.5, 1.0, "2026-11-06T00:00:00Z")
+    d.spend("2026-11", 0.0, 1.0, "2026-11-05T00:00:00Z")
+    delta_conn.commit()
+    apply(state, delta_conn)
+    newest = [("2026-11", 0.5, 1.0, "2026-11-06T00:00:00Z")]
+    assert state.execute("SELECT * FROM spend").fetchall() == newest
+
+    Delta(delta_conn, NOW).spend("2026-11", 0.0, 1.0, "2026-11-05T12:00:00Z")
+    delta_conn.commit()
+    apply(state, delta_conn)
+    assert state.execute("SELECT * FROM spend").fetchall() == newest
+    assert meta(state, "applied_seq") == "3"
+
+
 def test_apply_never_reads_counts(state, delta_conn):
     d = Delta(delta_conn, NOW)
     d.project(1, "a", 1)
