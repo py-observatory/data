@@ -498,3 +498,48 @@ def test_a_refusal_quotes_google_and_never_the_token_or_the_query():
     )
     assert "sekret-token" not in text
     assert sleeps == []
+
+
+def test_a_credentials_backed_google_retries_a_401_with_a_new_token():
+    seen = Spy()
+    creds = Credentials(FED, transport=seen, environ=ENV)
+    google = Google(creds.token, renew=creds.invalidate, transport=seen)
+    seen.fail_next(401, url_contains="run.googleapis.com")
+    assert google.executions(PROJECT, REGION, JOB) == []
+    bearers = [h["Authorization"] for m, u, h, b in seen.sent if "run.googleapis" in u]
+    assert bearers == ["Bearer sa-token-1", "Bearer sa-token-2"]
+
+
+def test_a_refused_sign_in_is_raised_at_once():
+    def refused():
+        raise GoogleError("the STS exchange returned HTTP 403", 403)
+
+    sleeps = []
+    google = Google(refused, transport=FakeGoogle(), sleep=sleeps.append)
+    with pytest.raises(GoogleError) as caught:
+        google.executions(PROJECT, REGION, JOB)
+    assert caught.value.status == 403
+    assert sleeps == []
+
+
+def test_a_sign_in_that_got_no_reply_is_retried():
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise GoogleError("the STS exchange failed: TimeoutError")
+        return "t"
+
+    sleeps = []
+    google = Google(flaky, transport=FakeGoogle(), sleep=sleeps.append)
+    assert google.executions(PROJECT, REGION, JOB) == []
+    assert sleeps == [2]
+
+
+def test_every_pull_returns_immediately():
+    spy = Spy()
+    google, _, _ = make_google(spy)
+    google.pull(PROJECT, "budget-alerts-pull", max_messages=7)
+    bodies = [json.loads(b) for m, u, h, b in spy.sent if u.endswith(":pull")]
+    assert bodies == [{"maxMessages": 7, "returnImmediately": True}]

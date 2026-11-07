@@ -129,6 +129,12 @@ class Credentials:
         assert self._token is not None
         return self._token
 
+    def invalidate(self) -> None:
+        """Forget the token held, so the next `token()` exchanges anew. A caller does this
+        when Google refused the token as it stood, which can happen well before its end
+        (it was revoked, or the clocks differ)."""
+        self._token = None
+
     def _exchange(self) -> None:
         federated = self._federated(self._github_token())
         token, expire_time = self._impersonated(federated)
@@ -270,18 +276,23 @@ class Google:
     A request that fails with 429, a 5xx status or a network error is tried again after
     2, 4, 8, 16 and 32 seconds, or after the wait that the reply's `retry-after` asks
     for, up to 5 minutes, and then fails. A 401 is tried once more at once with a fresh
-    `token()`, in case the token ran out in flight.
+    `token()`, in case the token ran out in flight. `renew`, when given, is called first
+    to drop the token held (`Credentials.invalidate`), so that the fresh one is new.
+    A failure to get a token is retried only when it may pass: no reply at all, 429 or
+    a 5xx status. A refused sign-in is raised at once.
     """
 
     def __init__(
         self,
         token: Callable[[], str],
         *,
+        renew: Callable[[], None] | None = None,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._token = token
+        self._renew = renew
         self._transport = transport if transport is not None else UrllibTransport()
         self._sleep = sleep
         self._clock = clock
@@ -362,7 +373,11 @@ class Google:
         base = f"{_PUBSUB_URL}/{project}/subscriptions/{subscription}"
         messages: list[dict] = []
         while True:
-            reply = self._json("POST", f"{base}:pull", {"maxMessages": max_messages})
+            # Without returnImmediately an empty pull may be held open past the
+            # transport's 60 s timeout. Google discourages the flag for throughput, but
+            # a stream pulls a few times a day.
+            body = {"maxMessages": max_messages, "returnImmediately": True}
+            reply = self._json("POST", f"{base}:pull", body)
             where = f"POST {base}:pull"
             received = _list_of_objects(reply, "receivedMessages", where)
             if not received:
@@ -419,14 +434,16 @@ class Google:
                     {"Authorization": f"Bearer {self._token()}"},
                     payload,
                 )
-            except GoogleError:
-                if retries == len(_BACKOFF):
+            except GoogleError as exc:
+                if not _may_pass(exc) or retries == len(_BACKOFF):
                     raise
                 self._sleep(_BACKOFF[retries])
                 retries += 1
                 continue
             if status == 401 and not renewed:
                 renewed = True
+                if self._renew is not None:
+                    self._renew()
                 continue
             if 200 <= status <= 299 or status in accept:
                 return status, raw
@@ -443,6 +460,11 @@ class Google:
         if not isinstance(name, str) or not name:
             raise GoogleError("the reply has no operation `name`")
         return name
+
+
+def _may_pass(error: GoogleError) -> bool:
+    """Whether trying again can help: there was no reply, or it was 429 or a 5xx."""
+    return error.status is None or error.status == 429 or error.status >= 500
 
 
 def _job_path(project: str, region: str, job: str) -> str:
