@@ -26,23 +26,33 @@ WORKFLOW_DIR = ROOT / ".github" / "workflows"
 SCRIPT = ROOT / "scripts" / "rolling-issue.sh"
 KEEPALIVE = ROOT / "scripts" / "keepalive.sh"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
-EXPECTED = ("backfill.yml", "smoke.yml", "test.yml", "tick.yml")
+EXPECTED = ("backfill.yml", "deploy-counter.yml", "smoke.yml", "test.yml", "tick.yml")
 
 # Every job that writes: the token's `contents: write` is for these alone.
 PUBLISH_JOBS = {
     ("tick.yml", "pypi-registry"),
     ("tick.yml", "osv-pypi"),
+    ("tick.yml", "pypi-downloads"),
     ("tick.yml", "catalog"),
     ("backfill.yml", "sweep"),
     ("smoke.yml", "smoke"),
 }
+# The jobs that sign in to Google Cloud: they run in the `gcp` environment, which only
+# `main` may deploy to, and are the only ones that may ask GitHub for an OIDC token.
+GOOGLE_JOBS = {("tick.yml", "pypi-downloads"), ("deploy-counter.yml", "deploy")}
 REPORT_JOB = ("backfill.yml", "report")
 # What each job with permissions of its own is granted. A job that is not here has the
 # top level's, which is nothing or `contents: read`.
 PERMISSIONS = {
     ("tick.yml", "pypi-registry"): {"contents": "write", "issues": "write"},
     ("tick.yml", "osv-pypi"): {"contents": "write", "issues": "write"},
+    ("tick.yml", "pypi-downloads"): {
+        "contents": "write",
+        "id-token": "write",
+        "issues": "write",
+    },
     ("tick.yml", "catalog"): {"contents": "write", "issues": "write"},
+    ("deploy-counter.yml", "deploy"): {"contents": "read", "id-token": "write"},
     ("backfill.yml", "sweep"): {"contents": "write", "issues": "write"},
     ("backfill.yml", "redispatch"): {"actions": "write"},
     REPORT_JOB: {"actions": "write", "contents": "read", "issues": "write"},
@@ -52,6 +62,7 @@ PERMISSIONS = {
 DISPATCH_JOBS = {("backfill.yml", "redispatch"), REPORT_JOB}
 REGISTRY_GROUP = {"group": "stream-pypi-registry", "cancel-in-progress": "false"}
 OSV_GROUP = {"group": "stream-osv-pypi", "cancel-in-progress": "false"}
+DOWNLOADS_GROUP = {"group": "stream-pypi-downloads", "cancel-in-progress": "false"}
 CATALOG_GROUP = {"group": "catalog", "cancel-in-progress": "false"}
 # The streams that tick.yml runs, each in a job named for it, and the command that the
 # run step of the job starts. `--bootstrap`, and `--override-reason` with its reason,
@@ -64,6 +75,10 @@ TICK_COMMANDS = {
     "osv-pypi": [
         *["uv", "run", "--package", "osv-pypi", "python", "-m", "osv_pypi"],
         *["run", "--max-seconds", "1200"],
+    ],
+    "pypi-downloads": [
+        *["uv", "run", "--package", "pypi-downloads", "python", "-m", "pypi_downloads"],
+        *["run", "--max-seconds", "3000"],
     ],
     # The catalog has no budget of its own: its limits are its job's and its step's.
     "catalog": ["uv", "run", "--package", "catalog", "python", "-m", "catalog", "run"],
@@ -437,18 +452,27 @@ def test_job_timeouts_leave_room_after_the_run_budget():
     a few minutes at most to compress on a runner. Its step of 27 minutes leaves 7 for
     that and for the record in hand, so it needs none of the registry's room.
 
+    The downloads run starts no day after 3,000 s (50 minutes), but that only decides
+    whether a day starts. A day started just before it waits for the counter's job, whose
+    task is allowed 1,800 s, plus a margin of 300 s and one 30 s poll: 2,100 s and 30 s.
+    Publishing then takes a few minutes, call it 300 s. So the run can last 3,000 + 2,130
+    + 300 s, about 90 minutes, and its step of 97 minutes leaves 47 after the deadline,
+    seven more than the longest day and the publish need. Its job's limit is 100.
+
     The catalog has no budget to pass: it reads what the streams published, builds one
     database and publishes it. Its step of 57 minutes ends it three minutes before its
     job's 60, which is time enough to open the issue.
     """
     assert scalar(job_of("tick.yml", "pypi-registry"), "timeout-minutes", 4) == "330"
     assert scalar(job_of("tick.yml", "osv-pypi"), "timeout-minutes", 4) == "30"
+    assert scalar(job_of("tick.yml", "pypi-downloads"), "timeout-minutes", 4) == "100"
     assert scalar(job_of("tick.yml", "catalog"), "timeout-minutes", 4) == "60"
     assert scalar(job_of("backfill.yml", "sweep"), "timeout-minutes", 4) == "300"
     assert scalar(job_of("smoke.yml", "smoke"), "timeout-minutes", 4) == "15"
 
     assert step_limit("tick.yml", "pypi-registry", "pypi_registry run") == 327
     assert step_limit("tick.yml", "osv-pypi", "osv_pypi run") == 27
+    assert step_limit("tick.yml", "pypi-downloads", "pypi_downloads run") == 97
     assert step_limit("tick.yml", "catalog", "catalog run") == 57
     assert "--max-seconds" not in tick_script("catalog")
     assert step_limit("backfill.yml", "sweep", "pypi_registry sweep") == 297
@@ -458,6 +482,8 @@ def test_job_timeouts_leave_room_after_the_run_budget():
     for file, job, mentions, least in [
         ("tick.yml", "pypi-registry", "pypi_registry run", 45),
         ("tick.yml", "osv-pypi", "osv_pypi run", 5),
+        # A day that starts at the deadline waits 2,130 s for the counter, then publishes.
+        ("tick.yml", "pypi-downloads", "pypi_downloads run", 41),
         ("backfill.yml", "sweep", "pypi_registry sweep", 45),
     ]:
         budget = re.findall(r"--max-seconds (\d+)", one_script(file, job, mentions))
@@ -574,6 +600,49 @@ def test_the_catalog_job_has_its_own_concurrency_group():
     assert CATALOG_GROUP["group"] not in {REGISTRY_GROUP["group"], OSV_GROUP["group"]}
 
 
+def test_the_downloads_job_has_its_own_concurrency_group():
+    """Only the tick publishes pypi-downloads-current, so it must never run twice at
+    once, and a run that has begun, which may be waiting for the counter, is never
+    cancelled by a newer one. The group is no other stream's."""
+    downloads = {
+        (file, name): body
+        for file, name, body in all_jobs()
+        if "python -m pypi_downloads run" in body
+    }
+    assert set(downloads) == {("tick.yml", "pypi-downloads")}
+    group = mapping(downloads["tick.yml", "pypi-downloads"], "concurrency", 4)
+    assert group == DOWNLOADS_GROUP
+    others = {REGISTRY_GROUP["group"], OSV_GROUP["group"], CATALOG_GROUP["group"]}
+    assert DOWNLOADS_GROUP["group"] not in others
+
+
+def test_only_the_jobs_that_reach_google_get_an_id_token_and_the_gcp_environment():
+    """The provider admits only the environment `gcp`, and an OIDC token is what the
+    sign-in is made from. So the permission, and the environment that allows it, belong
+    to the job that runs the stream and the one that deploys the counter, and to no
+    other: a job that could ask for a token without the environment would get nowhere,
+    and one in the environment without need would be a way in that nothing uses."""
+    with_token = set()
+    in_environment = set()
+    for file, name, body in all_jobs():
+        granted = mapping(body, "permissions", 4)
+        if isinstance(granted, dict) and "id-token" in granted:
+            assert granted["id-token"] == "write", f"{file}: {name}"
+            with_token.add((file, name))
+        if scalar(body, "environment", 4) is not None:
+            assert scalar(body, "environment", 4) == "gcp", f"{file}: {name}"
+            in_environment.add((file, name))
+    assert with_token == GOOGLE_JOBS
+    assert in_environment == GOOGLE_JOBS
+    for text in workflows().values():
+        outside = [
+            line
+            for line in split_jobs(text)[0].splitlines()
+            if not line.startswith("#")
+        ]
+        assert "id-token" not in "\n".join(outside), "never for a whole workflow"
+
+
 def test_the_osv_job_runs_beside_the_registry_job():
     """osv-pypi is the tick's second stream. It is set up as the registry is, with the
     same pinned checkout, which keeps no token, and the same pinned uv. It syncs its own
@@ -581,7 +650,7 @@ def test_the_osv_job_runs_beside_the_registry_job():
     issue. Nothing makes it wait for the registry's job or skip it: a registry run that
     takes hours or fails must not hold the other stream back."""
     jobs = split_jobs(workflows()["tick.yml"])[1]
-    assert list(jobs) == ["pypi-registry", "osv-pypi", "catalog"]
+    assert list(jobs) == ["pypi-registry", "osv-pypi", "pypi-downloads", "catalog"]
     registry, osv = jobs["pypi-registry"], jobs["osv-pypi"]
     for job in (registry, osv):
         assert entry(job, "needs", 4) is None
@@ -1086,6 +1155,13 @@ def test_inputs_reach_scripts_through_the_environment():
         assert {name: env.get(name) for name in wanted} == wanted, stream
 
 
+def test_the_catalog_does_not_wait_for_the_downloads_job():
+    """The downloads run can take an hour and a half, and the catalog does not read it
+    yet, so its job still waits for osv-pypi alone."""
+    assert scalar(job_of("tick.yml", "catalog"), "needs", 4) == "osv-pypi"
+    assert entry(job_of("tick.yml", "pypi-downloads"), "needs", 4) is None
+
+
 def test_triggers():
     tick = split_jobs(workflows()["tick.yml"])[0]
     assert re.search(r"(?m)^    - cron: [\"']23 \*/6 \* \* \*[\"']\s*$", tick)
@@ -1100,7 +1176,7 @@ def test_triggers():
         choice = entry(inputs, name, 6)[1]
         assert scalar(choice, "type", 8) == "choice", name
         assert sequence(choice, "options", 8) == [
-            *["none", "pypi-registry", "osv-pypi", "catalog"]
+            *["none", "pypi-registry", "osv-pypi", "pypi-downloads", "catalog"]
         ]
         assert scalar(choice, "default", 8) == "none", name
         # A job of the tick that no option names could never be bootstrapped, and an
@@ -1134,6 +1210,7 @@ def test_every_stream_job_reports_to_the_rolling_issue():
     expected = {
         ("tick.yml", "pypi-registry"): ("pypi-registry", ["failure", "success"]),
         ("tick.yml", "osv-pypi"): ("osv-pypi", ["failure", "success"]),
+        ("tick.yml", "pypi-downloads"): ("pypi-downloads", ["failure", "success"]),
         ("tick.yml", "catalog"): ("catalog", ["failure", "success"]),
         ("backfill.yml", "sweep"): ("pypi-registry-backfill", ["failure", "success"]),
         ("smoke.yml", "smoke"): ("kit-smoke", ["failure", "success"]),
@@ -1168,7 +1245,11 @@ def test_checkouts_do_not_keep_the_token():
                 checked_out.add((file, name))
     # So that the loop above looks at something: every job that runs the repository's
     # code or scripts checks it out.
-    assert checked_out == PUBLISH_JOBS | {REPORT_JOB, ("test.yml", "test")}
+    assert checked_out == PUBLISH_JOBS | {
+        REPORT_JOB,
+        ("deploy-counter.yml", "deploy"),
+        ("test.yml", "test"),
+    }
 
 
 def test_the_build_is_pinned():
@@ -1195,6 +1276,92 @@ def test_workflows_run_the_locked_environment():
     for file, name, body in all_jobs():
         if (file, name) in PUBLISH_JOBS:
             assert "uv sync --locked" in "\n".join(run_scripts(body)), f"{file}: {name}"
+
+
+def deploy_steps() -> list[str]:
+    return steps(job_of("deploy-counter.yml", "deploy"))
+
+
+def test_deploy_counter_triggers():
+    """It deploys when the counter, or this workflow, changes on main, and when it is
+    dispatched, and on nothing else: not a pull request, whose code could then sign in."""
+    outside = split_jobs(workflows()["deploy-counter.yml"])[0]
+    triggers = entry(outside, "on", 0)[1]
+    assert sorted(re.findall(r"(?m)^ {2}(\w+):", triggers)) == [
+        "push",
+        "workflow_dispatch",
+    ]
+    push = entry(triggers, "push", 2)[1]
+    assert sequence(push, "branches", 4) == ["main"]
+    paths = [p.strip("\"'") for p in sequence(push, "paths", 4)]
+    assert paths == [
+        "streams/pypi_downloads/counter/**",
+        ".github/workflows/deploy-counter.yml",
+    ]
+    assert mapping(outside, "permissions", 0) == {}
+    jobs = split_jobs(workflows()["deploy-counter.yml"])[1]
+    assert list(jobs) == ["deploy"]
+    assert scalar(jobs["deploy"], "timeout-minutes", 4) == "30"
+
+
+def test_deploy_counter_removes_its_token_whatever_happens():
+    """The token is a credential for Google Cloud, so it goes to a file and never to the
+    log: it is masked in the step that writes it, before anything could print it, and the
+    file is removed by a step that runs whether or not the others did."""
+    texts = deploy_steps()
+    mentions = [i for i, text in enumerate(texts) if "RUNNER_TEMP/token" in text]
+    writer, *readers, last = mentions
+    assert last == len(texts) - 1, "the removal is the last step"
+    assert step_if(texts[last]) == "always()"
+    assert run_scripts(texts[last]) == ['rm -f "$RUNNER_TEMP/token"']
+
+    [script] = run_scripts(texts[writer])
+    assert "obskit.gcp token" in script
+    assert '> "$RUNNER_TEMP/token"' in script
+    mask = 'echo "::add-mask::$(cat "$RUNNER_TEMP/token")"'
+    assert mask in script
+    assert script.index('> "$RUNNER_TEMP/token"') < script.index(mask)
+    assert script.rstrip().endswith(mask), "nothing follows the mask that could print"
+    assert not re.search(r"(?m)^\s*set\s+-\S*x", script), "no trace of the commands"
+    # Nothing but the sign-in reads the file, and it reads it into a pipe, not a log.
+    for index in readers:
+        for script in run_scripts(texts[index]):
+            lines = [
+                line for line in script.splitlines() if "RUNNER_TEMP/token" in line
+            ]
+            assert all("--password-stdin" in line and "<" in line for line in lines)
+    for text in texts:
+        assert "${{ " not in text.replace("actions/", ""), "no expression in a step"
+
+
+def test_deploy_counter_builds_pushes_and_deploys_in_order():
+    """The image is built on the runner (ubuntu-latest is linux/amd64, which Cloud Run
+    runs), named for the commit, pushed after the sign-in and deployed by digest-free
+    tag through the stream's own command."""
+    texts = deploy_steps()
+    in_order = [
+        "actions/checkout",
+        "astral-sh/setup-uv",
+        "uv sync --locked --package pypi-downloads",
+        "obskit.gcp token",
+        "docker build",
+        "docker login",
+        "docker push",
+        "python -m pypi_downloads deploy",
+        "rm -f",
+    ]
+    assert len(texts) == len(in_order)
+    for text, wanted in zip(texts, in_order, strict=True):
+        assert wanted in text
+    assert texts[:2] == steps(job_of("tick.yml", "pypi-registry"))[:2]
+    assert 'docker build -t "$IMAGE" streams/pypi_downloads/counter' in texts[4]
+    assert "docker login -u oauth2accesstoken --password-stdin" in texts[5]
+    assert "us-central1-docker.pkg.dev" in texts[5]
+    assert 'docker push "$IMAGE"' in texts[6]
+    assert '--image "$IMAGE"' in texts[7]
+    assert (
+        "IMAGE=" in texts[3] and "image_repo" in texts[3] and "GITHUB_SHA" in texts[3]
+    )
 
 
 # --- scripts/rolling-issue.sh ---
