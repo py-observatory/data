@@ -455,9 +455,13 @@ class FakeGoogle:
       succeeded once is used. The Execution is given a `name` when it has none.
     - `operations` maps an operation's name to the operation, so a test can make one
       that never finishes, or ends in an error.
-    - `messages` holds the Pub/Sub messages as JSON objects, and `pull` drains them. The
-      ackIds it was sent are in `acked`, and `publish_time` is what it says it was
-      published at.
+    - `messages` holds the Pub/Sub messages as JSON objects, and `pull` drains them,
+      each under a new ackId, with `publish_time` as the time it says it was published
+      at. A message pulled and not acknowledged is held back from later pulls until
+      `expire_leases`, as Pub/Sub holds it until the subscription's ack deadline, and
+      is then delivered again, first, with the time it was first given. The ackIds that
+      `acknowledge` was sent are in `acked`. An ackId whose lease has run out
+      acknowledges nothing, as Pub/Sub may ignore it.
     - `partitions` maps a partition id (such as "20261109") to (total_rows, modified),
       and the one BigQuery query that is served, a read of INFORMATION_SCHEMA.PARTITIONS,
       answers with a row `[partition_id, str(total_rows), modified]` for each id it
@@ -485,6 +489,10 @@ class FakeGoogle:
         self.operations: dict[str, dict] = {}
         self.messages: list[dict] = []
         self.acked: list[str] = []
+        # The messages pulled and not acknowledged, by ackId, and those whose lease has
+        # run out, to be delivered again, each with its time of publishing.
+        self._leased: dict[str, tuple[dict, str]] = {}
+        self._redelivered: list[tuple[dict, str]] = []
         self.publish_time = "2026-11-06T07:00:00.000Z"
         self.partitions: dict[str, tuple[int, str]] = {}
         self.queries: list[str] = []
@@ -656,24 +664,39 @@ class FakeGoogle:
             return _google_error(404, "no such object")
         return 200, {"content-type": "application/octet-stream"}, data
 
+    def expire_leases(self) -> None:
+        """Let the lease of every message pulled and not acknowledged run out, as when
+        the subscription's ack deadline passes: the next pull delivers them again,
+        before any other message, under new ackIds."""
+        self._redelivered.extend(self._leased.values())
+        self._leased.clear()
+
     def _pubsub(self, call: _GoogleCall) -> _Reply:
         body = _json_object(call.body) or {}
         if call.url.endswith(":pull"):
-            batch = self.messages[: body.get("maxMessages", 100)]
-            del self.messages[: len(batch)]
+            limit = body.get("maxMessages", 100)
+            batch = self._redelivered[:limit]
+            del self._redelivered[: len(batch)]
+            fresh = self.messages[: limit - len(batch)]
+            del self.messages[: len(fresh)]
+            batch += [(message, self.publish_time) for message in fresh]
             received = []
-            for message in batch:
+            for message, published in batch:
                 self._pulled += 1
+                ack_id = f"ack-{self._pulled}"
+                self._leased[ack_id] = (message, published)
                 data = base64.b64encode(json.dumps(message).encode()).decode()
                 received.append(
                     {
-                        "ackId": f"ack-{self._pulled}",
-                        "message": {"data": data, "publishTime": self.publish_time},
+                        "ackId": ack_id,
+                        "message": {"data": data, "publishTime": published},
                     }
                 )
             return _reply(200, {"receivedMessages": received} if received else {})
         if call.url.endswith(":acknowledge"):
-            self.acked.extend(body.get("ackIds", []))
+            for ack_id in body.get("ackIds", []):
+                self.acked.append(ack_id)
+                self._leased.pop(ack_id, None)
             return _reply(200, {})
         raise NotImplementedError(
             f"FakeGoogle has no route for {call.method} {call.url}"

@@ -7,7 +7,7 @@ exchanged again, so a run that lasts longer than the token's hour keeps working.
 
 `Google` is the few calls that a stream makes with that token: run a Cloud Run job and
 wait for it, list its executions, deploy it, read a Cloud Storage object, pull Pub/Sub
-messages and run a BigQuery metadata query.
+messages and acknowledge them, and run a BigQuery metadata query.
 
 A reply that is not a success is a GoogleError. No token, and no reply body that could
 hold one, is ever put in an error message.
@@ -364,12 +364,22 @@ class Google:
         return raw
 
     def pull(
-        self, project: str, subscription: str, *, max_messages: int = 100
+        self,
+        project: str,
+        subscription: str,
+        *,
+        max_messages: int = 100,
+        acknowledge: bool = True,
     ) -> list[dict]:
         """Every message waiting in a Pub/Sub subscription, decoded from its JSON, with
-        the time Pub/Sub published it added as `publishTime`. Each batch is acknowledged
-        once it is decoded, so a message is delivered to a run only once. A message that
-        is not a JSON object raises a GoogleError and is left unacknowledged."""
+        the time Pub/Sub published it added as `publishTime`. A message that is not a
+        JSON object raises a GoogleError and is left unacknowledged.
+
+        With `acknowledge`, each batch is acknowledged once it is decoded, so a message
+        is delivered to a run only once. Without it nothing is acknowledged, and each
+        message also carries its `ackId`, for `acknowledge` once the caller has kept
+        what it says. Until then Pub/Sub holds the messages back from other pulls, and
+        once the subscription's ack deadline has passed it delivers them again."""
         base = f"{_PUBSUB_URL}/{project}/subscriptions/{subscription}"
         messages: list[dict] = []
         while True:
@@ -382,21 +392,41 @@ class Google:
             received = _list_of_objects(reply, "receivedMessages", where)
             if not received:
                 return messages
-            messages.extend(_decoded(item, where) for item in received)
+            decoded = [_decoded(item, where) for item in received]
             ack_ids = [item["ackId"] for item in received]
-            self._json("POST", f"{base}:acknowledge", {"ackIds": ack_ids})
+            if acknowledge:
+                messages.extend(decoded)
+                self.acknowledge(project, subscription, ack_ids)
+            else:
+                messages.extend(
+                    {**message, "ackId": ack_id}
+                    for message, ack_id in zip(decoded, ack_ids, strict=True)
+                )
+
+    def acknowledge(self, project: str, subscription: str, ack_ids: list[str]) -> None:
+        """Acknowledge the messages of a Pub/Sub subscription that `pull` gave under
+        `ack_ids`, so that they are not delivered again. An empty list sends nothing.
+        Pub/Sub may ignore an ackId whose ack deadline has passed, and then delivers its
+        message again."""
+        if not ack_ids:
+            return
+        url = f"{_PUBSUB_URL}/{project}/subscriptions/{subscription}:acknowledge"
+        self._json("POST", url, {"ackIds": list(ack_ids)})
 
     def query(
         self, project: str, sql: str, *, location: str = "US"
     ) -> list[list[str | None]]:
-        """Run a BigQuery query and return its rows, each as a list of cell values. A
-        query that has not finished within a minute raises a GoogleError."""
+        """Run a BigQuery query, never answered from the cache, and return its rows,
+        each as a list of cell values. A query that has not finished within a minute
+        raises a GoogleError."""
         url = f"{_BIGQUERY_URL}/{project}/queries"
         body = {
             "query": sql,
             "useLegacySql": False,
             "location": location,
             "timeoutMs": _QUERY_TIMEOUT_MS,
+            # A reply from BigQuery's cache could hide what has changed since.
+            "useQueryCache": False,
         }
         reply = self._json("POST", url, body)
         if reply.get("jobComplete") is not True:

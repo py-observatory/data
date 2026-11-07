@@ -352,6 +352,69 @@ def test_pull_decodes_and_acknowledges_every_message():
     assert google.pull(PROJECT, "budget-alerts-pull") == []
 
 
+def test_pull_without_acknowledging_gives_ack_ids_and_the_messages_come_back():
+    fake = FakeGoogle()
+    notes = [{"costAmount": float(i), "budgetAmount": 1.0} for i in range(3)]
+    fake.messages = list(notes)
+    fake.publish_time = "2026-11-12T08:00:00.000Z"
+    google, _, _ = make_google(fake)
+
+    got = google.pull(PROJECT, "budget-alerts-pull", max_messages=2, acknowledge=False)
+
+    first_ids = ["ack-1", "ack-2", "ack-3"]
+    assert got == [
+        {**n, "publishTime": "2026-11-12T08:00:00.000Z", "ackId": ack_id}
+        for n, ack_id in zip(notes, first_ids)
+    ]
+    assert fake.acked == []
+    # While their lease holds, the messages are not delivered again.
+    assert google.pull(PROJECT, "budget-alerts-pull", acknowledge=False) == []
+
+    # Once it has run out, Pub/Sub delivers them again, as they were published, under
+    # new ackIds. A message published since comes after them.
+    fake.expire_leases()
+    fake.messages.append({"costAmount": 3.0, "budgetAmount": 1.0})
+    fake.publish_time = "2026-11-12T09:00:00.000Z"
+    again = google.pull(PROJECT, "budget-alerts-pull", acknowledge=False)
+
+    assert [m["costAmount"] for m in again] == [0.0, 1.0, 2.0, 3.0]
+    assert [m["publishTime"] for m in again] == [
+        *["2026-11-12T08:00:00.000Z"] * 3,
+        "2026-11-12T09:00:00.000Z",
+    ]
+    assert [m["ackId"] for m in again] == ["ack-4", "ack-5", "ack-6", "ack-7"]
+
+    # Acknowledged, they are gone for good. An ackId whose lease ran out acknowledges
+    # nothing, as Pub/Sub may ignore it.
+    google.acknowledge(PROJECT, "budget-alerts-pull", ["ack-1", "ack-4", "ack-5"])
+    fake.expire_leases()
+
+    assert fake.acked == ["ack-1", "ack-4", "ack-5"]
+    left = google.pull(PROJECT, "budget-alerts-pull")
+    assert [m["costAmount"] for m in left] == [2.0, 3.0]
+    fake.expire_leases()
+    assert google.pull(PROJECT, "budget-alerts-pull") == []
+
+
+def test_acknowledge_sends_the_ack_ids_and_nothing_for_none():
+    spy = Spy()
+    google, _, _ = make_google(spy)
+
+    google.acknowledge(PROJECT, "budget-alerts-pull", [])
+
+    assert spy.sent == []
+
+    google.acknowledge(PROJECT, "budget-alerts-pull", ["a-1", "a-2"])
+
+    ((method, url, _, body),) = spy.sent
+    assert (method, url) == (
+        "POST",
+        f"https://pubsub.googleapis.com/v1/projects/{PROJECT}"
+        "/subscriptions/budget-alerts-pull:acknowledge",
+    )
+    assert json.loads(body) == {"ackIds": ["a-1", "a-2"]}
+
+
 def test_pull_refuses_a_message_that_is_not_json_and_leaves_it_unacknowledged():
     class Odd:
         def request(self, method, url, headers, body):
@@ -405,6 +468,7 @@ def test_query_sends_its_options_and_refuses_an_unfinished_job():
                 "useLegacySql": False,
                 "location": "EU",
                 "timeoutMs": 60000,
+                "useQueryCache": False,
             },
         )
     ]
