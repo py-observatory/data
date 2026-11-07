@@ -214,7 +214,9 @@ def _transmit(
     payload: dict | None,
 ) -> tuple[int, dict[str, str], bytes]:
     """One request, whatever its status. A network failure is a GoogleError with no
-    status, and its text is left out of the message because it may quote the URL."""
+    status. Its text is left out of the message, and the transport's error is not
+    chained to it, because it may quote the URL, query and all, and a traceback would
+    show it."""
     sent = {"User-Agent": USER_AGENT, **headers}
     body = None
     if payload is not None:
@@ -225,7 +227,7 @@ def _transmit(
     except OSError as exc:
         raise GoogleError(
             f"{_label(method, url)} failed: {type(exc).__name__}"
-        ) from exc
+        ) from None
 
 
 def _refusal(method: str, url: str, status: int, raw: bytes) -> GoogleError:

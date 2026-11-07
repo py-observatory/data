@@ -137,6 +137,9 @@ def test_a_network_failure_is_a_google_error_with_no_status():
         Credentials(FED, transport=Down(), environ=ENV).token()
     assert caught.value.status is None
     assert "secret-in-the-message" not in str(caught.value)
+    # The transport's error is not chained, so a traceback does not show it either.
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
 
 
 def test_a_reply_without_a_token_is_an_error_that_quotes_no_body():
@@ -525,6 +528,8 @@ def test_a_network_failure_is_retried_and_names_no_url_query_or_text():
     assert caught.value.status is None
     assert "secret-in-the-message" not in str(caught.value)
     assert "alt=media" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
 
 
 def test_a_401_gets_a_fresh_token_once():
