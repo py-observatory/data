@@ -20,7 +20,7 @@ A download made by a mirror client is counted separately. The mirror clients are
 The history class of each table is in `stream.toml`.
 
 - `meta` (state, snapshot): `applied_seq`, `bootstrap_at` and `launch` (the first day that the stream counted, as YYYY-MM-DD), each as a key and its value.
-- `projects` (state, append): `project_id`, the canonical `name`, and `first_day`, the first day that the project had a download, in days since 1970-01-01.
+- `projects` (state, append): `project_id` and the canonical `name`. A project's first day with a download is the earliest `day` of its rows in `counts`. It is not stored here, because the backfill walks backward from launch and the table is append-only, so the day that first named a project is seldom its first.
 - `days` (state, append): one row for each counted day, with `day` (days since 1970-01-01), `rows_bigquery`, `rows_counted`, `partition_modified`, `projects`, `downloads`, `mirror_downloads`, `null_project_rows`, `read_bytes`, the `execution` that counted it (null when the day came from the bucket), its `vcpu_seconds` and `gib_seconds`, `counted_at` and `seq`.
 - `breaks` (state, append): a day on which the series breaks, and a note on why.
 - `spend` (state, snapshot): for each billing month, the cost and the budget that the newest budget notification reported, and when it was sent.

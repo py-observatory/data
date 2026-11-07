@@ -68,8 +68,8 @@ def test_store_names_every_state_table():
 
 def test_apply_adds_projects_days_breaks_and_upserts_spend(state, delta_conn):
     d = Delta(delta_conn, NOW)
-    d.project(1, "requests", 100)
-    d.project(2, "numpy", 101)
+    d.project(1, "requests")
+    d.project(2, "numpy")
     d.day(**day_columns(100))
     d.series_break(100, "a break")
     d.spend("2026-11", 0.0, 1.0, "2026-11-05T00:00:00Z")
@@ -77,8 +77,8 @@ def test_apply_adds_projects_days_breaks_and_upserts_spend(state, delta_conn):
     delta_conn.commit()
     apply(state, delta_conn)
     assert state.execute("SELECT * FROM projects ORDER BY project_id").fetchall() == [
-        (1, "requests", 100),
-        (2, "numpy", 101),
+        (1, "requests"),
+        (2, "numpy"),
     ]
     day = state.execute("SELECT day, execution, seq FROM days").fetchall()
     assert day == [(100, "e1", 3)]
@@ -109,8 +109,8 @@ def test_an_older_notice_never_replaces_a_newer_one(state, delta_conn):
 
 def test_apply_never_reads_counts(state, delta_conn):
     d = Delta(delta_conn, NOW)
-    d.project(1, "a", 1)
-    d.project(2, "b", 1)
+    d.project(1, "a")
+    d.project(2, "b")
     delta_conn.commit()
     assert insert_counts(delta_conn, [(1, 1, 5, 0), (2, 1, 6, 1), (1, 2, 7, 0)]) == 3
     delta_conn.commit()
@@ -122,7 +122,7 @@ def test_apply_never_reads_counts(state, delta_conn):
 
 def test_apply_twice_applies_each_row_once(state, delta_conn):
     d = Delta(delta_conn, NOW)
-    d.project(1, "a", 1)
+    d.project(1, "a")
     delta_conn.commit()
     apply(state, delta_conn)
     apply(state, delta_conn)
@@ -132,8 +132,8 @@ def test_apply_twice_applies_each_row_once(state, delta_conn):
 
 def test_a_project_id_taken_twice_is_refused(state, delta_conn):
     d = Delta(delta_conn, NOW)
-    d.project(1, "a", 1)
-    d.project(1, "b", 1)
+    d.project(1, "a")
+    d.project(1, "b")
     delta_conn.commit()
     with pytest.raises(sqlite3.IntegrityError):
         apply(state, delta_conn)
@@ -164,10 +164,10 @@ def test_a_day_row_with_a_wrong_key_is_refused(delta_conn):
 
 def test_a_delta_goes_on_after_its_highest_seq_and_ignores_counts(delta_conn):
     d = Delta(delta_conn, NOW)
-    d.project(1, "a", 1)
+    d.project(1, "a")
     insert_counts(delta_conn, [(1, 1, 5, 0)])
     delta_conn.commit()
-    Delta(delta_conn, NOW).project(2, "b", 1)
+    Delta(delta_conn, NOW).project(2, "b")
     assert delta_conn.execute("SELECT seq FROM projects ORDER BY seq").fetchall() == [
         (1,),
         (2,),

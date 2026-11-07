@@ -105,12 +105,12 @@ def test_bootstrap_counts_the_launch_day_and_publishes_first(tmp_path):
     assert state.execute("SELECT day, note FROM breaks ORDER BY day").fetchall() == [
         (day_number(day), note) for day, note in BREAKS
     ]
-    # The non-canonical name is stored canonical, and each project is first seen on
-    # the launch day.
+    # The non-canonical name is stored canonical, and the new names take ids in name
+    # order.
     assert state.execute("SELECT * FROM projects ORDER BY project_id").fetchall() == [
-        (1, "new-20261109", day_number(LAUNCH)),
-        (2, "numpy", day_number(LAUNCH)),
-        (3, "requests", day_number(LAUNCH)),
+        (1, "new-20261109"),
+        (2, "numpy"),
+        (3, "requests"),
     ]
     day = state.execute(
         "SELECT day, rows_bigquery, projects, downloads, mirror_downloads, read_bytes, "

@@ -252,10 +252,9 @@ def write_day(
     `state` is the state database, `conn` is the delta's connection and `delta` writes to
     it. A name is known if the state or the delta has it already, because earlier days
     of the same run are in the delta and not yet in the state. Each new name takes the
-    next id above every id of the two, in name order, with the day as its `first_day`.
-    The counts go in by project id, and the `days` row last, with the `name`,
-    `vcpu_seconds` and `gib_seconds` of `execution`, or None for a day taken from the
-    bucket.
+    next id above every id of the two, in name order. The counts go in by project id,
+    and the `days` row last, with the `name`, `vcpu_seconds` and `gib_seconds` of
+    `execution`, or None for a day taken from the bucket.
 
     All of it is one unit (`obskit.delta.atomic`): it commits when the day is written,
     and an error partway, such as a day that was counted already, undoes every row of
@@ -271,7 +270,7 @@ def write_day(
         next_id = max(_top_id(state), _top_id(conn)) + 1
         for name in new:
             ids[name] = next_id
-            delta.project(next_id, name, day)
+            delta.project(next_id, name)
             next_id += 1
         insert_counts(
             conn,

@@ -5,7 +5,10 @@ The stream is event sourced on the kit's delta (`obskit.delta`). The state has:
 
 - `meta`: `applied_seq` (the highest `seq` applied), `bootstrap_at` and `launch` (the
   first day counted by the stream, YYYY-MM-DD).
-- `projects`: each project's id, name and first day.
+- `projects`: each project's id and canonical name. The first day that a project had
+  a download is not kept here: the backfill walks backward, so the day whose count
+  first named a project is seldom its first, and the table is append-only once
+  published. It is the earliest `day` of the project's `counts`.
 - `days`: one row for each day counted, with what the counter reported.
 - `breaks`: the days where the series changes meaning.
 - `spend`: the newest budget notification of each billing month.
@@ -34,8 +37,7 @@ CREATE TABLE meta (
 
 CREATE TABLE projects (
     project_id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    first_day INTEGER NOT NULL
+    name TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE days (
@@ -72,8 +74,7 @@ DELTA_SCHEMA = """
 CREATE TABLE projects (
     seq INTEGER PRIMARY KEY,
     project_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    first_day INTEGER NOT NULL
+    name TEXT NOT NULL
 );
 
 CREATE TABLE days (
@@ -137,9 +138,7 @@ _DAY_COLUMNS = (
     "counted_at",
 )
 
-_INSERT_PROJECT = (
-    "INSERT INTO projects (seq, project_id, name, first_day) VALUES (?, ?, ?, ?)"
-)
+_INSERT_PROJECT = "INSERT INTO projects (seq, project_id, name) VALUES (?, ?, ?)"
 _INSERT_DAY = (
     f"INSERT INTO days (seq, {', '.join(_DAY_COLUMNS)}, observed_at) "
     f"VALUES (?, {', '.join('?' * (len(_DAY_COLUMNS) + 1))})"
@@ -173,9 +172,7 @@ def meta(state: sqlite3.Connection, key: str) -> str | None:
 
 
 def _apply_project(state: sqlite3.Connection, row: tuple) -> None:
-    state.execute(
-        "INSERT INTO projects (project_id, name, first_day) VALUES (?, ?, ?)", row[1:]
-    )
+    state.execute("INSERT INTO projects (project_id, name) VALUES (?, ?)", row[1:])
 
 
 def _apply_day(state: sqlite3.Connection, row: tuple) -> None:
@@ -208,7 +205,7 @@ def _apply_spend(state: sqlite3.Connection, row: tuple) -> None:
 # For each table of a delta that is applied, the columns that are read, `seq` first, and
 # the function that applies a row of them. `counts` is not here: the state holds none.
 _APPLY = {
-    "projects": ("seq, project_id, name, first_day", _apply_project),
+    "projects": ("seq, project_id, name", _apply_project),
     "days": (f"seq, {', '.join(_DAY_COLUMNS)}", _apply_day),
     "breaks": ("seq, day, note", _apply_break),
     "spend": ("seq, month, cost, budget, notified_at", _apply_spend),
@@ -233,9 +230,9 @@ class Delta(DeltaWriter):
             first_seq=first_seq,
         )
 
-    def project(self, project_id: int, name: str, first_day: int) -> None:
-        """Record a project that was first seen on `first_day`."""
-        self._write(_INSERT_PROJECT, (project_id, name, first_day))
+    def project(self, project_id: int, name: str) -> None:
+        """Record a project, by its id and its canonical name."""
+        self._write(_INSERT_PROJECT, (project_id, name))
 
     def day(self, **columns) -> None:
         """Record a counted day. The keys must be exactly the columns of a day (`day`,

@@ -204,7 +204,7 @@ def counted_for(counts):
 
 
 def test_write_day_gives_new_names_the_next_ids_in_name_order(state, delta_conn):
-    state.execute("INSERT INTO projects VALUES (7, 'old', 100)")
+    state.execute("INSERT INTO projects VALUES (7, 'old')")
     state.commit()
     counted = counted_for({"zebra": (1, 0), "apple": (2, 1), "old": (3, 0)})
     new = write_day(
@@ -217,8 +217,8 @@ def test_write_day_gives_new_names_the_next_ids_in_name_order(state, delta_conn)
     )
     assert new == 2
     assert delta_conn.execute(
-        "SELECT project_id, name, first_day FROM projects ORDER BY seq"
-    ).fetchall() == [(8, "apple", day_number(DAY)), (9, "zebra", day_number(DAY))]
+        "SELECT project_id, name FROM projects ORDER BY seq"
+    ).fetchall() == [(8, "apple"), (9, "zebra")]
     assert delta_conn.execute(
         "SELECT * FROM counts ORDER BY project_id"
     ).fetchall() == [
@@ -229,7 +229,7 @@ def test_write_day_gives_new_names_the_next_ids_in_name_order(state, delta_conn)
 
 
 def test_write_day_reuses_known_ids(state, delta_conn):
-    state.execute("INSERT INTO projects VALUES (1, 'requests', 50)")
+    state.execute("INSERT INTO projects VALUES (1, 'requests')")
     state.commit()
     delta = Delta(delta_conn, NOW)
     write_day(
