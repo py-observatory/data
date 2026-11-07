@@ -34,7 +34,7 @@ For each day D the counter writes two objects to the bucket `py-observatory-coun
 - `counts/D.db.zst` is a SQLite database compressed with zstd at level 19. Its `counts` table has one row for each project, with `downloads` above 0 and `mirror_downloads` between 0 and `downloads`. Its `meta` table holds the day, how many rows were counted and how many BigQuery had, when the partition was last modified, the bytes read, how many rows had no project, and the times, streams and workers of the counter's run.
 - `counts/D.json` holds `day`, `db_bytes` and `db_sha256` (of the compressed object), `rows_counted`, `rows_bigquery`, `partition_modified`, `read_bytes` and `null_project_rows`. It is written last, so it marks a finished day.
 
-The stream checks a counts file before it writes any row of it: it must be for the day that was asked for, its checksum and size must match, its totals must add up, and no project may appear twice once the names are canonical. The bucket deletes `counts/` objects after 14 days. They are handover copies of what the stream publishes, and never a published asset.
+The stream checks a counts file before it writes any row of it: it must be for the day that was asked for, its checksum and size must match, its totals must add up, and each name and count must be in range. A name that is not canonical is stored in its canonical form, and names that come to the same canonical name are merged, with their counts summed. The report's `renamed` counts the names that were not canonical. The bucket deletes `counts/` objects after 14 days. They are handover copies of what the stream publishes, and never a published asset.
 
 A counter execution can outlive the run that started it. The next run finds the day's files in the bucket, takes them and does not start the job again.
 
@@ -63,7 +63,11 @@ Before it starts each day, the run asks the guard, which holds the run in these 
 
 The usage is taken from Cloud Run itself: the vCPU- and GiB-seconds of every execution of the job that started this billing month, which includes executions of runs that died. The bytes read are summed from the days counted this month. Each Read API session is limited to one day's partition.
 
+The budget counts the free tier's credit and no other: Cloud Run's free tier arrives as a credit, so a budget that excludes every credit reports free use as spend, and the stream would hold. Promotions stay excluded, so that a trial's credit cannot hide a real charge. The setup under "Google Cloud" sets this.
+
 The budget's notifications come from a Pub/Sub subscription, `budget-alerts-pull`, which each run reads. The newest one of the month is kept in the `spend` table, and a message is acknowledged only once its spend is published.
+
+A run also reads the partition row counts of the newest 10 days after launch. A day whose count has moved since it was counted is named in the report as drift. It is detected, not recounted. When that read fails, the report says `drift_unknown: true`, and the run goes on to count and publish.
 
 ### Clearing a spend hold
 
@@ -74,8 +78,6 @@ gh workflow run tick.yml -f override_for=pypi-downloads -f override_reason="..."
 ```
 
 The run records a clearance for each billing month whose spend holds it, with the month's cost as its newest notification reports it and the reason, publishes it in the `clearances` table, and counts. A clearance covers only the cost it records: if a later notification shows more spent in that month, the stream holds again until it is looked at and cleared again. The same reason also overrides any publish gate that fails in that run.
-
-A run also reads the partition row counts of the newest 10 days after launch. A day whose count has moved since it was counted is named in the report as drift. It is detected, not recounted. When that read fails, the report says `drift_unknown: true`, and the run goes on to count and publish.
 
 ## Google Cloud
 
@@ -142,6 +144,17 @@ gcloud iam service-accounts add-iam-policy-binding counter-runtime@$SA_SUFFIX --
   --member=serviceAccount:counter-deployer@$SA_SUFFIX --role=roles/iam.serviceAccountUser
 gcloud artifacts repositories add-iam-policy-binding counter --location=$R --project=$P \
   --member=serviceAccount:counter-deployer@$SA_SUFFIX --role=roles/artifactregistry.writer
+
+# The budget counts what is owed: Cloud Run's free tier arrives as a FREE_TIER credit, so
+# a budget that excludes every credit reports free use as spend and the stream would hold
+# for good. Promotions (a trial's credit) stay excluded, so they cannot hide a real charge.
+ACCOUNT=$(gcloud billing projects describe $P --format='value(billingAccountName)')
+ACCOUNT=${ACCOUNT#billingAccounts/}
+BUDGET=$(gcloud billing budgets list --billing-account=$ACCOUNT \
+  --billing-project=$P --format='value(name)')
+gcloud billing budgets update "$BUDGET" --billing-account=$ACCOUNT \
+  --billing-project=$P --credit-types-treatment=include-specified-credits \
+  --credit-types=FREE_TIER
 
 # Workload Identity Federation: GitHub's OIDC tokens from this repository, on main, in the
 # gcp environment, and nothing else.
