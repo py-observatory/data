@@ -64,6 +64,8 @@ REGISTRY_GROUP = {"group": "stream-pypi-registry", "cancel-in-progress": "false"
 OSV_GROUP = {"group": "stream-osv-pypi", "cancel-in-progress": "false"}
 DOWNLOADS_GROUP = {"group": "stream-pypi-downloads", "cancel-in-progress": "false"}
 CATALOG_GROUP = {"group": "catalog", "cancel-in-progress": "false"}
+DEPLOY_GROUP = {"group": "deploy-counter", "cancel-in-progress": "false"}
+DEPLOY_JOB = ("deploy-counter.yml", "deploy")
 # The streams that tick.yml runs, each in a job named for it, and the command that the
 # run step of the job starts. `--bootstrap`, and `--override-reason` with its reason,
 # come after it when they are asked for.
@@ -729,13 +731,28 @@ def test_the_catalog_job_runs_after_osv_whatever_its_outcome():
         assert token and token[1] == "${{ github.token }}", text
 
 
-def test_only_the_stream_jobs_join_a_concurrency_group():
+def test_only_the_stream_jobs_and_the_deploy_join_a_concurrency_group():
     """A job that queues in the group replaces the one that is waiting there, so the
-    jobs that only dispatch or report stay out of it."""
+    jobs that only dispatch or report stay out of it. The deploy of the counter has a
+    group of its own, which no stream shares."""
     in_a_group = {
         (file, name) for file, name, body in all_jobs() if entry(body, "concurrency", 4)
     }
-    assert in_a_group == PUBLISH_JOBS
+    assert in_a_group == PUBLISH_JOBS | {DEPLOY_JOB}
+
+
+def test_the_deploy_job_has_its_own_concurrency_group():
+    """Two deploys at once could leave the job on the older image, so they run one at a
+    time, and one that has begun is never cancelled part way through. A newer one waits,
+    and deploys its own commit after it."""
+    assert mapping(job_of(*DEPLOY_JOB), "concurrency", 4) == DEPLOY_GROUP
+    others = {
+        REGISTRY_GROUP["group"],
+        OSV_GROUP["group"],
+        DOWNLOADS_GROUP["group"],
+        CATALOG_GROUP["group"],
+    }
+    assert DEPLOY_GROUP["group"] not in others
 
 
 def test_no_workflow_has_a_group_of_its_own_for_all_its_jobs():
@@ -1284,7 +1301,9 @@ def deploy_steps() -> list[str]:
 
 def test_deploy_counter_triggers():
     """It deploys when the counter, or this workflow, changes on main, and when it is
-    dispatched, and on nothing else: not a pull request, whose code could then sign in."""
+    dispatched, and on nothing else: not a pull request, whose code could then sign in.
+    It deploys too when stream.toml or run.py changes on main, since the job's template
+    is made from the one by `counter_template` in the other."""
     outside = split_jobs(workflows()["deploy-counter.yml"])[0]
     triggers = entry(outside, "on", 0)[1]
     assert sorted(re.findall(r"(?m)^ {2}(\w+):", triggers)) == [
@@ -1296,8 +1315,12 @@ def test_deploy_counter_triggers():
     paths = [p.strip("\"'") for p in sequence(push, "paths", 4)]
     assert paths == [
         "streams/pypi_downloads/counter/**",
+        "streams/pypi_downloads/stream.toml",
+        "streams/pypi_downloads/src/pypi_downloads/run.py",
         ".github/workflows/deploy-counter.yml",
     ]
+    for path in paths[1:3]:
+        assert (ROOT / path).is_file(), path
     assert mapping(outside, "permissions", 0) == {}
     jobs = split_jobs(workflows()["deploy-counter.yml"])[1]
     assert list(jobs) == ["deploy"]
