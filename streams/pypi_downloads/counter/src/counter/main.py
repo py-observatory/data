@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import re
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timedelta, UTC
 from pathlib import Path
@@ -31,6 +32,10 @@ PARTITIONS_SQL = (
 STREAMS_PER_WORKER = 4
 ATTEMPTS = 3
 UPLOAD_RETRY_SECONDS = 300
+# How long BigQuery may take over the partition query before it answers that the query
+# has not finished, and how long to wait before the one more try that a read gets.
+PARTITION_TIMEOUT_MS = 60_000
+PARTITION_RETRY_SECONDS = 10
 
 
 class SnapshotMoved(RuntimeError):
@@ -39,6 +44,10 @@ class SnapshotMoved(RuntimeError):
 
 class RowsMismatch(RuntimeError):
     """The rows counted are not the rows the partition holds."""
+
+
+class QueryUnfinished(RuntimeError):
+    """BigQuery had not finished the partition query when it answered."""
 
 
 def check_rows(counted: int, before: tuple[int, str], after: tuple[int, str]) -> None:
@@ -113,12 +122,8 @@ def count_day(day: date, *, project: str, workers: int) -> tuple[pa.Table, dict[
     return table, meta
 
 
-def read_partition(day: date, project: str) -> tuple[int, str]:
-    """The partition's total rows and last-modified time, by a metadata-only query."""
-    import google.auth
-    from google.auth.transport.requests import AuthorizedSession
-
-    session = AuthorizedSession(google.auth.default()[0])
+def _query_partition(session, day: date, project: str) -> dict:
+    """One run of the metadata-only query; raises for a failed request or an unfinished query."""
     reply = session.post(
         f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/queries",
         json={
@@ -126,6 +131,7 @@ def read_partition(day: date, project: str) -> tuple[int, str]:
             "useLegacySql": False,
             # The snapshot check compares two reads, so neither may come from cache.
             "useQueryCache": False,
+            "timeoutMs": PARTITION_TIMEOUT_MS,
             "location": "US",
             "parameterMode": "NAMED",
             "queryParameters": [
@@ -140,7 +146,29 @@ def read_partition(day: date, project: str) -> tuple[int, str]:
     )
     reply.raise_for_status()
     body = reply.json()
-    if not body.get("jobComplete") or not body.get("rows"):
+    if not body.get("jobComplete"):
+        raise QueryUnfinished(f"the partition query for {day} had not finished")
+    return body
+
+
+def read_partition(day: date, project: str, *, sleep=time.sleep) -> tuple[int, str]:
+    """The partition's total rows and last-modified time, by a metadata-only query.
+
+    A read that fails, by an error or by a query that has not finished, is tried once more
+    after PARTITION_RETRY_SECONDS: a hiccup on the read after the count would otherwise
+    throw the day's count away. A partition with no row is not read again.
+    """
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    session = AuthorizedSession(google.auth.default()[0])
+    try:
+        body = _query_partition(session, day, project)
+    except Exception as failed:
+        _say(outcome="partition_read_retry", day=str(day), error=type(failed).__name__)
+        sleep(PARTITION_RETRY_SECONDS)
+        body = _query_partition(session, day, project)
+    if not body.get("rows"):
         raise RuntimeError(f"no partition row for {day}: {json.dumps(body)[:300]}")
     cells = body["rows"][0]["f"]
     return int(cells[0]["v"]), cells[1]["v"]

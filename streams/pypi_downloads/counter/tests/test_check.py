@@ -138,33 +138,100 @@ def test_main_names_a_missing_environment_variable(monkeypatch, env, capsys):
 
 
 
-def test_the_partition_read_bypasses_the_query_cache(monkeypatch):
+PARTITION_ROW = {"jobComplete": True, "rows": [{"f": [{"v": "5"}, {"v": "2026-11-05T00:36:50Z"}]}]}
+
+
+def stub_partition_session(monkeypatch, answers):
+    """Stand in for Google's session: each post takes the next of `answers`, an
+    exception to raise or a reply body to give. Returns the request bodies posted."""
     import google.auth
     import google.auth.transport.requests as transport
-    from datetime import date
 
-    sent = {}
+    posted = []
+    left = iter(answers)
 
     class Reply:
+        def __init__(self, body):
+            self.body = body
+
         def raise_for_status(self):
             pass
 
         def json(self):
-            return {"jobComplete": True, "rows": [{"f": [{"v": "5"}, {"v": "2026-11-05T00:36:50Z"}]}]}
+            return self.body
 
     class Session:
         def __init__(self, credentials):
             pass
 
         def post(self, url, json, timeout):
-            sent["body"] = json
-            return Reply()
+            posted.append(json)
+            answer = next(left)
+            if isinstance(answer, Exception):
+                raise answer
+            return Reply(answer)
 
     monkeypatch.setattr(google.auth, "default", lambda: (object(), "p"))
     monkeypatch.setattr(transport, "AuthorizedSession", Session)
+    return posted
+
+
+def test_the_partition_read_bypasses_the_query_cache(monkeypatch):
+    from datetime import date
+
+    posted = stub_partition_session(monkeypatch, [PARTITION_ROW])
     assert job.read_partition(date(2026, 11, 4), "py-observatory") == (5, "2026-11-05T00:36:50Z")
-    assert sent["body"]["useQueryCache"] is False
-    assert sent["body"]["queryParameters"][0]["parameterValue"] == {"value": "20261104"}
+    (body,) = posted
+    assert body["useQueryCache"] is False
+    assert body["timeoutMs"] == 60000
+    assert body["queryParameters"][0]["parameterValue"] == {"value": "20261104"}
+
+
+@pytest.mark.parametrize(
+    "hiccup",
+    [ConnectionError("connection reset"), {"jobComplete": False}],
+    ids=["exception", "unfinished"],
+)
+def test_a_partition_read_that_fails_once_is_tried_again(monkeypatch, capsys, hiccup):
+    from datetime import date
+
+    waits = []
+    posted = stub_partition_session(monkeypatch, [hiccup, PARTITION_ROW])
+    got = job.read_partition(date(2026, 11, 4), "py-observatory", sleep=waits.append)
+    assert got == (5, "2026-11-05T00:36:50Z")
+    assert len(posted) == 2
+    assert waits == [job.PARTITION_RETRY_SECONDS]
+    assert json.loads(capsys.readouterr().out)["outcome"] == "partition_read_retry"
+
+
+@pytest.mark.parametrize(
+    "hiccup, error",
+    [
+        (ConnectionError("connection reset"), ConnectionError),
+        ({"jobComplete": False}, job.QueryUnfinished),
+    ],
+    ids=["exception", "unfinished"],
+)
+def test_a_partition_read_that_fails_twice_fails(monkeypatch, hiccup, error):
+    from datetime import date
+
+    waits = []
+    posted = stub_partition_session(monkeypatch, [hiccup, hiccup])
+    with pytest.raises(error):
+        job.read_partition(date(2026, 11, 4), "py-observatory", sleep=waits.append)
+    assert len(posted) == 2
+    assert waits == [job.PARTITION_RETRY_SECONDS]
+
+
+def test_a_partition_with_no_row_is_not_read_again(monkeypatch):
+    from datetime import date
+
+    waits = []
+    posted = stub_partition_session(monkeypatch, [{"jobComplete": True, "rows": []}])
+    with pytest.raises(RuntimeError, match="no partition row"):
+        job.read_partition(date(2026, 11, 4), "py-observatory", sleep=waits.append)
+    assert len(posted) == 1
+    assert waits == []
 
 
 def test_each_upload_carries_a_bounded_retry(monkeypatch, tmp_path):
