@@ -75,7 +75,7 @@ gh workflow run tick.yml -f override_for=pypi-downloads -f override_reason="..."
 
 The run records a clearance for each billing month whose spend holds it, with the month's cost as its newest notification reports it and the reason, publishes it in the `clearances` table, and counts. A clearance covers only the cost it records: if a later notification shows more spent in that month, the stream holds again until it is looked at and cleared again. The same reason also overrides any publish gate that fails in that run.
 
-A run also reads the partition row counts of the newest 10 days after launch. A day whose count has moved since it was counted is named in the report as drift. It is detected, not recounted.
+A run also reads the partition row counts of the newest 10 days after launch. A day whose count has moved since it was counted is named in the report as drift. It is detected, not recounted. When that read fails, the report says `drift_unknown: true`, and the run goes on to count and publish.
 
 ## Google Cloud
 
@@ -192,8 +192,9 @@ The run exits with 2, after it has published, when:
 - the guard held it for a spend above $0 that no clearance covers;
 - the guard held it at the 98% stop, which is usage plus the next execution's worst case;
 - the guard held the backfill for a missing budget notification, and no notification of any month has come in the last 48 hours, so the feed looks broken;
-- a day failed; or
-- drift was found: a counted day whose partition row count has moved.
+- a day failed;
+- drift was found: a counted day whose partition row count has moved; or
+- the drift is unknown, because the read of the partition row counts failed.
 
 A hold at the budget line, where the backfill has used its even share of the month, is normal and exits with 0. So is a backfill held at the start of a billing month whose first notification has not come yet, while the last month's still do. The report names either hold.
 

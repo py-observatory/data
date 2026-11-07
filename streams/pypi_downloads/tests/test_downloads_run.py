@@ -52,7 +52,8 @@ LAUNCH = date(2026, 11, 9)
 # Each execution of the fake counter takes 600 seconds at 4 vCPU and 2 GiB.
 VCPU_SECONDS = 2400.0
 GIB_SECONDS = 1200.0
-IMAGE = "us-central1-docker.pkg.dev/py-observatory/counter/counter@sha256:" + "a" * 64
+# The workflow names the image by the commit, as a tag.
+IMAGE = "us-central1-docker.pkg.dev/py-observatory/counter/counter:" + "a" * 40
 
 
 @pytest.fixture(autouse=True)
@@ -172,6 +173,7 @@ def test_bootstrap_counts_the_launch_day_and_publishes_first(tmp_path):
         held_kind=None,
         notices_quiet=True,
         drift=[],
+        drift_unknown=False,
         new_projects=3,
         renamed=1,
         usage={
@@ -454,6 +456,24 @@ def test_a_spend_holds_into_the_next_billing_month(tmp_path, monkeypatch, capsys
     assert report["held"] == "the budget shows $0.25 spent in 2026-11"
 
 
+def test_usage_is_measured_again_at_the_time_of_measuring(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.notify(0.0, at="2026-11-12T08:00:00Z")
+    # An execution started as the run began, by hand, and is still running.
+    running = execution(datetime(2026, 11, 12, 9, tzinfo=UTC), 0)
+    del running["completionTime"]
+    stream.cloud.executions.append(running)
+
+    report = stream.run("2026-11-12T09:00:00Z", max_seconds=1)
+
+    # Once 11-10 is counted, 600 seconds into the run, the running execution has used
+    # 600 seconds too.
+    assert report.counted == ["2026-11-10"]
+    assert report.usage["vcpu_seconds"] == 3 * VCPU_SECONDS
+    assert report.usage["gib_seconds"] == 3 * GIB_SECONDS
+
+
 def test_the_stop_keeps_room_for_the_next_execution(tmp_path, monkeypatch, capsys):
     stream = Stream(tmp_path)
     stream.bootstrap(BOOTSTRAP_AT)
@@ -504,9 +524,9 @@ def test_a_run_that_fails_after_the_pull_acknowledges_nothing(tmp_path):
     stream = Stream(tmp_path)
     stream.bootstrap(BOOTSTRAP_AT)
     stream.notify(0.25, at="2026-11-12T08:00:00Z")
-    # The run fails after it has pulled the notification: BigQuery refuses the query
-    # of the partition sizes.
-    stream.cloud.fail_next(403, url_contains="bigquery")
+    # The run fails after it has pulled the notification: Cloud Run refuses the list
+    # of the job's executions.
+    stream.cloud.fail_next(403, url_contains="/executions")
 
     with pytest.raises(GoogleError, match="HTTP 403"):
         stream.run("2026-11-12T09:00:00Z")
@@ -581,6 +601,33 @@ def test_a_day_whose_partition_moved_is_reported(tmp_path, monkeypatch, capsys):
     (sql,) = stream.cloud.queries
     assert sorted(listed_partitions(sql)) == ["20261110", "20261111"]
     assert report.drift == []
+
+
+def test_a_drift_check_that_fails_is_reported_and_the_run_goes_on(
+    tmp_path, monkeypatch, capsys
+):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.notify(0.0, at="2026-11-12T08:00:00Z")
+    stream.cloud.fail_next(403, url_contains="bigquery")
+
+    assert (
+        stream.main(monkeypatch, "2026-11-12T09:00:00Z", "run", "--max-seconds", "1")
+        == 2
+    )
+
+    out, err = capsys.readouterr()
+    report = json.loads(out)
+    assert (report["drift"], report["drift_unknown"]) == ([], True)
+    assert "the drift check failed: " in err
+    assert (report["counted"], report["failed"], report["held"]) == (
+        ["2026-11-10"],
+        [],
+        None,
+    )
+    assert stream.manifest().generated_at == "2026-11-12T09:00:00Z"
+    # The notification is acknowledged after the publish, as on any run.
+    assert stream.cloud.acked == ["ack-1"]
 
 
 def test_the_time_budget_stops_starting_days(tmp_path, monkeypatch, capsys):

@@ -36,10 +36,11 @@ run, so a spend above $0 is never forgotten.
 
 Each later run reads the sizes of the partitions of the newest days counted from launch
 on, and names each day whose partition has changed since it was counted. Late rows are
-detected, not recounted.
+detected, not recounted. A run whose read of the sizes fails says that the drift is
+unknown, and goes on.
 
-`main` exits 2 when a day failed, a partition moved, or the guard held the run for
-spend or for the 98% stop, after the publish, so that the
+`main` exits 2 when a day failed, a partition moved or the drift is unknown, or the
+guard held the run for spend or for the 98% stop, after the publish, so that the
 workflow opens its failure issue. A backfill held for want of a notification exits 2
 only when no notification of any month has come for NOTICE_HOURS, which is when the
 feed is broken: a billing month that has begun without its first is not. A backfill
@@ -171,7 +172,9 @@ class RunReport:
     the kind of that refusal (see `plan.Refusal`). Both are None when the guard let
     every day start. `notices_quiet` is whether no budget notification of any month
     has come in the last NOTICE_HOURS (see `plan.notices_quiet`). `drift` names the
-    days whose partition has changed since they were counted. `new_projects` counts the projects first seen in the days written, and `renamed`
+    days whose partition has changed since they were counted, and `drift_unknown` is
+    whether the read of the partitions failed, which leaves `drift` empty.
+    `new_projects` counts the projects first seen in the days written, and `renamed`
     the names in their files that were not canonical. `usage` is the free tier used in
     the billing month, as last measured: vCPU- and GiB-seconds of the counter's
     executions, and the bytes read for the days counted. `gate_failures` lists the
@@ -185,6 +188,7 @@ class RunReport:
     held_kind: str | None
     notices_quiet: bool
     drift: list[str]
+    drift_unknown: bool
     new_projects: int
     renamed: int
     usage: dict
@@ -411,6 +415,13 @@ def _clear_spend(
     _commit_and_apply(state, conn)
 
 
+def _wall(now: datetime, clock: Callable[[], float], started: float) -> datetime:
+    """The time at this moment. `now` is the time at which `clock` read `started`, as
+    the run began, and what `clock` has run since is added to it. Usage measured at
+    `now` alone would count nothing of an execution still running since then."""
+    return now + timedelta(seconds=clock() - started)
+
+
 def _usage(
     google: Google, config: Config, state: sqlite3.Connection, now: datetime
 ) -> Usage:
@@ -486,6 +497,19 @@ def _drift(
     )
 
 
+def _drift_or_unknown(
+    google: Google, config: Config, state: sqlite3.Connection, launch: date
+) -> list[str] | None:
+    """The days whose partition moved (see `_drift`), or None when Google refuses the
+    read of the partitions. Why goes to stderr. A drift check that fails says nothing of
+    the days to count, so the run goes on, and reports the drift as unknown."""
+    try:
+        return _drift(google, config, state, launch)
+    except GoogleError as error:
+        print(f"the drift check failed: {error}", file=sys.stderr)
+        return None
+
+
 def _counted(state: sqlite3.Connection) -> set[date]:
     """The days that the state has counted."""
     return {day_date(day) for (day,) in state.execute("SELECT day FROM days")}
@@ -535,7 +559,7 @@ def _report(
     *,
     held: Refusal | None,
     quiet: bool,
-    drift: list[str],
+    drift: list[str] | None,
     usage: Usage,
     failures: list[GateFailure],
 ) -> RunReport:
@@ -546,7 +570,8 @@ def _report(
         held=None if held is None else held.reason,
         held_kind=None if held is None else held.kind,
         notices_quiet=quiet,
-        drift=drift,
+        drift=[] if drift is None else drift,
+        drift_unknown=drift is None,
         new_projects=days.new_projects,
         renamed=days.renamed,
         usage=asdict(usage),
@@ -564,6 +589,8 @@ def _bootstrap(
     moment: str,
     today: date,
     override_reason: str | None,
+    clock: Callable[[], float],
+    started: float,
 ) -> RunReport:
     """Build the stream's first state from its launch day, the newest day that is due
     on `today`, and publish it.
@@ -572,7 +599,8 @@ def _bootstrap(
     day, and the open delta with the known breaks in the series and the budget's
     notifications, and with `override_reason`, a clearance of any spend that would hold
     it (see `_clear_spend`). The launch day is ensured (see `_ensure`) once the guard
-    allows it, as for a day after launch, and written. The state is copied as the base of today's month,
+    allows it, as for a day after launch, and written, and the usage is measured again
+    at the time then (see `_wall`). The state is copied as the base of today's month,
     and published with the open delta and a manifest that lists the breaks. Only then
     are the notifications acknowledged.
 
@@ -626,7 +654,7 @@ def _bootstrap(
         if outcome == "failed":
             raise BootstrapError(f"the launch day {launch} failed")
         if outcome == "counted":
-            usage = _usage(google, config, state, now)
+            usage = _usage(google, config, state, _wall(now, clock, started))
         through, coverage, complete = _summary(state, launch, today)
     cycle.publish_first(
         gh,
@@ -664,14 +692,14 @@ def run_once(
     (PriorStateError). The run rolls over (`cycle.roll_over`), writes the budget's
     notifications to the delta, without acknowledging them, and with `override_reason`
     a clearance of any spend that would hold it (see `_clear_spend`), and applies it.
-    It names the days whose partition moved, and measures what the billing month has
-    used.
+    It names the days whose partition moved, or that the drift is unknown when the
+    read fails, and measures what the billing month has used.
 
     Then it takes the days from launch on that are due and not counted, oldest first,
     and the backfill, newest first, one at a time (see `_take`). Before each it asks
     the guard (`plan.refusal`), and it measures the usage again after each that an
-    execution counted. It stops at a refusal, at a day that failed, and once
-    `max_seconds` from its start on `clock` have passed. It then
+    execution counted, at the time then (see `_wall`). It stops at a refusal, at a day
+    that failed, and once `max_seconds` from its start on `clock` have passed. It then
     publishes (`cycle.publish`): the manifest is checked with the gates, and the state,
     the open delta and the manifest are swapped into the current release. Only then are
     the notifications acknowledged.
@@ -681,7 +709,8 @@ def run_once(
     next run is given them again. What a rollover already added to a month's release
     stays, as in `obskit.cycle`.
     """
-    deadline = clock() + max_seconds
+    started = clock()
+    deadline = started + max_seconds
     moment = instant(now)
     today = now.astimezone(UTC).date()
     prior = fetch_prior(gh, STREAM, workdir, bootstrap=bootstrap)
@@ -697,6 +726,8 @@ def run_once(
             moment=moment,
             today=today,
             override_reason=override_reason,
+            clock=clock,
+            started=started,
         )
     resume = _resume(prior, workdir)
     launch = resume.launch
@@ -715,7 +746,7 @@ def run_once(
         if override_reason:
             _clear_spend(state, conn, delta, override_reason)
         quiet = notices_quiet(_spends(state), now)
-        drift = _drift(google, config, state, launch)
+        drift = _drift_or_unknown(google, config, state, launch)
         usage = _usage(google, config, state, now)
         counted = _counted(state)
         due = chain(
@@ -743,7 +774,7 @@ def run_once(
             if outcome == "failed":
                 break
             if outcome == "counted":
-                usage = _usage(google, config, state, now)
+                usage = _usage(google, config, state, _wall(now, clock, started))
         through, coverage, complete = _summary(state, launch, today)
     failures = cycle.publish(
         gh,
@@ -804,10 +835,11 @@ def _google(federation: Federation) -> Google:
 
 def _unwell(report: RunReport) -> bool:
     """Whether the workflow should open its failure issue for `report`: a day failed, a
-    partition moved, or the guard held the run for spend or the stop, or for want of a notification while no notification of any month is recent.
+    partition moved or the drift is unknown, or the guard held the run for spend or the
+    stop, or for want of a notification while no notification of any month is recent.
     A month that has begun without its first notification is not a failure, nor is the
     budget line."""
-    if report.failed or report.drift:
+    if report.failed or report.drift or report.drift_unknown:
         return True
     if report.held_kind == "notice":
         return report.notices_quiet
@@ -873,7 +905,10 @@ def main(argv: list[str] | None = None) -> int:
         "deploy", help="create or update the counter's Cloud Run job"
     )
     deploy.add_argument(
-        "--image", required=True, help="the counter's image, named by its digest"
+        "--image",
+        required=True,
+        help="the counter's image, named by a tag (the deploy workflow passes the "
+        "image repository and the commit, as REPOSITORY:COMMIT)",
     )
     args = parser.parse_args(argv)
     config = load()
