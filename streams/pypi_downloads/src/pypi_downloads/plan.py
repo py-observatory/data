@@ -17,7 +17,8 @@ BACKFILL_SHARE = 0.8
 STOP_SHARE = 0.98
 """No counting starts once any measure reaches this share of the free tier."""
 NOTICE_HOURS = 48
-"""Backfill needs a budget notification for the month newer than this."""
+"""Backfill needs a budget notification for the month newer than this, and a feed with
+none of any month newer than this is taken to be broken."""
 PACIFIC = ZoneInfo("America/Los_Angeles")
 """Google's free tier resets with the billing month, which follows this zone."""
 
@@ -48,9 +49,10 @@ class Spend:
 
 @dataclass(frozen=True)
 class Refusal:
-    """Why the guard says no. `kind` is "spend" (money was spent), "stop" (a measure is
-    at the stop share), "notice" (backfill has no recent budget notification) or "line"
-    (backfill is at the budget line)."""
+    """Why the guard says no. `kind` is "spend" (money was spent and no person has
+    cleared it), "stop" (a measure is at the stop share), "notice" (backfill has no
+    recent budget notification for the month) or "line" (backfill is at the budget
+    line)."""
 
     kind: str
     reason: str
@@ -169,21 +171,68 @@ def spend_from(messages: list[dict]) -> list[Spend]:
     return [spend for _, spend in newest.values()]
 
 
+def uncleared(spends: list[Spend], cleared: dict[str, float]) -> list[Spend]:
+    """The spends that hold all counting, oldest month first: of each month's newest
+    report, `spends`, those above $0 that no clearance covers. `cleared` maps a month to
+    the cost that a person cleared for it. A clearance covers only what was spent when
+    it was given, so a month whose cost has risen above it holds again."""
+    return sorted(
+        (
+            spend
+            for spend in spends
+            if spend.cost > 0
+            and (spend.month not in cleared or spend.cost > cleared[spend.month])
+        ),
+        key=lambda spend: spend.month,
+    )
+
+
+def notices_quiet(spends: list[Spend], now: datetime) -> bool:
+    """Whether no budget notification of any month has arrived in the NOTICE_HOURS
+    before `now`. The budget sends several a day, so a quiet feed is a broken one. A
+    billing month that has begun without its first notification, while the last
+    month's still come, is not quiet."""
+    return all(
+        now - _time(spend.notified_at) >= timedelta(hours=NOTICE_HOURS)
+        for spend in spends
+    )
+
+
+def _spent(spend: Spend, cleared: dict[str, float]) -> str:
+    """A spend that holds, with its cost as the budget reported it, and what was
+    cleared of its month."""
+    text = f"${spend.cost} spent in {spend.month}"
+    if spend.month in cleared:
+        text += f", above the ${cleared[spend.month]} cleared"
+    return text
+
+
 def refusal(
-    usage: Usage, spend: Spend | None, now: datetime, *, backfill: bool, reserve: Usage
+    usage: Usage,
+    spends: list[Spend],
+    cleared: dict[str, float],
+    now: datetime,
+    *,
+    backfill: bool,
+    reserve: Usage,
 ) -> Refusal | None:
-    """None to go on, or why counting must not start. `spend` is the newest report in
-    hand, of any month; only one for the billing month of `now` counts. The caller
-    passes `reserve`, the worst case of the execution about to start (its cpu times the
-    task timeout, its memory times the task timeout, and the largest read bytes of a
-    counted day), and the stop share applies to `usage + reserve`. The budget line
-    applies to `usage` alone."""
+    """None to go on, or why counting must not start.
+
+    `spends` is the newest report of each billing month in hand, and `cleared` the cost
+    that a person cleared for each month (see `uncleared`). Any month's spend that is
+    not cleared holds all counting, in every later month too, until a person looks.
+    Only the report of the billing month of `now` serves as the backfill's recent
+    notification. The caller passes `reserve`, the worst case of the execution about to
+    start (its cpu times the task timeout, its memory times the task timeout, and the
+    largest read bytes of a counted day), and the stop share applies to `usage +
+    reserve`. The budget line applies to `usage` alone."""
     start, end = billing_month(now)
     month = now.astimezone(PACIFIC).strftime("%Y-%m")
-    current = spend if spend is not None and spend.month == month else None
-    if current is not None and current.cost > 0:
+    held = uncleared(spends, cleared)
+    if held:
         return Refusal(
-            "spend", f"the budget shows ${current.cost:.2f} spent in {month}"
+            "spend",
+            "the budget shows " + "; ".join(_spent(s, cleared) for s in held),
         )
     for (name, used, free), (_, extra, _) in zip(_measures(usage), _measures(reserve)):
         if used + extra >= STOP_SHARE * free:
@@ -194,6 +243,7 @@ def refusal(
             )
     if not backfill:
         return None
+    current = next((spend for spend in spends if spend.month == month), None)
     if current is None or now - _time(current.notified_at) >= timedelta(
         hours=NOTICE_HOURS
     ):

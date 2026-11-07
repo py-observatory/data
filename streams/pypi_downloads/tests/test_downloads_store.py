@@ -107,6 +107,30 @@ def test_an_older_notice_never_replaces_a_newer_one(state, delta_conn):
     assert meta(state, "applied_seq") == "3"
 
 
+def test_the_newest_clearance_of_a_month_wins(state, delta_conn):
+    d = Delta(delta_conn, NOW)
+    d.clearance("2026-11", 0.25, "a rounding charge")
+    d.clearance("2026-10", 0.01, "a test run")
+    d.clearance("2026-11", 0.4, "the same charge, billed in full")
+    delta_conn.commit()
+    apply(state, delta_conn)
+    assert state.execute("SELECT * FROM clearances ORDER BY month").fetchall() == [
+        ("2026-10", 0.01, "a test run", NOW),
+        ("2026-11", 0.4, "the same charge, billed in full", NOW),
+    ]
+
+    # A later run's clearance replaces the month's, with that run's time.
+    later = "2026-11-07T04:00:00Z"
+    Delta(delta_conn, later).clearance("2026-11", 0.5, "looked again")
+    delta_conn.commit()
+    apply(state, delta_conn)
+    assert state.execute("SELECT * FROM clearances ORDER BY month").fetchall() == [
+        ("2026-10", 0.01, "a test run", NOW),
+        ("2026-11", 0.5, "looked again", later),
+    ]
+    assert meta(state, "applied_seq") == "4"
+
+
 def test_apply_never_reads_counts(state, delta_conn):
     d = Delta(delta_conn, NOW)
     d.project(1, "a")

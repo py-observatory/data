@@ -12,6 +12,9 @@ The stream is event sourced on the kit's delta (`obskit.delta`). The state has:
 - `days`: one row for each day counted, with what the counter reported.
 - `breaks`: the days where the series changes meaning.
 - `spend`: the newest budget notification of each billing month.
+- `clearances`: for each billing month whose spend a person has cleared, the cost that
+  was cleared, the person's reason and when. A spend above $0 holds all counting until
+  a clearance of its month covers it, and one covers only the cost it records.
 
 Days are stored as the number of days since 1970-01-01.
 
@@ -68,6 +71,13 @@ CREATE TABLE spend (
     budget REAL NOT NULL,
     notified_at TEXT NOT NULL
 ) WITHOUT ROWID;
+
+CREATE TABLE clearances (
+    month TEXT PRIMARY KEY,
+    cost REAL NOT NULL,
+    reason TEXT NOT NULL,
+    cleared_at TEXT NOT NULL
+) WITHOUT ROWID;
 """
 
 DELTA_SCHEMA = """
@@ -109,6 +119,14 @@ CREATE TABLE spend (
     notified_at TEXT NOT NULL
 );
 
+CREATE TABLE clearances (
+    seq INTEGER PRIMARY KEY,
+    month TEXT NOT NULL,
+    cost REAL NOT NULL,
+    reason TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
+
 CREATE TABLE counts (
     project_id INTEGER NOT NULL,
     day INTEGER NOT NULL,
@@ -118,7 +136,7 @@ CREATE TABLE counts (
 ) WITHOUT ROWID;
 """
 
-STATE_TABLES = ("meta", "projects", "days", "breaks", "spend")
+STATE_TABLES = ("meta", "projects", "days", "breaks", "spend", "clearances")
 
 # The columns of a day, in the order of the state's `days` table (and the delta's, which
 # has observed_at where the state has seq).
@@ -146,6 +164,10 @@ _INSERT_DAY = (
 _INSERT_BREAK = "INSERT INTO breaks (seq, day, note) VALUES (?, ?, ?)"
 _INSERT_SPEND = (
     "INSERT INTO spend (seq, month, cost, budget, notified_at) VALUES (?, ?, ?, ?, ?)"
+)
+_INSERT_CLEARANCE = (
+    "INSERT INTO clearances (seq, month, cost, reason, observed_at) "
+    "VALUES (?, ?, ?, ?, ?)"
 )
 _INSERT_COUNT = (
     "INSERT INTO counts (project_id, day, downloads, mirror_downloads) "
@@ -202,6 +224,17 @@ def _apply_spend(state: sqlite3.Connection, row: tuple) -> None:
     )
 
 
+def _apply_clearance(state: sqlite3.Connection, row: tuple) -> None:
+    # Rows are applied in seq order, so the newest clearance of a month replaces the
+    # one held. The run's observed_at is when it was cleared.
+    state.execute(
+        "INSERT INTO clearances (month, cost, reason, cleared_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (month) DO UPDATE SET cost = excluded.cost, "
+        "reason = excluded.reason, cleared_at = excluded.cleared_at",
+        row[1:],
+    )
+
+
 # For each table of a delta that is applied, the columns that are read, `seq` first, and
 # the function that applies a row of them. `counts` is not here: the state holds none.
 _APPLY = {
@@ -209,6 +242,7 @@ _APPLY = {
     "days": (f"seq, {', '.join(_DAY_COLUMNS)}", _apply_day),
     "breaks": ("seq, day, note", _apply_break),
     "spend": ("seq, month, cost, budget, notified_at", _apply_spend),
+    "clearances": ("seq, month, cost, reason, observed_at", _apply_clearance),
 }
 
 
@@ -226,7 +260,7 @@ class Delta(DeltaWriter):
         super().__init__(
             conn,
             observed_at,
-            ("projects", "days", "breaks", "spend"),
+            ("projects", "days", "breaks", "spend", "clearances"),
             first_seq=first_seq,
         )
 
@@ -258,6 +292,11 @@ class Delta(DeltaWriter):
         """Record the budget notice for a billing month."""
         self._write(_INSERT_SPEND, (month, cost, budget, notified_at))
 
+    def clearance(self, month: str, cost: float, reason: str) -> None:
+        """Record that a person, for `reason`, cleared the spend of a billing month up
+        to `cost`, at the time of the run."""
+        self._write(_INSERT_CLEARANCE, (month, cost, reason, self.observed_at))
+
 
 def insert_counts(
     conn: sqlite3.Connection, rows: Iterable[tuple[int, int, int, int]]
@@ -283,8 +322,8 @@ def apply(state: sqlite3.Connection, delta: sqlite3.Connection) -> None:
     every replay does. This is the stream's `Store.apply`. It never reads `counts`.
 
     A `projects`, `days` or `breaks` row whose key is in the state already raises
-    sqlite3.IntegrityError, and a `spend` row replaces the month's only when it was
-    notified later. Raises ValueError when the state has no applied_seq, which a
+    sqlite3.IntegrityError, a `spend` row replaces the month's only when it was notified
+    later, and a `clearances` row replaces the month's. Raises ValueError when the state has no applied_seq, which a
     bootstrap writes, and as `apply_rows` does.
     """
     applied = meta(state, "applied_seq")

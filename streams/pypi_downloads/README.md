@@ -24,6 +24,7 @@ The history class of each table is in `stream.toml`.
 - `days` (state, append): one row for each counted day, with `day` (days since 1970-01-01), `rows_bigquery`, `rows_counted`, `partition_modified`, `projects`, `downloads`, `mirror_downloads`, `null_project_rows`, `read_bytes`, the `execution` that counted it (null when the day came from the bucket), its `vcpu_seconds` and `gib_seconds`, `counted_at` and `seq`.
 - `breaks` (state, append): a day on which the series breaks, and a note on why.
 - `spend` (state, snapshot): for each billing month, the cost and the budget that the newest budget notification reported, and when it was sent.
+- `clearances` (state, snapshot): for each billing month whose spend a person has cleared, the `cost` that was cleared, the `reason` they gave and `cleared_at` (see "Clearing a spend hold").
 - `counts` (delta only, append): `project_id`, `day`, `downloads` and `mirror_downloads`, keyed by the project and the day. The state holds no counts: they are in the deltas and in the months' merged databases. A day counted twice in one month would break the merge loudly, and so cannot be counted twice without notice.
 
 ## The counts file
@@ -56,13 +57,23 @@ The stream is meant to cost nothing, always. Google's free tier is counted for e
 
 Before it starts each day, the run asks the guard, which holds the run in these cases:
 
-- The budget has reported any spend above $0 for this billing month. This stops all counting.
+- The budget has reported a spend above $0, in this billing month or an earlier one, that no clearance covers. This stops all counting, and the hold does not lapse when a new billing month begins: it lasts until a person has looked (see "Clearing a spend hold").
 - Any of the three measured parts has reached 98% of its free tier, or the next execution's worst case would take it there. This stops all counting.
 - For the backfill only: some measure is above `0.8 × free × elapsed`, where `elapsed` is the share of the billing month that has passed, or no budget notification for the month that is less than 48 hours old has been seen. So the backfill is spread evenly over the month, daily counting always has room, and no news is no backfill.
 
 The usage is taken from Cloud Run itself: the vCPU- and GiB-seconds of every execution of the job that started this billing month, which includes executions of runs that died. The bytes read are summed from the days counted this month. Each Read API session is limited to one day's partition.
 
 The budget's notifications come from a Pub/Sub subscription, `budget-alerts-pull`, which each run reads. The newest one of the month is kept in the `spend` table, and a message is acknowledged only once its spend is published.
+
+### Clearing a spend hold
+
+A spend above $0 holds every day until a person has looked at it. Look at the billing report first (Billing, then Reports, for the project `py-observatory`), and find what was charged and why. Then dispatch `tick.yml` with the stream named in `override_for` and what you found in `override_reason`:
+
+```
+gh workflow run tick.yml -f override_for=pypi-downloads -f override_reason="..."
+```
+
+The run records a clearance for each billing month whose spend holds it, with the month's cost as its newest notification reports it and the reason, publishes it in the `clearances` table, and counts. A clearance covers only the cost it records: if a later notification shows more spent in that month, the stream holds again until it is looked at and cleared again. The same reason also overrides any publish gate that fails in that run.
 
 A run also reads the partition row counts of the newest 10 days after launch. A day whose count has moved since it was counted is named in the report as drift. It is detected, not recounted.
 
@@ -168,7 +179,7 @@ A run publishes to `GITHUB_REPOSITORY` (`py-observatory/data` when it is not set
 uv run --package pypi-downloads python -m pypi_downloads run
 ```
 
-`--bootstrap` counts the newest day that is due as the launch day and publishes the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. `--max-seconds` is how long after its start a run stops starting days (3,600 by default, and 3,000 in the tick: see below). `--workdir PATH` is the folder in which a run makes its own directory and removes it afterwards (`work` by default).
+`--bootstrap` counts the newest day that is due as the launch day and publishes the first state, and only a stream that has never published accepts it. `--override-reason TEXT` publishes although a publish gate failed, and the manifest logs the reason. It also clears a spend that holds the run (see "Clearing a spend hold"). `--max-seconds` is how long after its start a run stops starting days (3,600 by default, and 3,000 in the tick: see below). `--workdir PATH` is the folder in which a run makes its own directory and removes it afterwards (`work` by default).
 
 `python -m pypi_downloads deploy --image IMAGE` creates or updates the counter's job to run `IMAGE`. The deploy workflow calls it.
 
@@ -178,13 +189,13 @@ The run prints its report as JSON.
 
 The run exits with 2, after it has published, when:
 
-- the guard held it for spend above $0 this billing month;
+- the guard held it for a spend above $0 that no clearance covers;
 - the guard held it at the 98% stop, which is usage plus the next execution's worst case;
-- the guard held the backfill for a missing budget notification;
+- the guard held the backfill for a missing budget notification, and no notification of any month has come in the last 48 hours, so the feed looks broken;
 - a day failed; or
 - drift was found: a counted day whose partition row count has moved.
 
-A hold at the budget line, where the backfill has used its even share of the month, is normal and exits with 0.
+A hold at the budget line, where the backfill has used its even share of the month, is normal and exits with 0. So is a backfill held at the start of a billing month whose first notification has not come yet, while the last month's still do. The report names either hold.
 
 ### On GitHub
 

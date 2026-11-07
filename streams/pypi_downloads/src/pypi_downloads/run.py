@@ -20,9 +20,15 @@ launch day, and writes the known breaks in the series. Every later run counts th
 from launch on that are due and not yet counted, oldest first, and then the backfill:
 the days before launch, newest first, back to the first day of PyPI's table. Before
 each day it asks the budget guard (`plan.refusal`). No counting starts once the budget
-shows any spend in the billing month, or once the next execution could take a measure
-of the free tier to 98%, and the backfill starts only below the budget line and with a
-recent budget notification. A run also stops starting days once its time is up.
+shows any spend above $0, in any billing month, that a person has not cleared, or once
+the next execution could take a measure of the free tier to 98%, and the backfill
+starts only below the budget line and with a recent budget notification. A run also
+stops starting days once its time is up.
+
+A person clears a spend by giving the run a reason (`--override-reason`), once they have
+looked at the billing report. The run then records a clearance of each month's cost as
+it stands, and counts. A clearance covers only that cost, so more spend in the same
+month holds the stream again.
 
 The budget's notifications are acknowledged only once a publish holds their spend. A
 run that publishes nothing leaves them to Pub/Sub, which delivers them again to the next
@@ -33,10 +39,12 @@ on, and names each day whose partition has changed since it was counted. Late ro
 detected, not recounted.
 
 `main` exits 2 when a day failed, a partition moved, or the guard held the run for
-spend, for the 98% stop or for want of a notification, after the publish, so that the
-workflow opens its failure issue. A backfill held at the budget line is the normal end
-of a run. Every other error propagates, and a run that fails publishes nothing to the
-current release.
+spend or for the 98% stop, after the publish, so that the
+workflow opens its failure issue. A backfill held for want of a notification exits 2
+only when no notification of any month has come for NOTICE_HOURS, which is when the
+feed is broken: a billing month that has begun without its first is not. A backfill
+held at the budget line is the normal end of a run. Every other error propagates, and a
+run that fails publishes nothing to the current release.
 """
 
 import argparse
@@ -64,7 +72,6 @@ from pypi_downloads.config import Config, load
 from pypi_downloads.counts import Counted, CountsError, read_counts, write_day
 from pypi_downloads.plan import (
     FIRST_DAY,
-    PACIFIC,
     Refusal,
     Spend,
     Usage,
@@ -74,8 +81,10 @@ from pypi_downloads.plan import (
     execution_usage,
     forward_days,
     latest_due,
+    notices_quiet,
     refusal,
     spend_from,
+    uncleared,
 )
 from pypi_downloads.store import (
     DELTA_SCHEMA,
@@ -110,9 +119,10 @@ WAIT_MARGIN_SECONDS = 300
 # The read bytes that the guard keeps for the next execution until a day has been
 # counted to say how much one reads.
 RESERVE_READ_BYTES = 2 * 2**40
-# The kinds of refusal that make `main` exit 2. A refusal at the budget line is the
-# normal end of a run's backfill.
-FAILING_HOLDS = ("spend", "stop", "notice")
+# The kinds of refusal that make `main` exit 2. A refusal for want of a notification
+# does too when no notification of any month is recent (see `_unwell`), and a refusal at
+# the budget line is the normal end of a run's backfill.
+FAILING_HOLDS = ("spend", "stop")
 
 # The sizes of the partitions that a run checks. It reads table metadata and scans no
 # table data, so it is free.
@@ -159,12 +169,13 @@ class RunReport:
     them, and `failed` the day that failed, after which the run started no more.
     `held` is why the budget guard stopped the run from starting a day, and `held_kind`
     the kind of that refusal (see `plan.Refusal`). Both are None when the guard let
-    every day start. `drift` names the days whose partition has changed since they were
-    counted. `new_projects` counts the projects first seen in the days written, and
-    `renamed` the names in their files that were not canonical. `usage` is the free
-    tier used in the billing month, as last measured: vCPU- and GiB-seconds of the
-    counter's executions, and the bytes read for the days counted. `gate_failures`
-    lists the failures that a person overrode, and is empty when no gate failed.
+    every day start. `notices_quiet` is whether no budget notification of any month
+    has come in the last NOTICE_HOURS (see `plan.notices_quiet`). `drift` names the
+    days whose partition has changed since they were counted. `new_projects` counts the projects first seen in the days written, and `renamed`
+    the names in their files that were not canonical. `usage` is the free tier used in
+    the billing month, as last measured: vCPU- and GiB-seconds of the counter's
+    executions, and the bytes read for the days counted. `gate_failures` lists the
+    failures that a person overrode, and is empty when no gate failed.
     """
 
     counted: list[str]
@@ -172,6 +183,7 @@ class RunReport:
     failed: list[str]
     held: str | None
     held_kind: str | None
+    notices_quiet: bool
     drift: list[str]
     new_projects: int
     renamed: int
@@ -375,14 +387,28 @@ def _acknowledge(google: Google, config: Config, ack_ids: list[str]) -> None:
     google.acknowledge(config.project, config.subscription, ack_ids)
 
 
-def _spend(state: sqlite3.Connection, now: datetime) -> Spend | None:
-    """The newest budget notification of the billing month of `now` in the state, or
-    None when it has none."""
-    month = now.astimezone(PACIFIC).strftime("%Y-%m")
-    row = state.execute(
-        "SELECT month, cost, budget, notified_at FROM spend WHERE month = ?", (month,)
-    ).fetchone()
-    return None if row is None else Spend(*row)
+def _spends(state: sqlite3.Connection) -> list[Spend]:
+    """The newest budget notification of each billing month in the state."""
+    rows = state.execute("SELECT month, cost, budget, notified_at FROM spend")
+    return [Spend(*row) for row in rows]
+
+
+def _cleared(state: sqlite3.Connection) -> dict[str, float]:
+    """The cost that a person cleared for each billing month in the state."""
+    return dict(state.execute("SELECT month, cost FROM clearances"))
+
+
+def _clear_spend(
+    state: sqlite3.Connection, conn: sqlite3.Connection, delta: Delta, reason: str
+) -> None:
+    """Record a clearance, for `reason`, of each month whose spend would hold the run,
+    at the month's cost as the state holds it, and commit and apply them. A person
+    gives the reason once they have looked at the billing report. Each month cleared is
+    written to stderr for the run's log."""
+    for spend in uncleared(_spends(state), _cleared(state)):
+        delta.clearance(spend.month, spend.cost, reason)
+        print(f"cleared ${spend.cost} spent in {spend.month}", file=sys.stderr)
+    _commit_and_apply(state, conn)
 
 
 def _usage(
@@ -424,7 +450,8 @@ def _held(
     None to go on (see `plan.refusal`)."""
     return refusal(
         usage,
-        _spend(state, now),
+        _spends(state),
+        _cleared(state),
         now,
         backfill=backfill,
         reserve=_reserve(config, state),
@@ -507,6 +534,7 @@ def _report(
     days: _Days,
     *,
     held: Refusal | None,
+    quiet: bool,
     drift: list[str],
     usage: Usage,
     failures: list[GateFailure],
@@ -517,6 +545,7 @@ def _report(
         failed=days.failed,
         held=None if held is None else held.reason,
         held_kind=None if held is None else held.kind,
+        notices_quiet=quiet,
         drift=drift,
         new_projects=days.new_projects,
         renamed=days.renamed,
@@ -534,16 +563,18 @@ def _bootstrap(
     now: datetime,
     moment: str,
     today: date,
+    override_reason: str | None,
 ) -> RunReport:
     """Build the stream's first state from its launch day, the newest day that is due
     on `today`, and publish it.
 
     The state starts with nothing applied, `moment` as its bootstrap_at and the launch
     day, and the open delta with the known breaks in the series and the budget's
-    notifications. The launch day is ensured (see `_ensure`) once the guard allows it,
-    as for a day after launch, and written. The state is copied as the base of today's
-    month, and published with the open delta and a manifest that lists the breaks.
-    Only then are the notifications acknowledged.
+    notifications, and with `override_reason`, a clearance of any spend that would hold
+    it (see `_clear_spend`). The launch day is ensured (see `_ensure`) once the guard
+    allows it, as for a day after launch, and written. The state is copied as the base of today's month,
+    and published with the open delta and a manifest that lists the breaks. Only then
+    are the notifications acknowledged.
 
     Raises BootstrapError, and publishes nothing, when the guard refuses the launch
     day or the day fails: a stream with no day counted has nothing to publish. The
@@ -571,6 +602,9 @@ def _bootstrap(
             delta.series_break(day_number(day), note)
         pulled = _record_spend(google, config, delta)
         _commit_and_apply(state, conn)
+        if override_reason:
+            _clear_spend(state, conn, delta, override_reason)
+        quiet = notices_quiet(_spends(state), now)
         usage = _usage(google, config, state, now)
         held = _held(usage, config, state, now, backfill=False)
         if held is not None:
@@ -607,7 +641,7 @@ def _bootstrap(
         series_breaks=[{"day": day.isoformat(), "note": note} for day, note in BREAKS],
     )
     _acknowledge(google, config, pulled)
-    return _report(days, held=None, drift=[], usage=usage, failures=[])
+    return _report(days, held=None, quiet=quiet, drift=[], usage=usage, failures=[])
 
 
 def run_once(
@@ -628,17 +662,19 @@ def run_once(
     and then a bootstrap builds and publishes the first state (see `_bootstrap`).
     Otherwise the prior manifest must list the state and the open delta
     (PriorStateError). The run rolls over (`cycle.roll_over`), writes the budget's
-    notifications to the delta, without acknowledging them, and applies it, names the
-    days whose partition moved, and measures what the billing month has used.
+    notifications to the delta, without acknowledging them, and with `override_reason`
+    a clearance of any spend that would hold it (see `_clear_spend`), and applies it.
+    It names the days whose partition moved, and measures what the billing month has
+    used.
 
     Then it takes the days from launch on that are due and not counted, oldest first,
     and the backfill, newest first, one at a time (see `_take`). Before each it asks
     the guard (`plan.refusal`), and it measures the usage again after each that an
     execution counted. It stops at a refusal, at a day that failed, and once
-    `max_seconds` from its start on `clock` have passed. It then publishes
-    (`cycle.publish`): the manifest is checked with the gates, and the state, the open
-    delta and the manifest are swapped into the current release. Only then are the
-    notifications acknowledged.
+    `max_seconds` from its start on `clock` have passed. It then
+    publishes (`cycle.publish`): the manifest is checked with the gates, and the state,
+    the open delta and the manifest are swapped into the current release. Only then are
+    the notifications acknowledged.
 
     Every error other than a failed day propagates, and an error before the publish
     publishes nothing to the current release and acknowledges no notification, so the
@@ -653,7 +689,14 @@ def run_once(
     # bootstrap, when GitHub answers 404 for the current release.
     if prior is None:
         return _bootstrap(
-            gh, google, workdir, config=config, now=now, moment=moment, today=today
+            gh,
+            google,
+            workdir,
+            config=config,
+            now=now,
+            moment=moment,
+            today=today,
+            override_reason=override_reason,
         )
     resume = _resume(prior, workdir)
     launch = resume.launch
@@ -669,6 +712,9 @@ def run_once(
         delta = Delta(conn, moment, first_seq=resume.applied + 1)
         pulled = _record_spend(google, config, delta)
         _commit_and_apply(state, conn)
+        if override_reason:
+            _clear_spend(state, conn, delta, override_reason)
+        quiet = notices_quiet(_spends(state), now)
         drift = _drift(google, config, state, launch)
         usage = _usage(google, config, state, now)
         counted = _counted(state)
@@ -716,7 +762,9 @@ def run_once(
         override_reason=override_reason,
     )
     _acknowledge(google, config, pulled)
-    return _report(days, held=held, drift=drift, usage=usage, failures=failures)
+    return _report(
+        days, held=held, quiet=quiet, drift=drift, usage=usage, failures=failures
+    )
 
 
 def counter_template(config: Config, image: str) -> dict:
@@ -756,8 +804,14 @@ def _google(federation: Federation) -> Google:
 
 def _unwell(report: RunReport) -> bool:
     """Whether the workflow should open its failure issue for `report`: a day failed, a
-    partition moved, or the guard held the run for any reason but the budget line."""
-    return bool(report.failed or report.drift or report.held_kind in FAILING_HOLDS)
+    partition moved, or the guard held the run for spend or the stop, or for want of a notification while no notification of any month is recent.
+    A month that has begun without its first notification is not a failure, nor is the
+    budget line."""
+    if report.failed or report.drift:
+        return True
+    if report.held_kind == "notice":
+        return report.notices_quiet
+    return report.held_kind in FAILING_HOLDS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -769,10 +823,10 @@ def main(argv: list[str] | None = None) -> int:
     or to py-observatory/data when that is not set (see obskit.runs). It works in a new
     directory in the folder that `--workdir` names (./work by default), which is
     removed afterwards, and SQLite's temporary files go in that folder too, unless
-    SQLITE_TMPDIR is set. It prints the report as JSON, and returns 2 when a day
-    failed, a partition moved or the guard held the run for any reason but the budget
-    line, so that the workflow opens its failure issue, and 0 otherwise. Either comes
-    after the publish.
+    SQLITE_TMPDIR is set. It prints the report as JSON, and returns 2 when the report
+    calls for the workflow's failure issue (see `_unwell`), and 0 otherwise. Either
+    comes after the publish. `--override-reason` also clears a spend that holds the run
+    (see `run_once`).
 
     `deploy` signs in as the deployer, and creates or updates the counter's job to run
     IMAGE (see `counter_template`). It returns 0.
@@ -797,8 +851,9 @@ def main(argv: list[str] | None = None) -> int:
         "--override-reason",
         default="",
         metavar="TEXT",
-        help="publish although a gate failed (except a failed month close), for this "
-        "reason, which the manifest logs",
+        help="publish although a gate failed (except a failed month close), and clear "
+        "any spend above $0 that holds the run, for this reason, which the manifest "
+        "or the state logs",
     )
     run.add_argument(
         "--max-seconds",

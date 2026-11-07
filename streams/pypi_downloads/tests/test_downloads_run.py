@@ -170,6 +170,7 @@ def test_bootstrap_counts_the_launch_day_and_publishes_first(tmp_path):
         failed=[],
         held=None,
         held_kind=None,
+        notices_quiet=True,
         drift=[],
         new_projects=3,
         renamed=1,
@@ -211,6 +212,19 @@ def test_a_bootstrap_held_by_the_budget_starts_no_execution(tmp_path):
 
     assert stream.started == []
     assert stream.cloud.acked == []
+
+    # A person who has looked clears the spend with a reason, and the bootstrap
+    # counts. The clearance is published with the first state.
+    report = stream.run(
+        "2026-11-11T10:00:00Z", bootstrap=True, override_reason="a test charge"
+    )
+
+    assert (report.counted, report.held) == (["2026-11-09"], None)
+    state = stream.open(CURRENT, STATE)
+    assert state.execute("SELECT * FROM clearances").fetchall() == [
+        ("2026-11", 0.01, "a test charge", "2026-11-11T10:00:00Z")
+    ]
+    assert stream.cloud.acked == ["ack-3"]
 
 
 # ---- the runs after it
@@ -355,12 +369,89 @@ def test_backfill_without_a_notification_exits_2(tmp_path, monkeypatch, capsys):
     stream = Stream(tmp_path)
     stream.bootstrap(BOOTSTRAP_AT)
 
-    # The day after launch needs no notification. The backfill does.
+    # The day after launch needs no notification. The backfill does. No notification
+    # of any month has come, so the feed may be broken, and the run exits 2.
     assert stream.main(monkeypatch, "2026-11-12T09:00:00Z", "run") == 2
 
     assert days_after_bootstrap(stream) == ["2026-11-10"]
     report = printed_report(capsys)
     assert (report["counted"], report["held_kind"]) == (["2026-11-10"], "notice")
+    assert report["notices_quiet"] is True
+
+
+def test_a_month_before_its_first_notification_holds_the_backfill_and_exits_0(
+    tmp_path, monkeypatch, capsys
+):
+    stream = Stream(tmp_path)
+    # The billing month began at 07:00 UTC. October's notifications still come, and
+    # November's first has not.
+    stream.bootstrap("2026-11-01T09:00:00Z")
+    stream.notify(0.0, at="2026-11-01T10:00:00Z", month="2026-10")
+
+    assert stream.main(monkeypatch, "2026-11-01T12:00:00Z", "run") == 0
+
+    # The launch day, 10-30, is the newest that is due, so only the backfill is left,
+    # and it waits for November's notification.
+    assert days_after_bootstrap(stream) == []
+    report = printed_report(capsys)
+    assert report["held_kind"] == "notice"
+    assert report["held"] == "no budget notification for 2026-11 in the last 48 hours"
+    assert report["notices_quiet"] is False
+
+
+def test_an_override_clears_a_spend_hold_until_the_cost_rises(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.notify(0.25, at="2026-11-12T08:00:00Z")
+
+    held = stream.run("2026-11-12T09:00:00Z")
+
+    assert (held.counted, held.held_kind) == ([], "spend")
+
+    # A person looks at the billing report and clears the spend with a reason. The
+    # run records a clearance of the month's cost, and counts.
+    cleared = stream.run(
+        "2026-11-12T15:00:00Z", override_reason="a rounding charge", max_seconds=1
+    )
+
+    assert (cleared.counted, cleared.held) == (["2026-11-10"], None)
+    state = stream.open(CURRENT, STATE)
+    assert state.execute("SELECT * FROM clearances").fetchall() == [
+        ("2026-11", 0.25, "a rounding charge", "2026-11-12T15:00:00Z")
+    ]
+
+    # The clearance is published, so the next run counts with no reason given.
+    after = stream.run("2026-11-12T21:00:00Z", max_seconds=1)
+
+    assert (after.counted, after.held) == (["2026-11-08"], None)
+
+    # A later notification shows more spent in the month: the clearance does not
+    # cover it, and the run holds again.
+    stream.notify(0.4, at="2026-11-13T08:00:00Z")
+
+    again = stream.run("2026-11-13T09:00:00Z")
+
+    assert (again.counted, again.held_kind) == ([], "spend")
+    assert again.held == (
+        "the budget shows $0.4 spent in 2026-11, above the $0.25 cleared"
+    )
+    assert days_after_bootstrap(stream) == ["2026-11-10", "2026-11-08"]
+
+
+def test_a_spend_holds_into_the_next_billing_month(tmp_path, monkeypatch, capsys):
+    stream = Stream(tmp_path)
+    stream.bootstrap("2026-11-28T09:00:00Z")
+    stream.notify(0.25, at="2026-11-29T08:00:00Z")
+
+    assert stream.main(monkeypatch, "2026-11-29T09:00:00Z", "run") == 2
+
+    # December has begun in California, and November's spend still holds every day.
+    assert stream.main(monkeypatch, "2026-12-01T09:00:00Z", "run") == 2
+
+    assert days_after_bootstrap(stream) == []
+    report = printed_report(capsys)
+    assert (report["counted"], report["held_kind"]) == ([], "spend")
+    assert report["held"] == "the budget shows $0.25 spent in 2026-11"
 
 
 def test_the_stop_keeps_room_for_the_next_execution(tmp_path, monkeypatch, capsys):

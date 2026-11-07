@@ -14,8 +14,10 @@ from pypi_downloads.plan import (
     execution_usage,
     forward_days,
     latest_due,
+    notices_quiet,
     refusal,
     spend_from,
+    uncleared,
 )
 
 NOW = datetime(2026, 11, 11, 7, 0, tzinfo=UTC)  # ten days into a 30-day Pacific month
@@ -167,21 +169,92 @@ def test_spend_from_keeps_the_newest_per_month():
 def test_any_spend_stops_everything():
     spent = Spend("2026-11", 0.01, 1.0, "2026-11-11T05:00:00Z")
     for backfill in (False, True):
-        result = refusal(Usage(0, 0, 0), spent, NOW, backfill=backfill, reserve=NONE)
-        assert result == Refusal("spend", result.reason)
-        assert "spent" in result.reason
-    # last month's spend is not this month's
-    old = Spend("2026-10", 5.0, 1.0, "2026-10-31T05:00:00Z")
-    assert refusal(Usage(0, 0, 0), old, NOW, backfill=False, reserve=NONE) is None
-
-
-def test_spend_is_read_in_pacific_months():
-    # 03:00 UTC on 12-01 is still November in California.
-    now = datetime(2026, 12, 1, 3, 0, tzinfo=UTC)
-    november = Spend("2026-11", 0.5, 1.0, "2026-12-01T02:00:00Z")
+        result = refusal(
+            Usage(0, 0, 0), [spent], {}, NOW, backfill=backfill, reserve=NONE
+        )
+        assert result == Refusal("spend", "the budget shows $0.01 spent in 2026-11")
+    # A month whose newest notification shows nothing spent holds nothing.
+    nothing = [Spend("2026-10", 0.0, 1.0, "2026-10-31T05:00:00Z"), FRESH]
     assert (
-        refusal(Usage(0, 0, 0), november, now, backfill=False, reserve=NONE).kind
+        refusal(Usage(0, 0, 0), nothing, {}, NOW, backfill=True, reserve=NONE) is None
+    )
+
+
+def test_a_spend_holds_into_the_next_billing_month():
+    # October's spend is not cleared, so it holds November's counting too, though
+    # November has spent nothing.
+    october = Spend("2026-10", 5.0, 1.0, "2026-10-31T05:00:00Z")
+    for backfill in (False, True):
+        result = refusal(
+            Usage(0, 0, 0), [october, FRESH], {}, NOW, backfill=backfill, reserve=NONE
+        )
+        assert result == Refusal("spend", "the budget shows $5.0 spent in 2026-10")
+    # Cleared, it holds nothing.
+    cleared = {"2026-10": 5.0}
+    assert (
+        refusal(
+            Usage(0, 0, 0), [october, FRESH], cleared, NOW, backfill=True, reserve=NONE
+        )
+        is None
+    )
+
+
+def test_a_cleared_month_holds_again_when_its_cost_rises():
+    cleared = {"2026-11": 0.25}
+    same = Spend("2026-11", 0.25, 1.0, "2026-11-11T05:00:00Z")
+    assert (
+        refusal(Usage(0, 0, 0), [same], cleared, NOW, backfill=True, reserve=NONE)
+        is None
+    )
+    more = Spend("2026-11", 0.3, 1.0, "2026-11-11T06:00:00Z")
+    result = refusal(Usage(0, 0, 0), [more], cleared, NOW, backfill=False, reserve=NONE)
+    assert result == Refusal(
+        "spend", "the budget shows $0.3 spent in 2026-11, above the $0.25 cleared"
+    )
+    # Another month's clearance covers nothing of this one.
+    other = {"2026-10": 1.0}
+    assert (
+        refusal(Usage(0, 0, 0), [same], other, NOW, backfill=False, reserve=NONE).kind
         == "spend"
+    )
+
+
+def test_the_spend_reason_gives_the_cost_as_reported_and_every_month_held():
+    small = Spend("2026-11", 0.004, 1.0, "2026-11-11T05:00:00Z")
+    october = Spend("2026-10", 0.5, 1.0, "2026-10-31T05:00:00Z")
+    result = refusal(
+        Usage(0, 0, 0), [small, october], {}, NOW, backfill=False, reserve=NONE
+    )
+    assert result.reason == (
+        "the budget shows $0.5 spent in 2026-10; $0.004 spent in 2026-11"
+    )
+
+
+def test_uncleared_names_the_months_that_hold_oldest_first():
+    spends = [
+        Spend("2026-11", 0.3, 1.0, "2026-11-11T05:00:00Z"),
+        Spend("2026-09", 0.0, 1.0, "2026-09-30T05:00:00Z"),
+        Spend("2026-10", 0.2, 1.0, "2026-10-31T05:00:00Z"),
+        Spend("2026-08", 0.1, 1.0, "2026-08-31T05:00:00Z"),
+    ]
+    held = uncleared(spends, {"2026-08": 0.1, "2026-11": 0.25})
+    assert [spend.month for spend in held] == ["2026-10", "2026-11"]
+    assert uncleared([], {}) == []
+
+
+def test_the_notice_is_read_in_pacific_months():
+    # 03:00 UTC on 12-01 is still November in California, so November's notification
+    # is this month's, and the backfill may go on. By 09:00 it is December's month.
+    november = Spend("2026-11", 0.0, 1.0, "2026-12-01T02:00:00Z")
+    still_november = datetime(2026, 12, 1, 3, 0, tzinfo=UTC)
+    assert (
+        refusal(NONE, [november], {}, still_november, backfill=True, reserve=NONE)
+        is None
+    )
+    december = datetime(2026, 12, 1, 9, 0, tzinfo=UTC)
+    assert (
+        refusal(NONE, [november], {}, december, backfill=True, reserve=NONE).kind
+        == "notice"
     )
 
 
@@ -192,12 +265,13 @@ def test_98_percent_stops_everything():
             Usage(0, 0.98 * FREE.gib_seconds, 0),
             Usage(0, 0, int(0.98 * FREE.read_bytes) + 1),
         ):
-            result = refusal(usage, FRESH, NOW, backfill=backfill, reserve=NONE)
+            result = refusal(usage, [FRESH], {}, NOW, backfill=backfill, reserve=NONE)
             assert result.kind == "stop"
     assert (
         refusal(
             Usage(0.97 * FREE.vcpu_seconds, 0, 0),
-            FRESH,
+            [FRESH],
+            {},
             NOW,
             backfill=False,
             reserve=NONE,
@@ -206,23 +280,38 @@ def test_98_percent_stops_everything():
     )
 
 
+def test_the_notices_are_quiet_when_none_of_any_month_is_recent():
+    assert notices_quiet([], NOW) is True
+    # 48 hours and a minute old.
+    old = Spend("2026-11", 0.0, 1.0, "2026-11-09T06:59:00Z")
+    assert notices_quiet([old], NOW) is True
+    # A new billing month whose first notification has not come, while the last
+    # month's still do: the feed works.
+    last_month = Spend("2026-10", 0.0, 1.0, "2026-11-10T06:00:00Z")
+    assert notices_quiet([old, last_month], NOW) is False
+    assert notices_quiet([FRESH], NOW) is False
+
+
 def test_backfill_needs_a_recent_notification():
-    assert refusal(Usage(0, 0, 0), None, NOW, backfill=False, reserve=NONE) is None
-    result = refusal(Usage(0, 0, 0), None, NOW, backfill=True, reserve=NONE)
+    assert refusal(Usage(0, 0, 0), [], {}, NOW, backfill=False, reserve=NONE) is None
+    result = refusal(Usage(0, 0, 0), [], {}, NOW, backfill=True, reserve=NONE)
     assert result.kind == "notice"
     assert "notification" in result.reason
     old = Spend("2026-11", 0.0, 1.0, "2026-11-09T06:59:00Z")  # 48 h 1 min old
     assert (
-        refusal(Usage(0, 0, 0), old, NOW, backfill=True, reserve=NONE).kind == "notice"
+        refusal(Usage(0, 0, 0), [old], {}, NOW, backfill=True, reserve=NONE).kind
+        == "notice"
     )
-    assert refusal(Usage(0, 0, 0), old, NOW, backfill=False, reserve=NONE) is None
+    assert refusal(Usage(0, 0, 0), [old], {}, NOW, backfill=False, reserve=NONE) is None
     last_month = Spend("2026-10", 0.0, 1.0, "2026-11-11T06:00:00Z")
     assert (
-        refusal(Usage(0, 0, 0), last_month, NOW, backfill=True, reserve=NONE).kind
+        refusal(Usage(0, 0, 0), [last_month], {}, NOW, backfill=True, reserve=NONE).kind
         == "notice"
     )
     recent = Spend("2026-11", 0.0, 1.0, "2026-11-09T07:01:00Z")
-    assert refusal(Usage(0, 0, 0), recent, NOW, backfill=True, reserve=NONE) is None
+    assert (
+        refusal(Usage(0, 0, 0), [recent], {}, NOW, backfill=True, reserve=NONE) is None
+    )
 
 
 def test_backfill_follows_the_budget_line():
@@ -231,34 +320,50 @@ def test_backfill_follows_the_budget_line():
     third = start + (end - start) / 3
     fresh = Spend("2026-11", 0.0, 1.0, third.isoformat())
     assert (
-        refusal(Usage(63_999, 0, 0), fresh, third, backfill=True, reserve=NONE) is None
+        refusal(Usage(63_999, 0, 0), [fresh], {}, third, backfill=True, reserve=NONE)
+        is None
     )
-    result = refusal(Usage(64_000, 0, 0), fresh, third, backfill=True, reserve=NONE)
+    result = refusal(
+        Usage(64_000, 0, 0), [fresh], {}, third, backfill=True, reserve=NONE
+    )
     assert result.kind == "line"
     assert (
-        refusal(Usage(64_000, 0, 0), fresh, third, backfill=False, reserve=NONE) is None
+        refusal(Usage(64_000, 0, 0), [fresh], {}, third, backfill=False, reserve=NONE)
+        is None
     )
     gib_line = 0.8 * FREE.gib_seconds / 3
     assert (
-        refusal(Usage(0, gib_line - 1, 0), fresh, third, backfill=True, reserve=NONE)
+        refusal(
+            Usage(0, gib_line - 1, 0), [fresh], {}, third, backfill=True, reserve=NONE
+        )
         is None
     )
     assert (
         refusal(
-            Usage(0, gib_line + 1, 0), fresh, third, backfill=True, reserve=NONE
+            Usage(0, gib_line + 1, 0), [fresh], {}, third, backfill=True, reserve=NONE
         ).kind
         == "line"
     )
     read_line = 0.8 * FREE.read_bytes / 3
     assert (
         refusal(
-            Usage(0, 0, int(read_line) - 1), fresh, third, backfill=True, reserve=NONE
+            Usage(0, 0, int(read_line) - 1),
+            [fresh],
+            {},
+            third,
+            backfill=True,
+            reserve=NONE,
         )
         is None
     )
     assert (
         refusal(
-            Usage(0, 0, int(read_line) + 1), fresh, third, backfill=True, reserve=NONE
+            Usage(0, 0, int(read_line) + 1),
+            [fresh],
+            {},
+            third,
+            backfill=True,
+            reserve=NONE,
         ).kind
         == "line"
     )
@@ -271,10 +376,11 @@ def test_the_budget_line_uses_the_real_length_of_the_month():
     fresh = Spend("2026-11", 0.0, 1.0, half.isoformat())
     line = 0.8 * FREE.vcpu_seconds * 0.5
     assert (
-        refusal(Usage(line - 1, 0, 0), fresh, half, backfill=True, reserve=NONE) is None
+        refusal(Usage(line - 1, 0, 0), [fresh], {}, half, backfill=True, reserve=NONE)
+        is None
     )
     assert (
-        refusal(Usage(line, 0, 0), fresh, half, backfill=True, reserve=NONE).kind
+        refusal(Usage(line, 0, 0), [fresh], {}, half, backfill=True, reserve=NONE).kind
         == "line"
     )
 
@@ -297,19 +403,19 @@ def test_a_day_is_refused_when_its_worst_case_would_reach_the_stop_share():
     used = Usage(0.97 * FREE.vcpu_seconds, 0, 0)
     for backfill in (False, True):
         result = refusal(
-            used, FRESH, NOW, backfill=backfill, reserve=Usage(7_200, 0, 0)
+            used, [FRESH], {}, NOW, backfill=backfill, reserve=Usage(7_200, 0, 0)
         )
         assert result.kind == "stop"
     fits = Usage(2_000, 0, 0)  # 232,800 + 2,000 stays under 235,200
-    assert refusal(used, FRESH, NOW, backfill=False, reserve=fits) is None
+    assert refusal(used, [FRESH], {}, NOW, backfill=False, reserve=fits) is None
 
 
 def test_the_read_bytes_reserve_counts_too():
     used = Usage(0, 0, int(0.97 * FREE.read_bytes))
     big = Usage(0, 0, int(0.02 * FREE.read_bytes))
-    assert refusal(used, FRESH, NOW, backfill=False, reserve=big).kind == "stop"
+    assert refusal(used, [FRESH], {}, NOW, backfill=False, reserve=big).kind == "stop"
     small = Usage(0, 0, int(0.005 * FREE.read_bytes))
-    assert refusal(used, FRESH, NOW, backfill=False, reserve=small) is None
+    assert refusal(used, [FRESH], {}, NOW, backfill=False, reserve=small) is None
 
 
 def test_the_budget_line_ignores_the_reserve():
@@ -318,5 +424,6 @@ def test_the_budget_line_ignores_the_reserve():
     fresh = Spend("2026-11", 0.0, 1.0, third.isoformat())
     below = Usage(60_000, 0, 0)
     assert (
-        refusal(below, fresh, third, backfill=True, reserve=Usage(7_200, 0, 0)) is None
+        refusal(below, [fresh], {}, third, backfill=True, reserve=Usage(7_200, 0, 0))
+        is None
     )
