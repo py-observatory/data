@@ -1,5 +1,6 @@
-"""Fakes for tests, and texts for tests to share. FakeGitHub is the GitHub releases API
-and FakeHttp is a set of web pages that obskit.http reads, both held in memory. The
+"""Fakes for tests, and texts for tests to share. FakeGitHub is the GitHub releases API,
+FakeHttp is a set of web pages that obskit.http reads, and FakeGoogle is the Google
+Cloud APIs, all held in memory. The
 lists at the end are the texts that the tests of obskit.emails share with the tests of
 each stream that uses it."""
 
@@ -9,6 +10,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 _Reply = tuple[int, dict[str, str], bytes]
@@ -416,6 +418,108 @@ class FakeHttp:
             if entry.remaining == 0:
                 del entries[0]
         return entry.status, dict(entry.headers), entry.body
+
+
+@dataclass
+class _GoogleCall:
+    """A request that matched a route of FakeGoogle: its URL, headers and JSON body."""
+
+    method: str
+    url: str
+    headers: dict[str, str]
+    body: bytes | None
+
+
+class FakeGoogle:
+    """The Google Cloud APIs that `obskit.gcp` calls, held in memory, as a Transport.
+
+    The sign-in is three calls: GitHub's OIDC endpoint (at `oidc_url`), Google's STS and
+    the impersonation of a service account. Each issues a token the next one must be
+    given, and one that is not known is a 401. The impersonated tokens are named
+    "sa-token-1", "sa-token-2" and so on, in the order issued, and each one ends
+    `access_token_lifetime` seconds after it was issued, by the wall clock.
+
+    A test reads what the sign-in sent: `last_oidc_audience`, the audience asked of
+    GitHub, and `last_sts_body`, the JSON body of the latest STS request.
+    `oidc_tokens_issued` counts the OIDC tokens. `fail_next` makes a request fail.
+
+    Routes are a table of (method, URL prefix, handler), tried in order, and `route`
+    adds one. A request that no route takes raises NotImplementedError, never a 404.
+    """
+
+    def __init__(self, oidc_url: str = "https://gh.example/oidc") -> None:
+        # (method, url) of every request, in order, failed ones included.
+        self.requests: list[tuple[str, str]] = []
+        self.oidc_tokens_issued = 0
+        self.access_token_lifetime = 3600
+        self.last_oidc_audience: str | None = None
+        self.last_sts_body: dict | None = None
+        self._failures: list[tuple[int, str]] = []
+        self._federated: set[str] = set()
+        self._access_tokens_issued = 0
+        self._routes: list[tuple[str, str, Callable[[_GoogleCall], _Reply]]] = []
+        self.route("GET", oidc_url, self._oidc)
+        self.route("POST", "https://sts.googleapis.com/v1/token", self._sts)
+        self.route(
+            "POST",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/",
+            self._impersonate,
+        )
+
+    def route(
+        self, method: str, url_prefix: str, handler: Callable[[_GoogleCall], _Reply]
+    ) -> None:
+        """Answer the requests that use `method` and whose URL starts with `url_prefix`
+        with `handler`, after the routes already added."""
+        self._routes.append((method, url_prefix, handler))
+
+    def fail_next(self, status: int, *, url_contains: str = "") -> None:
+        """Answer the next request whose URL contains `url_contains` (any, by default)
+        with `status` and a Google-shaped error, without carrying it out."""
+        self._failures.append((status, url_contains))
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | None
+    ) -> _Reply:
+        self.requests.append((method, url))
+        for index, (status, needle) in enumerate(self._failures):
+            if needle in url:
+                del self._failures[index]
+                return _reply(status, {"error": {"message": f"refused with {status}"}})
+        call = _GoogleCall(method, url, dict(headers), body)
+        for route_method, prefix, handler in self._routes:
+            if method == route_method and url.startswith(prefix):
+                return handler(call)
+        raise NotImplementedError(f"FakeGoogle has no route for {method} {url}")
+
+    def _oidc(self, call: _GoogleCall) -> _Reply:
+        query = parse_qs(urlsplit(call.url).query)
+        self.last_oidc_audience = query.get("audience", [""])[0]
+        self.oidc_tokens_issued += 1
+        return _reply(200, {"value": f"oidc-jwt-{self.oidc_tokens_issued}"})
+
+    def _sts(self, call: _GoogleCall) -> _Reply:
+        body = _json_object(call.body) or {}
+        self.last_sts_body = body
+        if not str(body.get("subjectToken", "")).startswith("oidc-jwt-"):
+            return _problem(400, "the subject token is not one that was issued")
+        token = f"sts-token-{body['subjectToken'].removeprefix('oidc-jwt-')}"
+        self._federated.add(token)
+        return _reply(200, {"access_token": token})
+
+    def _impersonate(self, call: _GoogleCall) -> _Reply:
+        bearer = call.headers.get("Authorization", "").removeprefix("Bearer ")
+        if bearer not in self._federated:
+            return _problem(401, "the federated token is not one that was issued")
+        self._access_tokens_issued += 1
+        ends = datetime.now(UTC) + timedelta(seconds=self.access_token_lifetime)
+        return _reply(
+            200,
+            {
+                "accessToken": f"sa-token-{self._access_tokens_issued}",
+                "expireTime": ends.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
 
 
 # ---- Texts for the tests of obskit.emails, and of every stream that uses it.
