@@ -1,13 +1,15 @@
 """Each stream's admitted tables, downloaded from its release and staged for a build.
 
 A stage holds what the builders read of a stream. osv's admitted table is a table of its
-state, so its stage is its state as downloaded. Three of the registry's admitted tables
-are tables of its state and three are tables of its deltas, which are large: their files
-alone are tens of millions of rows. So `stage_registry` reads the parts one at a time,
-keeps of each only what a build needs, and deletes each before it downloads the next, so
-that the disk never holds the files twice. It sums each release's files into one row,
-joined with the state's files_current for what each file is now, and copies the release
-records and the events as they are.
+state, so its stage is its state as downloaded. The downloads stream's admitted tables
+are tables of its state and of its serving database, so its stage is both, as
+downloaded. Three of the registry's admitted tables are tables of its state and three
+are tables of its deltas, which are large: their files alone are tens of millions of
+rows. So `stage_registry` reads the parts one at a time, keeps of each only what a build
+needs, and deletes each before it downloads the next, so that the disk never holds the
+files twice. It sums each release's files into one row, joined with the state's
+files_current for what each file is now, and copies the release records and the events
+as they are.
 
 A downloaded database is data from outside. Each is opened with obskit.sqlite.open_db
 against its stream's schema, which refuses one that lacks a table, and the stage reads
@@ -23,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import osv_pypi
+import pypi_downloads
 import pypi_registry
 from obskit.github import GitHub
 from obskit.manifest import Asset
@@ -61,6 +64,10 @@ class DownloadsStage:
 
     state: Path
     serving: Path
+
+
+# What the builders read of a stream, whichever stream it is.
+Stage = RegistryStage | OsvStage | DownloadsStage
 
 
 def _registry_tables(tables: tuple[str, ...]) -> str:
@@ -253,10 +260,23 @@ READS: dict[str, frozenset[str]] = {
         }
     ),
     osv_pypi.STREAM: frozenset({"advisories"}),
+    pypi_downloads.STREAM: frozenset(
+        {
+            "projects",
+            "days",
+            "breaks",
+            "monthly",
+            "months",
+            "top_set",
+            "daily",
+            "recent",
+        }
+    ),
 }
 
 # How each stream is staged, by its id.
-STAGERS: dict[str, Callable[[GitHub, list[Asset], Path], RegistryStage | OsvStage]] = {
+STAGERS: dict[str, Callable[[GitHub, list[Asset], Path], Stage]] = {
     pypi_registry.STREAM: stage_registry,
     osv_pypi.STREAM: stage_osv,
+    pypi_downloads.STREAM: stage_downloads,
 }

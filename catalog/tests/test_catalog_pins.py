@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from test_catalog_downloads import coverage
+
 from catalog.config import load_config
 from catalog.inputs import StreamRead, read_stream
 from catalog.pins import (
@@ -18,11 +20,19 @@ from catalog.pins import (
     write_pin,
 )
 from catalog.run import run_once
-from catalog_helpers import REPO, TOKEN, no_sleep, publish_osv, publish_registry
+from catalog_helpers import (
+    REPO,
+    TOKEN,
+    no_sleep,
+    publish_downloads,
+    publish_osv,
+    publish_registry,
+)
 from obskit.github import GitHub
 from obskit.manifest import Asset, Manifest, dumps, loads
 from obskit.release import CreateOnceError, add_create_once
 from obskit.testing import FakeGitHub
+from pypi_downloads.store import day_number
 
 CONFIG = load_config()
 CURRENT = "catalog-current"
@@ -61,6 +71,25 @@ def osv(gh: GitHub, open_day: str, *sealed: str) -> Manifest:
         for day in sealed
     }
     return publish_osv(gh, advisories=[], open_day=open_day, sealed=rows)
+
+
+def downloads(gh: GitHub, open_day: str, *sealed: str) -> Manifest:
+    """Publish the downloads stream as its run on `open_day` leaves it, having sealed
+    each day of `sealed`, as `registry` does. Each sealed delta holds the day that it
+    counted, two days before, which gives each its own bytes."""
+    rows = {
+        day: {"days": [{"day": day_number(date.fromisoformat(day)) - 2}]}
+        for day in sealed
+    }
+    return publish_downloads(
+        gh,
+        state={},
+        serving={},
+        open_day=open_day,
+        open_delta={},
+        coverage=coverage(),
+        sealed=rows,
+    )
 
 
 def read_all(gh: GitHub, tmp_path: Path) -> list[StreamRead]:
@@ -111,9 +140,11 @@ def test_due_days_start_at_the_first_build_and_end_yesterday():
 
 
 def test_a_pin_waits_until_every_stream_has_sealed_the_day(gh, tmp_path):
-    # The registry has sealed the 2nd, and osv is still open on it.
+    # The registry and the downloads stream have sealed the 2nd, and osv is still open
+    # on it.
     registry(gh, "2026-11-03", "2026-11-02")
     osv(gh, "2026-11-02")
+    downloads(gh, "2026-11-03", "2026-11-02")
     morning = datetime(2026, 11, 3, 6, 0, tzinfo=UTC)
 
     assert pin_ready(DAY, read_all(gh, tmp_path), morning, 24) is False
@@ -122,11 +153,12 @@ def test_a_pin_waits_until_every_stream_has_sealed_the_day(gh, tmp_path):
     osv(gh, "2026-11-03", "2026-11-02")
     reads = read_all(gh, tmp_path)
     assert pin_ready(DAY, reads, morning, 24) is True
-    # Neither has sealed the 3rd.
+    # None has sealed the 3rd.
     assert pin_ready(date(2026, 11, 3), reads, morning, 24) is False
     # A stream that cannot be read has sealed nothing that the catalog can see.
-    registry_read, _ = reads
-    assert pin_ready(DAY, [registry_read, unreadable("osv-pypi")], morning, 24) is False
+    registry_read, _, downloads_read = reads
+    with_osv_unread = [registry_read, unreadable("osv-pypi"), downloads_read]
+    assert pin_ready(DAY, with_osv_unread, morning, 24) is False
 
 
 def test_a_pin_is_written_anyway_once_the_wait_is_over(gh, fake, tmp_path):
@@ -170,15 +202,18 @@ def test_a_pin_is_written_anyway_once_the_wait_is_over(gh, fake, tmp_path):
 def test_the_pin_document_names_create_once_assets_with_urls_and_the_commit(
     gh, fake, tmp_path
 ):
-    # The registry has sealed the 2nd and the 3rd, and osv the 2nd. The pin of the 2nd
-    # names the base copy of the month and the delta of the 2nd of each: not the delta
-    # of the 3rd, which is after the day, nor the state or the open delta, which the
-    # next run of the stream replaces.
+    # The registry has sealed the 2nd and the 3rd, and osv and the downloads stream the
+    # 2nd. The pin of the 2nd names the base copy of the month and the delta of the 2nd
+    # of each: not the delta of the 3rd, which is after the day, nor the state, the open
+    # delta or the downloads stream's serving database, which the next run of the
+    # stream replaces.
     registry(gh, "2026-11-04", "2026-11-02", "2026-11-03")
     osv(gh, "2026-11-03", "2026-11-02")
+    downloads(gh, "2026-11-03", "2026-11-02")
     reads = read_all(gh, tmp_path)
     registry_month = "pypi-registry-month-2026-11"
     osv_month = "osv-pypi-month-2026-11"
+    downloads_month = "pypi-downloads-month-2026-11"
 
     document = pin_document(DAY, reads, CONFIG, REPO, "8f3c2a1")
 
@@ -248,6 +283,39 @@ def test_the_pin_document_names_create_once_assets_with_urls_and_the_commit(
                 "complete": True,
                 "error": None,
                 "sealed_through": "2026-11-03",
+            },
+            "pypi-downloads": {
+                "assets": [
+                    {
+                        "name": "pypi-downloads-state-base-2026-11.db.zst",
+                        "period": "2026-11",
+                        "sha256": sha256_of(
+                            fake,
+                            downloads_month,
+                            "pypi-downloads-state-base-2026-11.db.zst",
+                        ),
+                        "tag": "pypi-downloads-month-2026-11",
+                        "url": "https://github.com/py-observatory/data/releases/"
+                        "download/pypi-downloads-month-2026-11/"
+                        "pypi-downloads-state-base-2026-11.db.zst",
+                    },
+                    {
+                        "name": "pypi-downloads-delta-2026-11-02.db.zst",
+                        "period": "2026-11-02",
+                        "sha256": sha256_of(
+                            fake,
+                            downloads_month,
+                            "pypi-downloads-delta-2026-11-02.db.zst",
+                        ),
+                        "tag": "pypi-downloads-month-2026-11",
+                        "url": "https://github.com/py-observatory/data/releases/"
+                        "download/pypi-downloads-month-2026-11/"
+                        "pypi-downloads-delta-2026-11-02.db.zst",
+                    },
+                ],
+                "complete": True,
+                "error": None,
+                "sealed_through": "2026-11-02",
             },
         },
     }
@@ -356,6 +424,7 @@ def test_a_pin_that_github_lists_without_a_digest_is_not_taken_as_written(
 def test_the_month_copy_copies_the_last_build_byte_for_byte(gh, fake, tmp_path):
     registry(gh, "2026-11-30")
     osv(gh, "2026-11-30")
+    downloads(gh, "2026-11-30")
     run_once(
         gh,
         Path(tempfile.mkdtemp(dir=tmp_path)),

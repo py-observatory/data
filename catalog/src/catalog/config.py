@@ -17,7 +17,12 @@ from obskit.tags import check_tag, current_tag
 # Next to the package's pyproject.toml, as a stream keeps its stream.toml.
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "catalog.toml"
 
-_BUILD_KEYS = ("min_gap_minutes", "max_gap_hours", "pin_wait_hours")
+_BUILD_KEYS = (
+    "min_gap_minutes",
+    "max_gap_hours",
+    "pin_wait_hours",
+    "download_daily_years",
+)
 _STREAM_KEYS = ("tables", "stale_after_hours")
 
 
@@ -37,18 +42,21 @@ class Config:
     """The admitted streams, by id and in the order of the file, and the limits of a
     build. A build waits `min_gap_minutes` after the last one, and one is made anyway
     once the last is `max_gap_hours` old. A day's pin waits `pin_wait_hours` after the
-    day for a stream to seal it."""
+    day for a stream to seal it. A build keeps the daily downloads of the newest
+    `download_daily_years` years: the year of the newest day counted, and the years
+    before it."""
 
     streams: dict[str, StreamAdmission]
     min_gap_minutes: int
     max_gap_hours: int
     pin_wait_hours: int
+    download_daily_years: int
 
 
 def load_config(path: Path = CONFIG_PATH) -> Config:
     """Read the admission list at `path`.
 
-    The file has a `build` table with the three limits and a `streams` table with one
+    The file has a `build` table with the four limits and a `streams` table with one
     table for each stream, which gives that stream's `tables` and `stale_after_hours`,
     and it has no other key. A limit is a whole number of at least 1, and
     `min_gap_minutes` is shorter than `max_gap_hours`. A stream's id must be one that

@@ -24,10 +24,13 @@ once the last build is `max_gap_hours` old. Every other run builds nothing. A bu
 stages each stream that was read, carries each stream that could not be read or staged
 from the last build's database, and builds the serving database. Its manifest says
 which streams were carried and which are stale, and the data is complete only when none
-is. The kit's gates check the manifest against the last one, so a build from older
-inputs than the last build's waits for a person's reason, and so does one with fewer
-projects or events than the last build. Then it is swapped into `catalog-current`,
-which is the only release that GitHub shows as Latest.
+is. A stream whose own manifest says that its data is not complete, as the registry's
+does until its sweep has read every project and the downloads stream's until its
+backfill is done, leaves the catalog's complete: the stream's coverage and `input` row
+say it of that stream. The kit's gates check the manifest against the last one, so a
+build from older inputs than the last build's waits for a person's reason, and so does
+one with fewer projects or events than the last build. Then it is swapped into
+`catalog-current`, which is the only release that GitHub shows as Latest.
 
 Every run writes the daily pins that are due and ready (see `pins`). They depend on the
 streams' manifests alone, so a build writes them before it publishes, and its manifest
@@ -85,7 +88,7 @@ from catalog.serving import (
     build_serving,
     over_budget,
 )
-from catalog.stage import STAGERS, OsvStage, RegistryStage
+from catalog.stage import STAGERS, Stage
 
 # The reasons for which a run builds. Every other reason builds nothing.
 _BUILDS = frozenset({"bootstrap", "month began", "inputs changed", "heartbeat"})
@@ -287,7 +290,7 @@ def _decide(
 
 def _stage(
     gh: GitHub, read: StreamRead, directory: Path, *, bootstrap: bool
-) -> tuple[RegistryStage | OsvStage | None, str | None]:
+) -> tuple[Stage | None, str | None]:
     """Stage the stream of `read` in `directory`. Returns the stage, or None and the
     reason that there is none: the stream could not be read, or could not be staged.
 
@@ -322,7 +325,8 @@ def _inputs(
     There is exactly one input for each admitted stream, in the order of catalog.toml:
     the build carries a stream whose input has no stage, and would drop one that had
     no input at all. A carried stream keeps the licences that the last build listed for
-    it, as it keeps that build's attribution.
+    it, as it keeps that build's attribution, and has no coverage, as its tables are
+    the last build's. A staged stream has its manifest's coverage.
     """
     last = prior.coverage["streams"] if prior else {}
     inputs: list[StreamInput] = []
@@ -332,10 +336,12 @@ def _inputs(
         if staged is None or read.manifest is None:
             known[stream] = _carried(stream, last, error or "")
             licences = _licences_of(prior, stream)
+            coverage = {}
         else:
             known[stream] = seen[stream]
             licences = read.manifest.licences
-        inputs.append(_input(stream, known[stream], licences, staged))
+            coverage = read.manifest.coverage
+        inputs.append(_input(stream, known[stream], licences, coverage, staged))
     return inputs, known
 
 
@@ -350,7 +356,8 @@ def _input(
     stream: str,
     known: dict,
     licences: list[dict],
-    staged: RegistryStage | OsvStage | None,
+    coverage: dict,
+    staged: Stage | None,
 ) -> StreamInput:
     """What the build has of `stream`, from `known`, what the run knows of it (see
     `_seen` and `_carried`)."""
@@ -361,6 +368,7 @@ def _input(
         complete=known["complete"],
         fingerprint=known["fingerprint"],
         licences=licences,
+        coverage=coverage,
         staged=staged,
     )
 
@@ -523,7 +531,7 @@ def run_once(
     carrying = any(item.staged is None for item in inputs)
     previous = _previous_build(gh, prior, workdir) if prior and carrying else None
     db = workdir / SERVING_DB
-    built = build_serving(db, inputs, previous)
+    built = build_serving(db, inputs, previous, daily_years=config.download_daily_years)
     packed, entry, over = _pack(db, workdir)
     # The pins are written before the manifest is made, so that it records them.
     pins, last_pin = _write_pins(gh, workdir, reads, now, config, first_build, last_pin)

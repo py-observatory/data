@@ -204,7 +204,7 @@ def publish_registry(
     The manifest says that the publish was made at the start of `open_day`, and that the
     data reaches the serial of that day (see `_registry_data_through`). Its licences are
     the upstreams that the stream's stream.toml names, as a run gives them. The catalog
-    reads nothing more of a stream's manifest than those, the assets and whether the
+    reads nothing more of the registry's manifest than those, the assets and whether the
     data is complete, so the coverage is empty and there is no cursor. The data is
     complete unless `complete` says otherwise, as the registry's is not until its sweep
     has read every project.
@@ -264,6 +264,8 @@ def publish_downloads(
     serving: Rows,
     open_day: str,
     open_delta: Rows,
+    coverage: Mapping[str, object] | None = None,
+    sealed: Mapping[str, Rows] | None = None,
     complete: bool = False,
 ) -> Manifest:
     """Publish pypi-downloads as its run on `open_day`, given as YYYY-MM-DD, leaves it,
@@ -275,8 +277,11 @@ def publish_downloads(
     which goes up beside the state as the stream's derived asset: `pypi-downloads-
     serving.db.zst` in the current release, with the role public and no period. A row of
     the state's days leaves out nothing but what `_DOWNLOADS` gives it, so it names its
-    `seq`. The data reaches the start of `open_day`, as a day. The stream's data is not
-    complete, as it is not until its backfill has counted every day.
+    `seq`. `sealed` gives the rows of the sealed delta of each day, as
+    `publish_registry`'s does. The data reaches the start of `open_day`, as a day. The
+    manifest's coverage is `coverage`, which the catalog copies into its own tables, or
+    empty. The stream's data is not complete, as it is not until its backfill has
+    counted every day.
     """
     return _publish(
         gh,
@@ -284,10 +289,11 @@ def publish_downloads(
         state,
         open_day,
         open_delta,
-        {},
+        sealed or {},
         {},
         complete=complete,
         serving=serving,
+        coverage=coverage,
     )
 
 
@@ -303,10 +309,12 @@ def _publish(
     generated_at: str | None = None,
     complete: bool = True,
     serving: Rows | None = None,
+    coverage: Mapping[str, object] | None = None,
 ) -> Manifest:
     """Publish `stream` as `publish_registry` says, and return the manifest. Its
-    `generated_at` is the start of `open_day` unless `generated_at` gives another, and
-    it says that the data is complete unless `complete` is False.
+    `generated_at` is the start of `open_day` unless `generated_at` gives another, it
+    says that the data is complete unless `complete` is False, and its coverage is
+    `coverage`, or empty.
 
     The files go up as a run puts them up: first those of the month releases, each to
     the release that its entry names, and then the state and the open delta, which
@@ -322,7 +330,7 @@ def _publish(
         producer=producer(gh.repo),
         generated_at=generated_at or f"{open_day}T00:00:00Z",
         complete=complete,
-        coverage={},
+        coverage=dict(coverage or {}),
         data_through=stream.data_through(open_day),
         cursor=None,
         licences=toml["upstreams"],

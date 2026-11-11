@@ -27,6 +27,13 @@ TABLES = {
     "advisory",
     "advisory_package",
     "affected",
+    "download_month",
+    "download_day",
+    "download_last30",
+    "download_top",
+    "download_period",
+    "download_break",
+    "download_coverage",
 }
 # `search` is a virtual table. FTS5 keeps its index in four tables of its own, and adds
 # a fifth, `search_content`, when it stores the text itself. Here the text is in `project`.
