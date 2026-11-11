@@ -18,7 +18,7 @@ from obskit.testing import FakeGitHub, FakeHttp
 from obskit.zst import decompress_file
 from opened_connections import OPENED
 from pypi_registry.layout import OPEN_DELTA_DB, STATE_DB, base_state_name, delta_name
-from pypi_registry.run import RunReport, replay, run_once, sweep
+from pypi_registry.run import RecordsReport, RunReport, records, replay, run_once, sweep
 from pypi_registry.simple import ROOT_URL, project_url, version_url
 from pypi_registry.store import STATE_SCHEMA, diff_states, open_db
 
@@ -247,6 +247,26 @@ class Stream:
             now=datetime.fromisoformat(at),
             max_seconds=max_seconds,
             clock=self.clock,
+        )
+
+    def records(
+        self,
+        at: str,
+        *,
+        releases: Sequence[tuple[str, str]] = (),
+        max_seconds: float = 16_200,
+    ) -> RecordsReport:
+        """A records run at `at`, a UTC time. It reads no root and no page, so none is
+        served, and the release record of each (name, version) of `releases` is served
+        once (see `serve`)."""
+        self.serve((), releases)
+        return records(
+            self.gh,
+            self.workdir(),
+            max_seconds=max_seconds,
+            clock=self.clock,
+            http=self.http,
+            now=datetime.fromisoformat(at),
         )
 
     def serve(

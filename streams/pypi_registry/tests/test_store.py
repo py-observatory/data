@@ -826,9 +826,51 @@ def test_a_cursor_row_without_a_serial_is_refused(tmp_path):
     assert state_rows(state) == BASE
 
 
-def test_a_release_record_changes_no_state(tmp_path):
+def test_applying_a_record_marks_the_version_recorded(tmp_path):
+    # demo 1.1 was seen without a record. A record that comes later, in a row of its
+    # own, marks it, and changes nothing else.
     state = base_copy(tmp_path, "state.db")
-    apply_rows(state, tmp_path, lambda d: d.record(record_of("demo", 1, "1.2")))
+    apply_rows(state, tmp_path, lambda d: d.record(record_of("demo", 1, "1.1")))
+    assert state_rows(state) == {
+        **BASE,
+        "versions_seen": [
+            ("demo", 1, "1.0", 1),
+            ("demo", 1, "1.1", 1),
+            ("gone", 1, "0.1", 1),
+            ("other", 1, "2.0", 1),
+        ],
+    }
+
+
+def test_a_record_after_its_version_row_leaves_the_version_recorded(tmp_path):
+    # A run that reads a new version writes the version with record=True and then the
+    # record, as every delta has. The record marks a version that is marked already.
+    state = base_copy(tmp_path, "state.db")
+
+    def write(delta: Delta) -> None:
+        delta.version("demo", 1, "2.0", record=True)
+        delta.record(record_of("demo", 1, "2.0"))
+
+    assert apply_rows(state, tmp_path, write) == 2
+    assert ("demo", 1, "2.0", 1) in state_rows(state)["versions_seen"]
+
+
+@pytest.mark.parametrize(
+    ("incarnation", "version"), [(1, "1.2"), (2, "1.0")], ids=["version", "incarnation"]
+)
+def test_a_record_for_an_unseen_version_is_refused(tmp_path, incarnation, version):
+    # The state holds no such version: not 1.2 of demo, and not 1.0 of a second
+    # incarnation. A record of it means that the delta and the state disagree.
+    state = base_copy(tmp_path, "state.db")
+    conn, delta = new_delta(tmp_path)
+    delta.record(record_of("demo", incarnation, version))
+    conn.commit()
+    with closing(conn), pytest.raises(ValueError, match="the state has no") as caught:
+        apply_delta(state, conn)
+    assert f"version {version!r}" in str(caught.value)
+    assert any(
+        "row 1 of the release_records table" in note for note in caught.value.__notes__
+    )
     assert state_rows(state) == BASE
 
 
@@ -876,14 +918,14 @@ def test_apply_delta_returns_the_highest_seq_applied(tmp_path):
 
 
 def test_a_release_record_counts_toward_the_seq_applied(tmp_path):
-    # A record changes no state, but it is a row of the delta, and a delta that ends
-    # with one has been applied through it. The next delta starts after that seq.
+    # A record is a row of the delta like any other, and a delta that ends with one has
+    # been applied through it. The next delta starts after that seq.
     state = base_copy(tmp_path, "state.db")
 
     def write(delta: Delta) -> None:
         delta.serial("demo", 6)
-        delta.record(record_of("demo", 1, "1.2"))
-        delta.record(record_of("demo", 1, "1.3"))
+        delta.record(record_of("demo", 1, "1.0"))
+        delta.record(record_of("demo", 1, "1.1"))
 
     assert apply_rows(state, tmp_path, write) == 3
 

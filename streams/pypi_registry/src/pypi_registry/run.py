@@ -36,6 +36,18 @@ last daily run left to the next one, and its `unswept` is the sweep's progress. 
 writes no event either: it reads a page as it is now, and nothing says when a file was
 added or a status changed, so none of the files that it records is exact.
 
+`records` is the third run, the records pass. The bootstrap and the sweep store the
+versions of the releases from before the bootstrap without their records, so most
+projects lack the record of the release that they are at, which holds what a project
+says of itself: its summary, its licence and its requirements. The records pass reads
+that record, from the JSON API, for each project that may lack it, in name order and a
+time budget at a time, at the sweep's pace (`_record_projects`). It writes the record
+alone, and applying it marks the version as recorded (see `store.apply_delta`). Like the
+sweep, it reads no root and keeps the prior manifest's `data_through`, `cursor` and
+backlog. Its coverage says where it stopped (`records_after`) and how many projects are
+left after that (`records_left`), so that the next records run goes on from there, and
+every other run carries both on as they were.
+
 A manifest says that the data is `complete` when neither is left: no project to the next
 daily run, and none unswept. That holds for every run, so the bootstrap, which has read
 no page, publishes a manifest that is not complete.
@@ -68,6 +80,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from collections import Counter
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
@@ -117,6 +130,7 @@ from pypi_registry.process import (
     get_root,
     process_projects,
     process_unswept,
+    record_current,
 )
 from pypi_registry.store import (
     DELTA_SCHEMA,
@@ -132,14 +146,15 @@ from pypi_registry.store import (
 # lost its names and a burst of 404s must not be published unread.
 MAX_REMOVALS = 1_000
 
-# What `main` returns for a sweep that is to be run again, so that the workflow that
-# runs it can dispatch the next. Any other non-zero code is a failure.
-SWEEP_AGAIN = 3
+# What `main` returns for a sweep or a records run that is to be run again, so that the
+# workflow that runs it can dispatch the next. Any other non-zero code is a failure.
+RUN_AGAIN = 3
 
 # The seconds between two requests of a sweep: about 0.8 a second. A sweep reads a page
 # for each project on PyPI, close to a million, and at this pace the sweeps take about
 # two weeks, where the kit's default of a request every 0.25 s would take a few days.
-# The daily run keeps that default.
+# The records pass reads about as many records, and goes at the same pace. The daily run
+# keeps the kit's default.
 SWEEP_INTERVAL = 1.25
 
 # The repository that `main` publishes to when GITHUB_REPOSITORY does not say.
@@ -152,10 +167,32 @@ _DELTA_ASSET = f"{OPEN_DELTA_DB}.zst"
 # nor quarantined: the ones that the sweep reads and that the coverage counts. Its marks
 # are filled with INACTIVE.
 _ACTIVE = f"status NOT IN ({', '.join('?' * len(INACTIVE))})"
+# The keys of the coverage that give the records pass's progress: the name of the last
+# project that a records run came to, null before any records run and after one that
+# came to the end of the list, and how many projects that may lack a record come after
+# it.
+_RECORDS_PROGRESS = ("records_after", "records_left")
 
 
 class StaleRootError(RuntimeError):
     """The Simple API root is older than the state: its serial is below the cursor."""
+
+
+@dataclass(frozen=True)
+class RecordsReport:
+    """What a records run did.
+
+    `processed` counts the projects that it came to before its deadline. Of those,
+    `recorded` got the record of their current release, and `missing` are those whose
+    record PyPI does not have (404 or 410). The rest had nothing to ask for. `left`
+    counts the projects after the last one that it came to that may still lack a record,
+    and is 0 when it came to the end of the list.
+    """
+
+    processed: int
+    recorded: int
+    missing: int
+    left: int
 
 
 @dataclass(frozen=True)
@@ -535,12 +572,22 @@ def _removals(delta: sqlite3.Connection, *, after_seq: int) -> int:
     return count
 
 
-def _coverage(state: sqlite3.Connection, remaining: int) -> dict:
+def _records_progress(prior: Manifest | None) -> dict:
+    """The records pass's progress as the coverage of the prior manifest gives it, for a
+    run that carries it on. A key that the coverage lacks, as a manifest from before any
+    records run does, is null: nothing is known of what is left."""
+    coverage = prior.coverage if prior else {}
+    return {key: coverage.get(key) for key in _RECORDS_PROGRESS}
+
+
+def _coverage(state: sqlite3.Connection, remaining: int, progress: dict) -> dict:
     """What the state covers. `projects` counts the projects that are neither removed
     nor quarantined, which are the ones that the sweep reads, and `swept` and
     `unswept` split them by whether their page has been read in full. `remaining`
     counts the projects that the last daily run left to the next one, which a sweep
-    carries on, and `bootstrap_at` is when the state was first built."""
+    carries on, and `bootstrap_at` is when the state was first built. `progress` is the
+    records pass's place and what it has left after it, which a records run sets and
+    every other run carries on (see `_records_progress`)."""
     projects, swept = state.execute(
         f"SELECT count(*), coalesce(sum(swept), 0) FROM projects WHERE {_ACTIVE}",
         INACTIVE,
@@ -551,6 +598,7 @@ def _coverage(state: sqlite3.Connection, remaining: int) -> dict:
         "unswept": projects - swept,
         "remaining": remaining,
         "bootstrap_at": _meta(state, "bootstrap_at"),
+        **progress,
     }
 
 
@@ -560,6 +608,7 @@ def _apply_run(
     *,
     applied: int,
     remaining: int,
+    progress: dict,
 ) -> tuple[int, dict]:
     """Commit what a run wrote to its open delta, `conn`, and apply it to `state`.
 
@@ -567,12 +616,13 @@ def _apply_run(
     the rows above it are the run's. Returns the number of `removed` events among them,
     and what the state covers once they are applied (see `_coverage`), where `remaining`
     is the projects that the last daily run left to the next one: this run's own for a
-    daily run, and the prior manifest's for a sweep.
+    daily run, and the prior manifest's for a sweep and a records run. `progress` is the
+    records pass's: its own for a records run, and the prior manifest's for the others.
     """
     conn.commit()
     removals = _removals(conn, after_seq=applied)
     _apply(state, conn)
-    return removals, _coverage(state, remaining)
+    return removals, _coverage(state, remaining, progress)
 
 
 def _prepare_current(workdir: Path, today: date) -> tuple[list[Path], list[Asset]]:
@@ -750,7 +800,7 @@ def _bootstrap(
         ]
         state.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", meta)
         state.commit()
-        coverage = _coverage(state, remaining=0)
+        coverage = _coverage(state, remaining=0, progress=_records_progress(None))
     open_db(workdir / OPEN_DELTA_DB, DELTA_SCHEMA, create=True).close()
     files, current = _prepare_current(workdir, today)
     # The first run starts today's month with a base copy, as plan_rollover says.
@@ -802,7 +852,8 @@ def run_once(
     `clock` have passed, writes the root's serial to the delta as the cursor, and
     applies the delta to the state. It then writes the manifest, checks it with the
     gates (see `_gate`), and swaps the state, the open delta and the manifest into the
-    current release.
+    current release. The manifest carries the records pass's progress on from the prior
+    one (see `records`).
 
     Every error propagates, and an error before the publish publishes nothing to the
     current release. What a rollover already added to a month's release stays. The
@@ -838,7 +889,11 @@ def run_once(
         )
         delta.cursor(root.serial, moment)
         removals, coverage = _apply_run(
-            state, conn, applied=resume.applied, remaining=processed.remaining
+            state,
+            conn,
+            applied=resume.applied,
+            remaining=processed.remaining,
+            progress=_records_progress(prior),
         )
     failures = _publish(
         gh,
@@ -942,7 +997,7 @@ def sweep(
     `data_through`, the `cursor` and the backlog of the prior one, because no root was
     read: the coverage's `remaining` stays what the last daily run left to the next one
     (`_backlog`), and its `unswept` is how many projects the sweep has left. The data is
-    complete when both are 0.
+    complete when both are 0. The records pass's progress is carried on as well.
 
     The report's `swept` is the number of projects that this sweep read, and its
     `remaining` is the number that are still unswept. Each sweep reads what it has the
@@ -974,7 +1029,11 @@ def sweep(
         delta = Delta(conn, moment, first_seq=resume.applied + 1)
         processed = _sweep_projects(state, delta, http, deadline=deadline, clock=clock)
         removals, coverage = _apply_run(
-            state, conn, applied=resume.applied, remaining=backlog
+            state,
+            conn,
+            applied=resume.applied,
+            remaining=backlog,
+            progress=_records_progress(prior),
         )
     failures = _publish(
         gh,
@@ -993,24 +1052,170 @@ def sweep(
     return _report(processed, requests=http.requests - requests, failures=failures)
 
 
+# The projects that the records pass comes to, in name order: those that are neither
+# removed nor quarantined, whose page a run has read in full, and that hold a version of
+# their incarnation without a record. Only the names after the pass's place are taken,
+# and every name when it has none. The marks are filled with INACTIVE, then the place
+# twice.
+_LACKING_RECORDS = f"""
+SELECT name, incarnation FROM projects
+WHERE swept = 1 AND {_ACTIVE} AND (? IS NULL OR name > ?)
+AND EXISTS (
+    SELECT 1 FROM versions_seen
+    WHERE versions_seen.name = projects.name
+    AND versions_seen.incarnation = projects.incarnation
+    AND versions_seen.record = 0
+)
+ORDER BY name
+"""
+
+
+def _record_projects(
+    state: sqlite3.Connection,
+    delta: Delta,
+    http: Http,
+    *,
+    after: str | None,
+    deadline: float,
+    clock: Callable[[], float],
+) -> tuple[RecordsReport, str | None]:
+    """Come to each project that may lack the record of its current release, in name
+    order after `after`, until `clock()` reaches `deadline`, and write the record when
+    it does lack it (see `process.record_current`). Returns the report, and the name of
+    the last project that it came to, or None when it came to none.
+
+    A project is a candidate while any version of it lacks a record, and most keep an
+    old version without one for good, so the pass comes to most projects only to find
+    nothing to ask for, which costs no request. A project is processed whole or not at
+    all: the deadline is checked between projects. The state is read and never written,
+    and the delta is not committed.
+    """
+    ctx = Context(state, delta, http, bootstrap_at(state))
+    lacking = state.execute(_LACKING_RECORDS, (*INACTIVE, after, after)).fetchall()
+    outcomes: Counter[str] = Counter()
+    last = None
+    for name, incarnation in lacking:
+        if clock() >= deadline:
+            break
+        outcomes[record_current(ctx, name, incarnation)] += 1
+        last = name
+    processed = outcomes.total()
+    report = RecordsReport(
+        processed=processed,
+        recorded=outcomes["recorded"],
+        missing=outcomes["missing"],
+        left=len(lacking) - processed,
+    )
+    return report, last
+
+
+def records(
+    gh: GitHub,
+    workdir: Path,
+    *,
+    max_seconds: float,
+    clock: Callable[[], float] = time.monotonic,
+    http: Http | None = None,
+    now: datetime | None = None,
+) -> RecordsReport:
+    """One run of the records pass, in the empty directory `workdir`, at `now`, or at
+    the present when it is not given. It fetches with `http`, and when that is not given
+    with a client paced as the sweep's is (SWEEP_INTERVAL).
+
+    It goes on from the last publish as the sweep does, and reads no root. The stream
+    must have published already, and its manifest must list the state and the open
+    delta (PriorStateError). It rolls over (see `_roll_over`), comes to each project
+    that may lack the record of its current release, in name order after the place
+    where the last records run stopped, until `max_seconds` from its start on `clock`
+    have passed (see `_record_projects`), and applies the delta. It then publishes as
+    the sweep does, and its manifest keeps the `data_through`, the `cursor` and the
+    backlog of the prior one, because no root was read.
+
+    Its coverage gives the pass's place, `records_after`: the last project that it came
+    to, or null when it came to the end of the list, so that the next records run starts
+    again from the first name. Until then a project whose record PyPI does not have is
+    not asked for again. `records_left` is the report's `left`. Every other run carries
+    both on from the prior manifest.
+
+    A gate failure raises GateError. The run takes no override reason, as the sweep
+    takes none. Every other error propagates as well, and an error before the publish
+    publishes nothing to the current release, so the next run does that work again.
+    """
+    deadline = clock() + max_seconds
+    if http is None:
+        http = Http(interval=SWEEP_INTERVAL)
+    if now is None:
+        now = datetime.now(UTC)
+    moment = instant(now)
+    today = now.astimezone(UTC).date()
+    prior = fetch_prior(gh, STREAM, workdir, bootstrap=False)
+    if prior is None:
+        raise PriorStateError(
+            f"{gh.repo} has no published state to read records for: a stream's first "
+            "state is the bootstrap of the daily run"
+        )
+    resume = _resume(prior, workdir)
+    backlog = _backlog(prior)
+    after = _records_progress(prior)["records_after"]
+    added = _roll_over(gh, workdir, prior, resume.carried, today)
+    with (
+        closing(open_db(workdir / STATE_DB, STATE_SCHEMA)) as state,
+        closing(open_db(workdir / OPEN_DELTA_DB, DELTA_SCHEMA)) as conn,
+    ):
+        delta = Delta(conn, moment, first_seq=resume.applied + 1)
+        report, last = _record_projects(
+            state, delta, http, after=after, deadline=deadline, clock=clock
+        )
+        # The end of the list leaves no place, so that the next run starts again from
+        # the first name. A run that came to no project keeps the place it had.
+        if not report.left:
+            place = None
+        else:
+            place = last if last is not None else after
+        removals, coverage = _apply_run(
+            state,
+            conn,
+            applied=resume.applied,
+            remaining=backlog,
+            progress={"records_after": place, "records_left": report.left},
+        )
+    _publish(
+        gh,
+        workdir,
+        prior,
+        added,
+        today=today,
+        moment=moment,
+        data_through=prior.data_through,
+        cursor=prior.cursor,
+        coverage=coverage,
+        files_removed=0,
+        removals=removals,
+        override_reason=None,
+    )
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Run the stream from the command line: `python -m pypi_registry run` or
-    `python -m pypi_registry sweep`.
+    """Run the stream from the command line: `python -m pypi_registry run`, `python -m
+    pypi_registry sweep` or `python -m pypi_registry records`.
 
     It needs GITHUB_TOKEN, and publishes to GITHUB_REPOSITORY, or to
     py-observatory/data when that is not set. It makes one GitHub client, whose
     writes are paced, for every call of the run, and works in a new directory in the
     folder that `--workdir` names (./work by default), which is removed afterwards.
     SQLite's temporary files go in that folder too, unless SQLITE_TMPDIR is set. It
-    prints the report as JSON. Every error propagates. A sweep waits SWEEP_INTERVAL
-    seconds between requests, and a run waits for as long as the kit's `Http` does by
-    default.
+    prints the report as JSON. Every error propagates. A sweep and a records run wait
+    SWEEP_INTERVAL seconds between requests, and a run waits for as long as the kit's
+    `Http` does by default.
 
     `run` returns 0. `sweep` returns 3, when it has swept some projects and others
     are left, to say that it is to be run again, and 0 otherwise. A sweep that reads
     nothing while projects are left has met only pages that it cannot use, which a
     sweep that followed at once would meet as well, so it returns 0 and ends the chain
-    that runs it again.
+    that runs it again. `records` returns 3 in the same way, when it came to some
+    projects and others are left, and 0 otherwise: one that came to none made no
+    progress, so it ends the chain too.
     """
     parser = argparse.ArgumentParser(
         prog="python -m pypi_registry", description="The pypi-registry stream."
@@ -1047,7 +1252,18 @@ def main(argv: list[str] | None = None) -> int:
         default=16_200,
         help="stop starting projects after this many seconds (default: 16200)",
     )
-    for command in (run, sweeping):
+    recording = commands.add_parser(
+        "records",
+        help="read the record of each project's current release that the registry "
+        "lacks, and publish them",
+    )
+    recording.add_argument(
+        "--max-seconds",
+        type=float,
+        default=16_200,
+        help="stop starting projects after this many seconds (default: 16200)",
+    )
+    for command in (run, sweeping, recording):
         command.add_argument(
             "--workdir",
             type=Path,
@@ -1067,6 +1283,7 @@ def main(argv: list[str] | None = None) -> int:
     # Set before any SQLite work, it keeps them on the work's disk, and so in the free
     # disk that a month close logs. A folder that is set already is kept.
     os.environ.setdefault("SQLITE_TMPDIR", str(work.resolve()))
+    report: RunReport | RecordsReport
     with tempfile.TemporaryDirectory(prefix="run-", dir=work) as workdir:
         if args.command == "sweep":
             report = sweep(
@@ -1076,6 +1293,10 @@ def main(argv: list[str] | None = None) -> int:
                 now=datetime.now(UTC),
                 max_seconds=args.max_seconds,
             )
+            again = bool(report.swept and report.remaining)
+        elif args.command == "records":
+            report = records(gh, Path(workdir), max_seconds=args.max_seconds)
+            again = bool(report.processed and report.left)
         else:
             report = run_once(
                 gh,
@@ -1086,7 +1307,6 @@ def main(argv: list[str] | None = None) -> int:
                 override_reason=args.override_reason or None,
                 max_seconds=args.max_seconds,
             )
+            again = False
     print(json.dumps(asdict(report)))
-    if args.command == "sweep" and report.swept and report.remaining:
-        return SWEEP_AGAIN
-    return 0
+    return RUN_AGAIN if again else 0

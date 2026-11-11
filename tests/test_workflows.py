@@ -85,10 +85,21 @@ TICK_COMMANDS = {
     # The catalog has no budget of its own: its limits are its job's and its step's.
     "catalog": ["uv", "run", "--package", "catalog", "python", "-m", "catalog", "run"],
 }
-SWEEP_COMMAND = [
-    *["uv", "run", "--package", "pypi-registry", "python", "-m", "pypi_registry"],
-    *["sweep", "--max-seconds", "15000"],
-]
+# The tasks that backfill.yml runs, each a chain of runs of one command of the
+# registry, and what the run step of its job mentions, to find it by: the task comes
+# from the dispatch's input, through the environment.
+BACKFILL_TASKS = ("sweep", "records")
+BACKFILL_RUN = 'pypi_registry "$TASK"'
+
+
+def backfill_command(task: str) -> list[str]:
+    """The command that the run step of backfill.yml starts for `task`."""
+    return [
+        *["uv", "run", "--package", "pypi-registry", "python", "-m", "pypi_registry"],
+        *[task, "--max-seconds", "15000"],
+    ]
+
+
 RUN_URL = "https://github.com/py-observatory/data/actions/runs/12345"
 
 
@@ -477,7 +488,7 @@ def test_job_timeouts_leave_room_after_the_run_budget():
     assert step_limit("tick.yml", "pypi-downloads", "pypi_downloads run") == 97
     assert step_limit("tick.yml", "catalog", "catalog run") == 57
     assert "--max-seconds" not in tick_script("catalog")
-    assert step_limit("backfill.yml", "sweep", "pypi_registry sweep") == 297
+    assert step_limit("backfill.yml", "sweep", BACKFILL_RUN) == 297
     assert step_limit("smoke.yml", "smoke", "obskit.smoke") == 12
 
     # The least room, in minutes, that each run leaves after its deadline.
@@ -486,7 +497,7 @@ def test_job_timeouts_leave_room_after_the_run_budget():
         ("tick.yml", "osv-pypi", "osv_pypi run", 5),
         # A day that starts at the deadline waits 2,130 s for the counter, then publishes.
         ("tick.yml", "pypi-downloads", "pypi_downloads run", 41),
-        ("backfill.yml", "sweep", "pypi_registry sweep", 45),
+        ("backfill.yml", "sweep", BACKFILL_RUN, 45),
     ]:
         budget = re.findall(r"--max-seconds (\d+)", one_script(file, job, mentions))
         assert len(budget) == 1, f"{file}: {job}: --max-seconds must be passed once"
@@ -779,7 +790,7 @@ def test_backfill_redispatches_from_a_job_outside_the_group():
     assert scalar(sweep, "continue", 6) == "${{ steps.sweep.outputs.continue }}"
     script = one_script("backfill.yml", "redispatch", "gh workflow run")
     assert script.count("gh workflow run") == 1
-    assert "gh workflow run backfill.yml -f task=sweep" in script
+    assert 'gh workflow run backfill.yml -f task="$TASK"' in script
     # Every try looks for another backfill run first, and knows this one by its id.
     assert script.count("gh run list") == 1
     assert script.index("gh run list") < script.index("gh workflow run")
@@ -832,13 +843,24 @@ ALONE = [
 
 
 def dispatch(
-    tmp_path: Path, job: tuple[str, str], runs: list[dict] = ALONE, **env: str
+    tmp_path: Path,
+    job: tuple[str, str],
+    runs: list[dict] = ALONE,
+    *,
+    task: str = "sweep",
+    **env: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
-    """The dispatch script of `job`, run with stand-ins for gh and sleep, where GitHub
-    lists `runs` as the backfill's runs, and the dispatches that reached it."""
+    """The dispatch script of `job` in a run of `task`, run with stand-ins for gh and
+    sleep, where GitHub lists `runs` as the backfill's runs, and the dispatches that
+    reached it."""
     script = one_script(*job, "gh workflow run")
     return run_step(
-        tmp_path, script, stubs=("gh", "sleep"), STUB_RUNS=json.dumps(runs), **env
+        tmp_path,
+        script,
+        stubs=("gh", "sleep"),
+        STUB_RUNS=json.dumps(runs),
+        TASK=task,
+        **env,
     )
 
 
@@ -913,6 +935,21 @@ def test_a_dispatch_without_its_run_id_fails(tmp_path, job):
 
     assert done.returncode != 0
     assert calls == []
+
+
+@needs_jq
+@pytest.mark.parametrize("task", BACKFILL_TASKS)
+@pytest.mark.parametrize("job", sorted(DISPATCH_JOBS), ids=lambda job: job[1])
+def test_a_task_redispatches_itself_with_its_own_name(tmp_path, job, task):
+    """A chain runs one task. The next run, and a run dispatched again after it was
+    replaced while it waited, are of the task that the run was dispatched with, which
+    reaches the script through the environment, as every input does."""
+    done, calls = dispatch(tmp_path, job, task=task)
+
+    assert done.returncode == 0, done.stderr
+    assert calls == [LISTING, [*DISPATCH[:-1], f"task={task}"]]
+    [step] = [s for s in steps(job_of(*job)) if "gh workflow run" in s]
+    assert re.search(r"(?m)^\s+TASK:\s*\$\{\{ inputs\.task \}\}\s*$", step)
 
 
 def test_a_hung_dispatch_fails_its_step_before_its_job_times_out():
@@ -1034,30 +1071,39 @@ def test_report_runs_for_a_chain_that_stopped_without_a_report_of_its_own():
         assert failing == (True, True)
 
 
-def test_sweep_exit_codes(tmp_path):
+@pytest.mark.parametrize("task", BACKFILL_TASKS)
+def test_backfill_exit_codes(tmp_path, task):
     """Exit 3 means "run again": the job still succeeds, and says so in its output.
-    Any other failure fails the job, with the code that it gave."""
-    script = one_script("backfill.yml", "sweep", "pypi_registry sweep")
+    Any other failure fails the job, with the code that it gave. Both tasks say so in
+    the same way."""
+    script = one_script("backfill.yml", "sweep", BACKFILL_RUN)
     expectations = {"0": (0, False), "3": (0, True), "1": (1, False), "2": (2, False)}
     for code, (status, again) in expectations.items():
         output = tmp_path / f"output-{code}"
         output.write_text("")
         done, calls = run_step(
-            tmp_path / code, script, STUB_EXIT=code, GITHUB_OUTPUT=str(output)
+            tmp_path / code,
+            script,
+            STUB_EXIT=code,
+            GITHUB_OUTPUT=str(output),
+            TASK=task,
         )
         assert done.returncode == status, (code, done.stderr)
         assert output.read_text() == ("continue=true\n" if again else ""), code
-        assert calls == [SWEEP_COMMAND], code
+        assert calls == [backfill_command(task)], code
 
 
-def test_sweep_passes_its_time_budget(tmp_path):
-    """15,000 s is 250 minutes, which leaves the rest of the step to publish."""
-    script = one_script("backfill.yml", "sweep", "pypi_registry sweep")
+@pytest.mark.parametrize("task", BACKFILL_TASKS)
+def test_backfill_runs_its_task_with_its_time_budget(tmp_path, task):
+    """15,000 s is 250 minutes, which leaves the rest of the step to publish. The task
+    is the dispatch's input, which reaches the script through the environment."""
+    script = one_script("backfill.yml", "sweep", BACKFILL_RUN)
     output = tmp_path / "output"
     output.write_text("")
-    _, calls = run_step(tmp_path, script, GITHUB_OUTPUT=str(output))
-    [call] = calls
-    assert call[call.index("sweep") :] == ["sweep", "--max-seconds", "15000"]
+    _, calls = run_step(tmp_path, script, GITHUB_OUTPUT=str(output), TASK=task)
+    assert calls == [backfill_command(task)]
+    [step] = [s for s in steps(job_of("backfill.yml", "sweep")) if BACKFILL_RUN in s]
+    assert re.search(r"(?m)^\s+TASK:\s*\$\{\{ inputs\.task \}\}\s*$", step)
 
 
 @pytest.mark.parametrize("stream", sorted(TICK_COMMANDS))
@@ -1215,7 +1261,9 @@ def test_triggers():
         entry(entry(backfill, "workflow_dispatch", 2)[1], "inputs", 4)[1], "task", 6
     )
     assert scalar(task[1], "type", 8) == "choice"
-    assert re.findall(r"(?m)^\s+- (\S+)", entry(task[1], "options", 8)[1]) == ["sweep"]
+    options = re.findall(r"(?m)^\s+- (\S+)", entry(task[1], "options", 8)[1])
+    assert options == list(BACKFILL_TASKS)
+    assert scalar(task[1], "default", 8) == "sweep"
 
 
 def test_every_stream_job_reports_to_the_rolling_issue():

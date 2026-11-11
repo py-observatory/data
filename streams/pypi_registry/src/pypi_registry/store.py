@@ -26,7 +26,8 @@ The state has four tables:
   there at the first run, which makes `first_seen` the time of that run.
 - `files_current` holds the files that a project has now, with their yank.
 - `versions_seen` holds the versions that have been seen, and whether each has a release
-  record.
+  record. A record can come after its version, in a row of its own, and applying it
+  marks the version.
 
 A delta has one table for each kind of row. `events`, `serials`, `swept` and
 `cursors` are keyed by `seq`. `files`, `versions` and `release_records` are keyed by
@@ -455,15 +456,28 @@ def _apply_cursor(state: sqlite3.Connection, row: tuple) -> None:
 
 
 def _apply_release_record(state: sqlite3.Connection, row: tuple) -> None:
-    """A release record is a fact that the delta keeps. The state does not hold it."""
+    """The delta keeps the record itself, and the state only that the version has one.
+
+    The version must be in the state. A run that reads a new version writes its
+    versions row first and its record next, so the record marks a version that is
+    marked already. The records pass writes the record of a version that the state
+    holds without one, and no versions row, so it is the record that marks it.
+    """
+    _, name, incarnation, version = row
+    cursor = state.execute(
+        "UPDATE versions_seen SET record = 1 "
+        "WHERE name = ? AND incarnation = ? AND version = ?",
+        (name, incarnation, version),
+    )
+    _expect_one(cursor, f"version {version!r} of {_project(name, incarnation)}")
 
 
 # For each table of a delta, the columns that `apply_delta` reads, `seq` first, and the
-# function that applies a row of them. A release record is read for its `seq` alone.
+# function that applies a row of them. A release record is read for its key alone.
 _APPLY: dict[str, tuple[str, Callable[[sqlite3.Connection, tuple], None]]] = {
     "files": ("seq, name, incarnation, filename, yanked, yanked_reason", _apply_file),
     "versions": ("seq, name, incarnation, version, record", _apply_version),
-    "release_records": ("seq", _apply_release_record),
+    "release_records": ("seq, name, incarnation, version", _apply_release_record),
     "events": (
         "seq, name, incarnation, kind, filename, detail, observed_at",
         _apply_event,
@@ -519,8 +533,8 @@ def apply_delta(
     `state` and `delta` are connections to the two databases, and the delta is only
     read. The caller keeps the number that this returns (as the state's `applied_seq`),
     and passes it as `after_seq` the next time, so that each row is applied once. The
-    number is `after_seq` when the delta has no row above it. A release record counts,
-    though it changes nothing, so a delta that ends with one is applied through it.
+    number is `after_seq` when the delta has no row above it. A release record counts
+    as every row does, so a delta that ends with one is applied through it.
 
     A delta that has rows, all of them below `after_seq`, is refused. It was not opened
     with a `first_seq` that goes on from what the state has applied, so none of its rows
@@ -528,8 +542,8 @@ def apply_delta(
     rows, or whose highest `seq` is `after_seq`, has nothing to apply and is not an
     error.
 
-    Each row changes the state as follows. Every event and row is about a project or a
-    file at an incarnation, and the state must hold it.
+    Each row changes the state as follows. Every event and row is about a project, a
+    file or a version at an incarnation, and the state must hold it.
 
     - `created` adds the project: active, with `last_serial` 0, not swept, and first
       seen at the event's `observed_at`, exactly.
@@ -551,13 +565,14 @@ def apply_delta(
       `swept` row sets `swept` to 1 and the status to the one in the row. A `cursors`
       row sets `meta.cursor`, to the text of the serial, and a row with no serial is
       refused.
-    - A `release_records` row changes nothing.
+    - A `release_records` row sets the version's `record` to 1. The version must be
+      in `versions_seen` already, from this delta or an earlier one.
 
     The changes are made in one transaction, which is committed before the function
     returns, or none is made: an error undoes what the call did to the state. Raises
-    ValueError for an event or row about a project or file that the state does not
-    hold, for an event of a kind that is not known, for two rows with one `seq`, whose
-    order would be open, and for a delta numbered below `after_seq`. Raises
+    ValueError for an event or row about a project, file or version that the state does
+    not hold, for an event of a kind that is not known, for two rows with one `seq`,
+    whose order would be open, and for a delta numbered below `after_seq`. Raises
     sqlite3.IntegrityError for a `created` event for a project that is there, for a
     `files` row for a file that is there, and for a `cursors` row with no serial. The
     error for a row says which row it was.

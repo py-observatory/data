@@ -147,6 +147,9 @@ def test_bootstrap_publishes_state_base_and_manifest(tmp_path, monkeypatch):
         "unswept": 3,
         "remaining": 0,
         "bootstrap_at": "2026-11-02T06:00:00Z",
+        # No records run has run, so nothing is known of what the pass has left.
+        "records_after": None,
+        "records_left": None,
     }
     # The bootstrap read no page, so every project is unswept, and until a sweep has read
     # them the data is not complete.
@@ -239,6 +242,8 @@ def test_second_run_records_changes(tmp_path):
         "unswept": 2,
         "remaining": 0,
         "bootstrap_at": "2026-11-02T06:00:00Z",
+        "records_after": None,
+        "records_left": None,
     }
     # The run left no project to the next one, but two are still unswept.
     assert manifest.complete is False
@@ -361,6 +366,8 @@ def test_month_close_builds_month_part_and_new_base(tmp_path):
         "unswept": 1,
         "remaining": 0,
         "bootstrap_at": "2026-11-27T06:00:00Z",
+        "records_after": None,
+        "records_left": None,
     }
 
     stream.run(

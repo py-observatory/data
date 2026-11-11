@@ -146,6 +146,8 @@ def test_sweep_marks_projects_swept_with_inexact_files(tmp_path):
         "unswept": 0,
         "remaining": 0,
         "bootstrap_at": BOOTSTRAP,
+        "records_after": None,
+        "records_left": None,
     }
     assert manifest.complete is True
     assert manifest.generated_at == SWEPT_AT

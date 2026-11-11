@@ -14,12 +14,11 @@ record of the project's latest version, which is worked out here.
 """
 
 import sqlite3
-from collections.abc import Iterable
 from itertools import groupby
 from operator import itemgetter
 
 from catalog.stage import RegistryStage, attach_read_only
-from packaging.version import Version
+from pypi_registry.names import latest_version
 
 # The kinds of event that set a project's status: it is created, removed, quarantined or
 # let out of quarantine, registered again, or given another status. The registry's other
@@ -163,32 +162,6 @@ FROM (
 )
 GROUP BY month
 """
-
-
-def latest_version(versions: Iterable[str]) -> str | None:
-    """The latest of `versions`, as PyPI names a project's latest version: the highest
-    final release, or when there is none, the highest pre-release or dev release, or
-    None when there is no version at all. A final release beats every pre-release, so a
-    project at 1.0 that has a 2.0rc1 is at 1.0.
-
-    Versions are ordered as PEP 440 orders them, so 1.10 is above 1.9. A version that
-    PEP 440 refuses has no place in the order, and is left out. The string returned is
-    the one given, and not the form that PEP 440 gives it. Two strings can be one
-    version, as 1.0 and 1.0.0 are, and then the one that sorts last as text is returned,
-    so that the answer does not depend on the order of `versions`.
-    """
-    finals: list[tuple[Version, str]] = []
-    pre_releases: list[tuple[Version, str]] = []
-    for text in versions:
-        try:
-            version = Version(text)
-        except ValueError:
-            # InvalidVersion is one. So is the refusal of a number of over 4,300 digits,
-            # which Python will not turn into an int, and which is not an InvalidVersion.
-            continue
-        (pre_releases if version.is_prerelease else finals).append((version, text))
-    chosen = finals or pre_releases
-    return max(chosen)[1] if chosen else None
 
 
 def build_registry(con: sqlite3.Connection, stage: RegistryStage) -> None:
