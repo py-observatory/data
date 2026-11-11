@@ -94,11 +94,21 @@ def serving_db(path: Path, sets: dict[int, list[str]]) -> Path:
     return path
 
 
-def publish_downloads(stream: Stream, db: Path, name: str = SERVING) -> None:
+def publish_downloads(
+    stream: Stream,
+    db: Path,
+    name: str = SERVING,
+    damage: Callable[[bytes], bytes] | None = None,
+) -> None:
     """Publish pypi-downloads-current on the stream's fake GitHub with the file `db`,
-    compressed, as its asset `name`, which is all that its manifest lists."""
+    compressed, as its asset `name`, which is all that its manifest lists. With
+    `damage`, the compressed bytes are put through it, and the entry gives the damaged
+    bytes' sha256, as a stream that published a damaged file would: the download then
+    matches its entry, and only expanding it fails."""
     packed = stream.folder("downloads") / name
     compress_file(db, packed)
+    if damage is not None:
+        packed.write_bytes(damage(packed.read_bytes()))
     entry = Asset(
         name=name,
         tag=DOWNLOADS_CURRENT,
@@ -124,10 +134,15 @@ def publish_downloads(stream: Stream, db: Path, name: str = SERVING) -> None:
     publish_current(stream.gh, DOWNLOADS, [packed], manifest, bootstrap=True)
 
 
-def publish_sets(stream: Stream, sets: dict[int, list[str]]) -> None:
-    """Publish the downloads stream's serving database with the sets `sets`."""
+def publish_sets(
+    stream: Stream,
+    sets: dict[int, list[str]],
+    damage: Callable[[bytes], bytes] | None = None,
+) -> None:
+    """Publish the downloads stream's serving database with the sets `sets`, its
+    compressed bytes put through `damage` when it is given (see `publish_downloads`)."""
     made = stream.folder("made") / SERVING.removesuffix(".zst")
-    publish_downloads(stream, serving_db(made, sets))
+    publish_downloads(stream, serving_db(made, sets), damage=damage)
 
 
 def requested(stream: Stream) -> list[str]:
@@ -400,6 +415,22 @@ def not_a_database(stream: Stream, member: str) -> None:
     publish_downloads(stream, made)
 
 
+def cut_short(stream: Stream, member: str) -> None:
+    """The serving database is published cut off halfway, so zstd finds no end to it."""
+    publish_sets(stream, {2027: [member]}, damage=lambda data: data[: len(data) // 2])
+
+
+def not_zstd(stream: Stream, member: str) -> None:
+    """The serving database is published as bytes that are not zstd at all."""
+    publish_sets(stream, {2027: [member]}, damage=lambda data: b"not zstd " * 16)
+
+
+def download_fails(stream: Stream, member: str) -> None:
+    """GitHub answers every try to download the serving database with a 502."""
+    publish_sets(stream, {2027: [member]})
+    stream.github.fail("GET", f"name={SERVING}", 502, times=6)
+
+
 @pytest.mark.parametrize(
     ("breaking", "reason"),
     [
@@ -408,6 +439,9 @@ def not_a_database(stream: Stream, member: str) -> None:
         (other_bytes, "has sha256"),
         (no_top_set, "no such table: top_set"),
         (not_a_database, "file is not a database"),
+        (cut_short, "ended before the end-of-stream marker"),
+        (not_zstd, "Unable to decompress Zstandard data"),
+        (download_fails, "HTTP 502"),
     ],
     ids=[
         "no release",
@@ -415,6 +449,9 @@ def not_a_database(stream: Stream, member: str) -> None:
         "other bytes",
         "no top set",
         "not sqlite",
+        "cut short",
+        "not zstd",
+        "a failed download",
     ],
 )
 def test_an_unreadable_downloads_release_skips_the_pass(

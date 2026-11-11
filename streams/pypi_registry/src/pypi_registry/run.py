@@ -92,6 +92,7 @@ import time
 import tomllib
 from collections import Counter
 from collections.abc import Callable
+from compression.zstd import ZstdError
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
@@ -198,6 +199,19 @@ _SERVING_ASSET = "pypi-downloads-serving.db.zst"
 _TOP_NAMES = """
 SELECT name FROM top_set WHERE year = (SELECT max(year) FROM top_set) ORDER BY name
 """
+# What makes the set unreadable, so that the status pass skips: a release that does not
+# hold what its manifest lists, a failed download, a file that matches its digest but
+# will not expand (cut short, which is an EOFError, or not zstd at all), a database
+# whose set cannot be read, and a full disk. The catalog stages a stream on the same
+# terms.
+_TOP_NAMES_ERRORS = (
+    PriorStateError,
+    GitHubError,
+    ZstdError,
+    EOFError,
+    ValueError,
+    OSError,
+)
 
 
 class StaleRootError(RuntimeError):
@@ -937,7 +951,9 @@ def top_names(gh: GitHub, workdir: Path) -> list[str]:
     The manifest and the database go to a new directory in `workdir`, which is removed
     before this returns, and the database is checked against its entry (see
     `fetch_assets`). Raises PriorStateError when the stream has not published, when its
-    manifest lists no serving database, and when the file does not match its entry, and
+    manifest lists no serving database, and when the file does not match its entry,
+    GitHubError for a request that failed, ZstdError or EOFError for a file that matches
+    its entry but does not expand, OSError when the file cannot be written, and
     ValueError for a manifest that cannot be read and a database whose set cannot be
     read (see `_read_top_names`).
     """
@@ -1022,7 +1038,7 @@ def _status_pass(
     """
     try:
         names = top_names(gh, workdir)
-    except (PriorStateError, ValueError, GitHubError) as error:
+    except _TOP_NAMES_ERRORS as error:
         report = StatusReport(
             slot=slot, members=0, read=0, changed=0, skipped=str(error)
         )
