@@ -238,19 +238,39 @@ def sealed_through(manifest: Manifest) -> date | None:
     return None if day is None else day - timedelta(days=1)
 
 
+def _history_tables(
+    manifest: Manifest, tables: frozenset[str], own: set[str], created: list[Asset]
+) -> frozenset[str]:
+    """The tables by which a pin chooses the parts of the months before its own: the
+    admitted tables that the state lacks, and, when a derived asset holds an admitted
+    table, every table that the create-once parts hold and the state lacks.
+
+    A derived asset is made from the stream's own history, which no create-once part
+    holds under the derived tables' names, so a pin chosen by those names alone would
+    name no part behind them, and the database it describes could not be rebuilt.
+    """
+    wanted = tables - own
+    if _derived(manifest, tables):
+        held = {t for a in created if a.format == SQLITE for t in a.tables}
+        wanted |= held - own
+    return frozenset(wanted)
+
+
 def pin_assets(manifest: Manifest, tables: frozenset[str], day: date) -> list[Asset]:
     """The create-once assets that rebuild the stream's data as it stood at the end of
     `day`, in the order of their periods and then of their names: the base copy of
     `day`'s month, every sealed delta of the month on or before `day`, and, when `tables`
-    holds a table of the delta, the coarsest closed delta parts of the months before it.
+    holds a table of the delta or a table of a derived asset, the coarsest closed delta
+    parts of the months before it.
 
     The base copy and the deltas rebuild the state of `day`, as a restore does, so the
     deltas are named whatever `tables` holds. A month part of `day`'s month, and a year
     part of its year, hold days after `day` as well, so neither is named: the sealed
     deltas, which a closed month keeps, stand in for the month. The parts of earlier
-    months are the coarsest that the manifest lists wholly before `day`'s month. Nothing
-    of the current release is named, because each run replaces it, and a pin that named
-    it would stop being true at the next run.
+    months are the coarsest that the manifest lists wholly before `day`'s month, and a
+    derived asset asks for every part that holds the stream's history (see
+    `_history_tables`). Nothing of the current release is named, because each run
+    replaces it, and a pin that named it would stop being true at the next run.
 
     Raises InputError when the manifest lists no state, whose tables tell the base copy
     from a delta part, and when it lists no closed base copy of the month, or more than
@@ -283,9 +303,11 @@ def pin_assets(manifest: Manifest, tables: frozenset[str], day: date) -> list[As
     ]
     # Parts that reach into `day`'s month or past it cannot cover what is before it, so
     # they are set aside before the coarsest of the rest are chosen. When `tables` holds
-    # no table of the delta, no asset is a delta part, and so none is named.
+    # no table of the delta and none of a derived asset, no asset is a delta part, and
+    # so none is named.
     before = [a for a in created if last_month(period_of(a)) < month]
-    parts = _coarsest_delta_parts(manifest, tables - own, before)
+    history = _history_tables(manifest, tables, own, created)
+    parts = _coarsest_delta_parts(manifest, history, before)
     return sorted([base, *sealed, *parts], key=order_key)
 
 

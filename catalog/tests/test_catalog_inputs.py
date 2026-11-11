@@ -850,6 +850,34 @@ def test_no_part_is_asked_for_tables_a_derived_asset_holds():
     ]
 
 
+def test_a_pin_names_the_parts_behind_the_derived_tables():
+    # November is over, and December has begun. The derived database is made from the
+    # counts of every day folded so far, which only the stream's parts hold, so a pin of
+    # a December day names November's part beside December's base copy and deltas.
+    manifest = DOWNLOADS.manifest(
+        DOWNLOADS.open_delta("2026-12-03"),
+        serving_db(),
+        *DOWNLOADS.closed_month("2026-11", 1, 2, 30),
+        *DOWNLOADS.month("2026-12", 1, 2),
+    )
+
+    assert names(pin_assets(manifest, DOWNLOADS_TABLES, date(2026, 12, 2))) == [
+        "pypi-downloads-2026-11.db.zst",
+        "pypi-downloads-state-base-2026-12.db.zst",
+        "pypi-downloads-delta-2026-12-01.db.zst",
+        "pypi-downloads-delta-2026-12-02.db.zst",
+    ]
+
+    # Without a derived table admitted, the pin rebuilds the state of the day and names
+    # no earlier part, as osv's does.
+    state_only = frozenset({"projects", "days", "breaks"})
+    assert names(pin_assets(manifest, state_only, date(2026, 12, 2))) == [
+        "pypi-downloads-state-base-2026-12.db.zst",
+        "pypi-downloads-delta-2026-12-01.db.zst",
+        "pypi-downloads-delta-2026-12-02.db.zst",
+    ]
+
+
 def test_the_registry_and_osv_need_what_they_needed_without_a_derived_asset():
     assert names(needed_assets(osv_on_2026_11_04(), OSV_TABLES)) == [
         "osv-pypi-state.db.zst"
