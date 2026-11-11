@@ -857,3 +857,35 @@ def test_the_registry_and_osv_need_what_they_needed_without_a_derived_asset():
     assert needed_assets(registry_on_2026_11_04(), REGISTRY_TABLES)[-1].name == (
         "pypi-registry-delta-open.db.zst"
     )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(
+            {
+                "tables": {
+                    "monthly": TableInfo(10, "derived"),
+                    "daily": TableInfo(5, "append"),
+                }
+            },
+            id="a table of another class",
+        ),
+        pytest.param({"closed": True}, id="a closed asset"),
+        pytest.param({"tables": {}}, id="no tables"),
+    ],
+)
+def test_a_public_asset_that_is_not_derived_is_not_taken_as_one(change):
+    # The state holds the admitted tables, so it is asked for them when the public asset
+    # is not a derived one.
+    serving = serving_db()
+    manifest = changed(downloads_on_2026_11_04(), serving, **change)
+    state = replace(
+        DOWNLOADS.state(),
+        tables={**DOWNLOADS.state().tables, "monthly": TableInfo(1, "append")},
+    )
+    manifest = replace(manifest, assets=[state, *manifest.assets[1:]])
+
+    assert names(needed_assets(manifest, frozenset({"monthly"}))) == [
+        "pypi-downloads-state.db.zst"
+    ]

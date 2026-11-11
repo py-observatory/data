@@ -98,9 +98,10 @@ def _open_delta(manifest: Manifest) -> Asset | None:
 
 def _derived(manifest: Manifest, wanted: frozenset[str]) -> list[Asset]:
     """The derived assets that hold a table of `wanted`: the assets of the current
-    release with the role public and no period, each a database of tables made from the
-    stream's own, in the order of their names. They are not closed, because each run
-    makes them anew."""
+    release with the role public, no period and no closed flag, whose tables are all of
+    the class derived, in the order of their names. Each is a database of tables made
+    from the stream's own, which each run makes anew. An asset with a table of another
+    class is not one, and its tables are not read as if it were."""
     tag = current_tag(manifest.stream)
     found = [
         a
@@ -108,6 +109,9 @@ def _derived(manifest: Manifest, wanted: frozenset[str]) -> list[Asset]:
         if a.tag == tag
         and a.role == "public"
         and a.period is None
+        and not a.closed
+        and a.tables
+        and all(info.history_class == "derived" for info in a.tables.values())
         and wanted & set(a.tables)
     ]
     return sorted(found, key=lambda a: a.name)
