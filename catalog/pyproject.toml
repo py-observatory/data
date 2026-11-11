@@ -2,12 +2,13 @@
 name = "catalog"
 version = "0.1.0"
 requires-python = ">=3.14"
-dependencies = ["obskit", "packaging>=25", "pypi-registry", "osv-pypi"]
+dependencies = ["obskit", "packaging>=25", "pypi-registry", "osv-pypi", "pypi-downloads"]
 
 [tool.uv.sources]
 obskit = { workspace = true }
 pypi-registry = { workspace = true }
 osv-pypi = { workspace = true }
+pypi-downloads = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.9,<0.14"]

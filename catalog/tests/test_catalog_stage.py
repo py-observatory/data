@@ -9,20 +9,31 @@ import pytest
 from catalog.config import StreamAdmission, load_config
 from catalog.inputs import fingerprint, needed_assets, read_stream
 from catalog.stage import (
+    DownloadsStage,
     READS,
     STAGE_SCHEMA,
     STAGERS,
     OsvStage,
     RegistryStage,
+    stage_downloads,
     stage_osv,
     stage_registry,
 )
-from catalog_helpers import REPO, TOKEN, no_sleep, publish_osv, publish_registry
+from catalog_helpers import (
+    REPO,
+    TOKEN,
+    no_sleep,
+    publish_downloads,
+    publish_osv,
+    publish_registry,
+)
 from obskit.github import GitHub
 from obskit.manifest import Asset, Manifest, Watermark, producer
 from obskit.release import prepare_asset, publish_current
 from obskit.sqlite import open_db, table_counts
 from obskit.testing import FakeGitHub
+from pypi_downloads import serving as downloads_serving
+from pypi_downloads import store as downloads_store
 from pypi_registry.store import DELTA_SCHEMA, STATE_SCHEMA
 
 REGISTRY = load_config().streams["pypi-registry"]
@@ -566,3 +577,94 @@ def test_stage_osv_downloads_only_the_state(gh, fake, workdir):
         ("MAL-2026-2", "malware"),
         ("PYSEC-2026-1", "vulnerability"),
     ]
+
+
+DOWNLOADS_TABLES = frozenset(
+    {"projects", "days", "breaks"}
+    | {"folded", "months", "monthly", "top_set", "daily", "recent"}
+)
+
+
+def test_the_downloads_stage_holds_the_state_and_the_serving_database(
+    gh, fake, workdir
+):
+    manifest = publish_downloads(
+        gh,
+        state={
+            "projects": [{"project_id": 1, "name": "sampleproject"}],
+            "days": [{"day": 20_000, "seq": 1, "downloads": 7}],
+            "breaks": [{"day": 19_999}],
+        },
+        serving={
+            "folded": [{"day": 20_000, "seq": 1}],
+            "monthly": [
+                {
+                    "project_id": 1,
+                    "month": 202_110,
+                    "downloads": 7,
+                    "mirror_downloads": 2,
+                }
+            ],
+        },
+        open_day="2026-11-02",
+        open_delta={"projects": [{"project_id": 1, "name": "sampleproject"}]},
+    )
+    fake.calls.clear()
+
+    stage = stage_downloads(gh, needed_assets(manifest, DOWNLOADS_TABLES), workdir)
+
+    assert stage == DownloadsStage(
+        state=workdir / "pypi-downloads-state.db",
+        serving=workdir / "pypi-downloads-serving.db",
+    )
+    assert downloads(fake, manifest) == [
+        "pypi-downloads-state.db.zst",
+        "pypi-downloads-serving.db.zst",
+    ]
+    assert listing(workdir) == ["pypi-downloads-serving.db", "pypi-downloads-state.db"]
+    assert select(stage.state, "SELECT project_id, name FROM projects") == [
+        (1, "sampleproject")
+    ]
+    assert select(stage.serving, "SELECT * FROM monthly") == [(1, 202_110, 7, 2)]
+
+
+@pytest.mark.parametrize(
+    "table", downloads_serving.TABLES, ids=lambda t: f"a serving database without {t}"
+)
+def test_a_serving_database_of_another_schema_is_refused(gh, tmp_path, workdir, table):
+    # The release is made by hand, as no stream would make it: the serving database
+    # lacks a table, so it is not the stream's serving database.
+    made = tmp_path / "made"
+    made.mkdir()
+    files, entries = [], []
+    for name, schema, role in [
+        ("pypi-downloads-state.db", downloads_store.STATE_SCHEMA, "state"),
+        ("pypi-downloads-serving.db", downloads_serving.SCHEMA, "public"),
+    ]:
+        with closing(open_db(made / name, schema, create=True)) as con:
+            if name.endswith("serving.db"):
+                con.execute(f"DROP TABLE {table}")
+        packed, entry = prepare_asset(
+            made / name,
+            made,
+            tag="pypi-downloads-current",
+            role=role,
+            classes=dict.fromkeys(table_counts(made / name), "derived"),
+        )
+        files.append(packed)
+        entries.append(entry)
+    manifest = Manifest(
+        stream="pypi-downloads",
+        producer=producer(REPO),
+        generated_at="2026-11-02T00:00:00Z",
+        complete=False,
+        coverage={},
+        data_through=Watermark("2026-11-02", "day"),
+        cursor=None,
+        licences=[],
+        assets=entries,
+    )
+    publish_current(gh, "pypi-downloads", files, manifest, bootstrap=True)
+
+    with pytest.raises(ValueError, match=f"lacks {table}"):
+        stage_downloads(gh, entries, workdir)

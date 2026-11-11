@@ -96,6 +96,23 @@ def _open_delta(manifest: Manifest) -> Asset | None:
     return _only(manifest, found, "open delta")
 
 
+def _derived(manifest: Manifest, wanted: frozenset[str]) -> list[Asset]:
+    """The derived assets that hold a table of `wanted`: the assets of the current
+    release with the role public and no period, each a database of tables made from the
+    stream's own, in the order of their names. They are not closed, because each run
+    makes them anew."""
+    tag = current_tag(manifest.stream)
+    found = [
+        a
+        for a in manifest.assets
+        if a.tag == tag
+        and a.role == "public"
+        and a.period is None
+        and wanted & set(a.tables)
+    ]
+    return sorted(found, key=lambda a: a.name)
+
+
 def _coarsest_delta_parts(
     manifest: Manifest, wanted: frozenset[str], assets: list[Asset]
 ) -> list[Asset]:
@@ -119,20 +136,26 @@ def _coarsest_delta_parts(
 
 def needed_assets(manifest: Manifest, tables: frozenset[str]) -> list[Asset]:
     """The assets that the catalog downloads to read `tables`, which are the tables that
-    it admits of the stream: the state, when `tables` holds a table of it, and then the
-    delta parts, in the order of their periods and then of their names.
+    it admits of the stream: the state, when `tables` holds a table of it, then the
+    delta parts, in the order of their periods and then of their names, and then the
+    stream's derived assets.
 
     A delta part is a sqlite asset that holds an admitted table that the state lacks
     (see the top of this module). A closed month part stands for the sealed deltas of its
     month, and a closed year part for the parts of its months (see `coarsest_parts`).
+    A derived asset holds tables made from the stream's own, and the tables that it
+    holds are read from it alone: no part is asked for them, and the state is not asked
+    for one that a derived asset holds too.
 
     Raises InputError when the manifest lists no state, when an admitted table is held by
     none of the assets chosen, and when a delta part has no period.
     """
     state = _state(manifest)
+    derived = _derived(manifest, tables)
+    from_state_or_parts = tables - {t for a in derived for t in a.tables}
     own = set(state.tables)
-    parts = _coarsest_delta_parts(manifest, tables - own, manifest.assets)
-    needed = [*([state] if tables & own else []), *parts]
+    parts = _coarsest_delta_parts(manifest, from_state_or_parts - own, manifest.assets)
+    needed = [*([state] if from_state_or_parts & own else []), *parts, *derived]
     held = {table for asset in needed for table in asset.tables}
     missing = sorted(tables - held)
     if missing:

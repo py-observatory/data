@@ -29,6 +29,8 @@ from obskit.manifest import Asset
 from obskit.release import fetch_assets
 from obskit.sqlite import open_db
 from osv_pypi import store as osv_store
+from pypi_downloads import serving as downloads_serving
+from pypi_downloads import store as downloads_store
 from pypi_registry import store as registry_store
 
 # The tables that the stage copies from each of the registry's parts, as they are.
@@ -50,6 +52,15 @@ class OsvStage:
     """osv, staged: its state, as downloaded, which holds its advisories."""
 
     state: Path
+
+
+@dataclass(frozen=True)
+class DownloadsStage:
+    """The downloads stream, staged: its state, as downloaded, which holds its projects,
+    days and breaks, and its serving database, as downloaded, which holds the rest."""
+
+    state: Path
+    serving: Path
 
 
 def _registry_tables(tables: tuple[str, ...]) -> str:
@@ -208,6 +219,23 @@ def stage_osv(gh: GitHub, assets: list[Asset], workdir: Path) -> OsvStage:
     [state] = fetch_assets(gh, assets[:1], workdir)
     open_db(state, osv_store.STATE_SCHEMA).close()
     return OsvStage(state=state)
+
+
+def stage_downloads(gh: GitHub, assets: list[Asset], workdir: Path) -> DownloadsStage:
+    """Download the downloads stream's state and serving database into `workdir`, which
+    must exist, as its stage.
+
+    `assets` are as `needed_assets` gives them: the state, and then the serving database,
+    which is the derived asset. The stream's delta tables are not admitted, so no part is
+    downloaded. Raises ValueError for a database that lacks a table of its schema, the
+    state's or the serving database's, and as `fetch_assets` raises.
+    """
+    state_asset, serving_asset = assets
+    [state] = fetch_assets(gh, [state_asset], workdir)
+    open_db(state, downloads_store.STATE_SCHEMA).close()
+    [serving] = fetch_assets(gh, [serving_asset], workdir)
+    open_db(serving, downloads_serving.SCHEMA).close()
+    return DownloadsStage(state=state, serving=serving)
 
 
 # The tables that each stage reads of its stream. They must be the tables that

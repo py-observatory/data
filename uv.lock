@@ -19,6 +19,7 @@ dependencies = [
     { name = "obskit" },
     { name = "osv-pypi" },
     { name = "packaging" },
+    { name = "pypi-downloads" },
     { name = "pypi-registry" },
 ]
 
@@ -27,6 +28,7 @@ requires-dist = [
     { name = "obskit", editable = "." },
     { name = "osv-pypi", editable = "streams/osv_pypi" },
     { name = "packaging", specifier = ">=25" },
+    { name = "pypi-downloads", editable = "streams/pypi_downloads" },
     { name = "pypi-registry", editable = "streams/pypi_registry" },
 ]
 
