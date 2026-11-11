@@ -39,6 +39,15 @@ on, and names each day whose partition has changed since it was counted. Late ro
 detected, not recounted. A run whose read of the sizes fails says that the drift is
 unknown, and goes on.
 
+Every publish carries the serving database (`serving`), which holds what readers need of
+the counts: monthly totals, the newest 30 days and the daily counts of each year's top
+15,000. A run takes the prior one from the current release, closes in it each month that
+has ended since the last run, before it folds the days that it counted, and checks it
+against the state. One that cannot be brought up to date that way, or that the prior
+manifest lacks, is made afresh from the published parts, read one at a time, and one
+that still disagrees with the state stops the run before it publishes. The bootstrap
+makes the first from its launch day.
+
 `main` exits 2 when a day failed, a partition moved or the drift is unknown, or the
 guard held the run for spend or for the 98% stop, after the publish, so that the
 workflow opens its failure issue. A backfill held for want of a notification exits 2
@@ -50,10 +59,12 @@ run that fails publishes nothing to the current release.
 
 import argparse
 import json
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -64,11 +75,13 @@ from obskit import cycle
 from obskit.gates import GateFailure
 from obskit.gcp import Credentials, Federation, Google, GoogleError
 from obskit.github import GitHub
-from obskit.manifest import Asset, Manifest, Watermark, instant
-from obskit.release import fetch_prior
+from obskit.manifest import Asset, Manifest, Watermark, current_asset, instant
+from obskit.parts import coarsest_parts
+from obskit.release import fetch_assets, fetch_prior
 from obskit.runs import github_from_env, run_directory
 from obskit.sqlite import open_db
-from pypi_downloads import STREAM
+from obskit.tags import current_tag
+from pypi_downloads import STREAM, serving
 from pypi_downloads.config import Config, load
 from pypi_downloads.counts import Counted, CountsError, read_counts, write_day
 from pypi_downloads.plan import (
@@ -120,6 +133,10 @@ WAIT_MARGIN_SECONDS = 300
 # The read bytes that the guard keeps for the next execution until a day has been
 # counted to say how much one reads.
 RESERVE_READ_BYTES = 2 * 2**40
+# The serving database's asset in the current release, and why the bootstrap makes it
+# afresh.
+SERVING_ASSET = f"{serving.SERVING_DB}.zst"
+FIRST_RUN_REASON = "the first run has no serving database to update"
 # The kinds of refusal that make `main` exit 2. A refusal for want of a notification
 # does too when no notification of any month is recent (see `_unwell`), and a refusal at
 # the budget line is the normal end of a run's backfill.
@@ -178,7 +195,10 @@ class RunReport:
     the names in their files that were not canonical. `usage` is the free tier used in
     the billing month, as last measured: vCPU- and GiB-seconds of the counter's
     executions, and the bytes read for the days counted. `gate_failures` lists the
-    failures that a person overrode, and is empty when no gate failed.
+    failures that a person overrode, and is empty when no gate failed. `serving` is
+    how the run brought the serving database up to date: "updated" from the prior
+    one, or "rebuilt" from the published counts, and `serving_reason` is why it was
+    rebuilt, or None.
     """
 
     counted: list[str]
@@ -193,6 +213,8 @@ class RunReport:
     renamed: int
     usage: dict
     gate_failures: list[GateFailure]
+    serving: str
+    serving_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -554,6 +576,161 @@ def _summary(
     return through, coverage, first == FIRST_DAY and missing == 0
 
 
+# ---- the serving database
+
+
+def _fetch_serving(gh: GitHub, prior: Manifest, workdir: Path) -> bool:
+    """Download the serving database that the prior manifest lists in the current
+    release, and expand it to `workdir`, checked against its entry (see
+    `fetch_assets`). Returns whether the manifest lists one: none was published before
+    the stream kept it. One that does not download as its entry says raises
+    PriorStateError."""
+    asset = current_asset(prior, SERVING_ASSET)
+    if asset is None:
+        return False
+    fetch_assets(gh, [asset], workdir)
+    return True
+
+
+def _months_to_close(
+    first: tuple[int, int] | None, launch: date, today: date
+) -> list[int]:
+    """The months whose close the run applies to the serving database, each as
+    `year * 100 + month`, in order: from `first`, the month that the rollover closes,
+    up to the month before `today`'s, leaving out any before the month of `launch`.
+    None closes none.
+
+    After a gap of more than a month the rollover closes only the open delta's month,
+    but each month after it has ended too, and a rebuild would close every one."""
+    months: list[int] = []
+    if first is None:
+        return months
+    year, month = first
+    while (year, month) < (today.year, today.month):
+        if (year, month) >= (launch.year, launch.month):
+            months.append(year * 100 + month)
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return months
+
+
+def _rebuild_parts(prior: Manifest, added: list[Asset]) -> list[Asset]:
+    """The published parts that hold the counts of every day of the state but those of
+    the open delta, each once: the coarsest (see `obskit.parts.coarsest_parts`) of the
+    assets of the month releases in the prior manifest and of those that the rollover
+    `added`. The prior open delta is not one of them: the rollover sealed it into
+    `added`, or it is still the open delta."""
+    released = [asset for asset in prior.assets if asset.tag != current_tag(STREAM)]
+    return coarsest_parts([*released, *added], frozenset({"counts"}))
+
+
+def _sources(
+    gh: GitHub, workdir: Path, parts: list[Asset], added: list[Asset]
+) -> Callable[[], Iterator[Path]]:
+    """The sources of a rebuild (see `serving.rebuild`): on each pass, the database of
+    each of `parts` in turn, and then the open delta.
+
+    A part that the rollover `added` and left in `workdir`, like the month's part that
+    it made, is read where it is. Every other part is downloaded and checked (see
+    `fetch_assets`) into a new, empty directory of its own, which is deleted before the
+    next part is downloaded, so that only one is on disk at a time: the published
+    counts grow past a runner's disk as the backfill goes back. A part that does not
+    download raises, so none is ever left out.
+    """
+
+    def provide() -> Iterator[Path]:
+        for part in parts:
+            made = workdir / part.name.removesuffix(".zst")
+            if part in added and made.exists():
+                yield made
+                continue
+            folder = Path(tempfile.mkdtemp(prefix="part-", dir=workdir))
+            try:
+                (path,) = fetch_assets(gh, [part], folder)
+                yield path
+            finally:
+                shutil.rmtree(folder)
+        yield workdir / STORE.open_delta_db
+
+    return provide
+
+
+def _update_serving(
+    path: Path, state: sqlite3.Connection, conn: sqlite3.Connection, closes: list[int]
+) -> None:
+    """Bring the prior serving database at `path` up to date with the state: close each
+    month of `closes`, in order, then fold the days that the state holds and it does
+    not, from the open delta `conn`, and check it (see `serving`). The closes come
+    first, so that each ranks only what was counted before its month ended. Raises
+    NeedsRebuild or ServingMismatch when the database cannot be brought up to date."""
+    with closing(open_db(path, serving.SCHEMA)) as db:
+        for month in closes:
+            serving.close(db, state, month)
+        serving.fold(db, state, conn)
+        serving.check(db, state)
+
+
+def _rebuild_serving(
+    path: Path,
+    state: sqlite3.Connection,
+    sources: Callable[[], Iterator[Path]],
+    today: date,
+) -> None:
+    """Make the serving database at `path` afresh, from the state and the counts of
+    `sources` (see `serving.rebuild`), and check it. Raises ServingMismatch when even
+    the database made afresh disagrees with the state, and the run then fails before
+    it publishes."""
+    serving.rebuild(path, state, sources, today=today)
+    with closing(open_db(path, serving.SCHEMA)) as db:
+        serving.check(db, state)
+
+
+def _serve(
+    path: Path,
+    state: sqlite3.Connection,
+    conn: sqlite3.Connection,
+    *,
+    fetched: bool,
+    closes: list[int],
+    sources: Callable[[], Iterator[Path]],
+    today: date,
+) -> str | None:
+    """Bring the serving database at `path` up to date with the state, and return why
+    it was rebuilt, or None when it was updated.
+
+    When `fetched`, `path` holds the prior serving database, which is updated (see
+    `_update_serving`). When the prior manifest listed none, or the update raises
+    NeedsRebuild, or the database that it leaves fails its check (ServingMismatch), the
+    file is deleted and made afresh from `sources` (see `_rebuild_serving`). The state
+    and the open delta `conn` must have committed what the run wrote."""
+    if not fetched:
+        reason = f"the prior manifest lists no {SERVING_ASSET}"
+    else:
+        try:
+            _update_serving(path, state, conn, closes)
+            return None
+        except (serving.NeedsRebuild, serving.ServingMismatch) as error:
+            reason = str(error)
+    path.unlink(missing_ok=True)
+    _rebuild_serving(path, state, sources, today)
+    return reason
+
+
+def _serving_coverage(path: Path) -> dict:
+    """What the manifest says of the serving database at `path`: how many folded days
+    the window up to the newest holds, the newest year that has a top set (None before
+    the first close), and how many projects that year's set holds."""
+    with closing(open_db(path, serving.SCHEMA)) as db:
+        (window,) = db.execute(
+            "SELECT count(*) FROM folded WHERE day > (SELECT max(day) FROM folded) - ?",
+            (serving.WINDOW,),
+        ).fetchone()
+        year, members = db.execute(
+            "SELECT max(year), count(*) FROM top_set "
+            "WHERE year = (SELECT max(year) FROM top_set)"
+        ).fetchone()
+    return {"window_days": window, "top_year": year, "top_set": members}
+
+
 def _report(
     days: _Days,
     *,
@@ -562,7 +739,10 @@ def _report(
     drift: list[str] | None,
     usage: Usage,
     failures: list[GateFailure],
+    serving_reason: str | None,
 ) -> RunReport:
+    """The report of a run, which took `days`. `serving_reason` is why the serving
+    database was rebuilt, and None when it was updated."""
     return RunReport(
         counted=days.counted,
         reused=days.reused,
@@ -576,6 +756,8 @@ def _report(
         renamed=days.renamed,
         usage=asdict(usage),
         gate_failures=failures,
+        serving="updated" if serving_reason is None else "rebuilt",
+        serving_reason=serving_reason,
     )
 
 
@@ -600,15 +782,18 @@ def _bootstrap(
     notifications, and with `override_reason`, a clearance of any spend that would hold
     it (see `_clear_spend`). The launch day is ensured (see `_ensure`) once the guard
     allows it, as for a day after launch, and written, and the usage is measured again
-    at the time then (see `_wall`). The state is copied as the base of today's month,
-    and published with the open delta and a manifest that lists the breaks. Only then
-    are the notifications acknowledged.
+    at the time then (see `_wall`). The serving database is made from the open delta,
+    which holds the launch day, and checked (see `_rebuild_serving`). The state is
+    copied as the base of today's month, and published with the open delta, the
+    serving database and a manifest that lists the breaks. Only then are the
+    notifications acknowledged.
 
     Raises BootstrapError, and publishes nothing, when the guard refuses the launch
     day or the day fails: a stream with no day counted has nothing to publish. The
     notifications are then not acknowledged, so a rerun is given them again.
     """
     launch = latest_due(today)
+    serving_db = workdir / serving.SERVING_DB
     days = _Days()
     with (
         closing(open_db(workdir / STORE.state_db, STATE_SCHEMA, create=True)) as state,
@@ -656,6 +841,9 @@ def _bootstrap(
         if outcome == "counted":
             usage = _usage(google, config, state, _wall(now, clock, started))
         through, coverage, complete = _summary(state, launch, today)
+        open_delta = workdir / STORE.open_delta_db
+        _rebuild_serving(serving_db, state, lambda: iter([open_delta]), today)
+    coverage |= _serving_coverage(serving_db)
     cycle.publish_first(
         gh,
         STORE,
@@ -667,9 +855,18 @@ def _bootstrap(
         coverage=coverage,
         complete=complete,
         series_breaks=[{"day": day.isoformat(), "note": note} for day, note in BREAKS],
+        derived=(serving_db,),
     )
     _acknowledge(google, config, pulled)
-    return _report(days, held=None, quiet=quiet, drift=[], usage=usage, failures=[])
+    return _report(
+        days,
+        held=None,
+        quiet=quiet,
+        drift=[],
+        usage=usage,
+        failures=[],
+        serving_reason=FIRST_RUN_REASON,
+    )
 
 
 def run_once(
@@ -699,15 +896,23 @@ def run_once(
     and the backfill, newest first, one at a time (see `_take`). Before each it asks
     the guard (`plan.refusal`), and it measures the usage again after each that an
     execution counted, at the time then (see `_wall`). It stops at a refusal, at a day
-    that failed, and once `max_seconds` from its start on `clock` have passed. It then
-    publishes (`cycle.publish`): the manifest is checked with the gates, and the state,
-    the open delta and the manifest are swapped into the current release. Only then are
-    the notifications acknowledged.
+    that failed, and once `max_seconds` from its start on `clock` have passed.
+
+    It brings the serving database up to date (see `_serve`): the prior one, fetched
+    from the current release before the rollover, closes each month that has ended
+    since the last run, folds the days that the state holds and it does not, and is
+    checked against the state. One that cannot be brought up to date, or that the prior
+    manifest lacks, is made afresh from the published parts that hold the counts and
+    the open delta. It then publishes (`cycle.publish`): the manifest is checked with
+    the gates, and the state, the open delta, the serving database and the manifest
+    are swapped into the current release. Only then are the notifications
+    acknowledged.
 
     Every error other than a failed day propagates, and an error before the publish
     publishes nothing to the current release and acknowledges no notification, so the
-    next run is given them again. What a rollover already added to a month's release
-    stays, as in `obskit.cycle`.
+    next run is given them again. A serving database made afresh that still disagrees
+    with the state is such an error (ServingMismatch). What a rollover already added to
+    a month's release stays, as in `obskit.cycle`.
     """
     started = clock()
     deadline = started + max_seconds
@@ -731,6 +936,14 @@ def run_once(
         )
     resume = _resume(prior, workdir)
     launch = resume.launch
+    serving_db = workdir / serving.SERVING_DB
+    fetched = _fetch_serving(gh, prior, workdir)
+    # When a month has ended since the prior open delta began, the rollover closes the
+    # delta's month, and the serving database closes it too, with each month after it.
+    open_day = date.fromisoformat(resume.carried[1].period or "")
+    closes = _months_to_close(
+        cycle.plan_rollover(open_day, today).close_month, launch, today
+    )
     added = cycle.roll_over(gh, STORE, workdir, prior, resume.carried, today)
     days = _Days()
     held: Refusal | None = None
@@ -776,6 +989,16 @@ def run_once(
             if outcome == "counted":
                 usage = _usage(google, config, state, _wall(now, clock, started))
         through, coverage, complete = _summary(state, launch, today)
+        serving_reason = _serve(
+            serving_db,
+            state,
+            conn,
+            fetched=fetched,
+            closes=closes,
+            sources=_sources(gh, workdir, _rebuild_parts(prior, added), added),
+            today=today,
+        )
+    coverage |= _serving_coverage(serving_db)
     failures = cycle.publish(
         gh,
         STORE,
@@ -791,10 +1014,17 @@ def run_once(
         allowed_shrink={},
         extra=[],
         override_reason=override_reason,
+        derived=(serving_db,),
     )
     _acknowledge(google, config, pulled)
     return _report(
-        days, held=held, quiet=quiet, drift=drift, usage=usage, failures=failures
+        days,
+        held=held,
+        quiet=quiet,
+        drift=drift,
+        usage=usage,
+        failures=failures,
+        serving_reason=serving_reason,
     )
 
 

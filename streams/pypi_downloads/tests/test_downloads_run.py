@@ -1,9 +1,11 @@
 import dataclasses
 import json
 import re
+import sqlite3
 import tomllib
 from contextlib import closing
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from downloads_run_helpers import (
@@ -16,19 +18,29 @@ from downloads_run_helpers import (
     MANIFEST,
     MANIFEST_NOVEMBER,
     NOVEMBER,
+    OPENED,
     PART_NOVEMBER,
     READ_BYTES,
+    SERVING,
     STATE,
     Stream,
+    by_month,
     close_connections,  # autouse: it closes what each test of this module opened
     counted_days,
     counts_rows,
     execution,
+    folded_days,
+    found_on,
+    project_ids,
+    rows,
     rows_of,
     sealed_name,
+    serving_tables,
 )
 from pypi_downloads import run as run_module
+from pypi_downloads import serving as serving_module
 from pypi_downloads.config import STREAM_TOML
+from pypi_downloads.counts import write_day
 from pypi_downloads.plan import BACKFILL_SHARE, FIRST_DAY, FREE, billing_month
 from pypi_downloads.run import (
     BREAKS,
@@ -37,12 +49,14 @@ from pypi_downloads.run import (
     RunReport,
     counter_template,
 )
+from pypi_downloads.serving import SERVING_DB, TABLES, ServingMismatch, check, rebuild
 from pypi_downloads.store import STATE_SCHEMA, STATE_TABLES, day_number
 
 from obskit import cycle
 from obskit.gcp import GoogleError
 from obskit.github import GitHubError
 from obskit.manifest import TableInfo, Watermark
+from obskit.parts import coarsest_parts
 from obskit.release import fetch_assets
 from obskit.sqlite import diff_tables, open_db
 
@@ -91,9 +105,10 @@ def test_bootstrap_counts_the_launch_day_and_publishes_first(tmp_path):
     # The newest day that is due on 11-11 is 11-09, which the counter is run for.
     assert stream.started == ["2026-11-09"]
     (run,) = stream.cloud.executions
-    # The current release holds the state, the open delta and the manifest. The
-    # month's release holds the state as the month began, which is the same bytes.
-    assert stream.assets(CURRENT) == sorted([STATE, DELTA, MANIFEST])
+    # The current release holds the state, the open delta, the serving database and
+    # the manifest. The month's release holds the state as the month began, which is
+    # the same bytes.
+    assert stream.assets(CURRENT) == sorted([STATE, DELTA, SERVING, MANIFEST])
     assert stream.assets(NOVEMBER) == [BASE_NOVEMBER]
     base_bytes = stream.github.asset_bytes(NOVEMBER, BASE_NOVEMBER)
     assert base_bytes == stream.github.asset_bytes(CURRENT, STATE)
@@ -139,8 +154,9 @@ def test_bootstrap_counts_the_launch_day_and_publishes_first(tmp_path):
     ]
 
     manifest = stream.manifest()
-    state_entry, delta_entry, base_entry = manifest.assets
+    state_entry, delta_entry, serving_entry, base_entry = manifest.assets
     assert (delta_entry.name, delta_entry.period) == (DELTA, "2026-11-11")
+    assert serving_entry.name == SERVING
     assert delta_entry.tables["counts"] == TableInfo(3, "append")
     assert base_entry == dataclasses.replace(
         state_entry, name=BASE_NOVEMBER, tag=NOVEMBER, period="2026-11", closed=True
@@ -163,6 +179,9 @@ def test_bootstrap_counts_the_launch_day_and_publishes_first(tmp_path):
         "forward_missing": 0,
         "backfill_left": (LAUNCH - FIRST_DAY).days,
         "projects": 3,
+        "window_days": 1,
+        "top_year": None,
+        "top_set": 0,
     }
     assert manifest.complete is False
     assert report == RunReport(
@@ -182,6 +201,8 @@ def test_bootstrap_counts_the_launch_day_and_publishes_first(tmp_path):
             "read_bytes": READ_BYTES,
         },
         gate_failures=[],
+        serving="rebuilt",
+        serving_reason="the first run has no serving database to update",
     )
 
 
@@ -280,6 +301,9 @@ def test_later_run_counts_forward_days_before_backfill(tmp_path):
         "forward_missing": 0,
         "backfill_left": (date(2026, 11, 7) - FIRST_DAY).days,
         "projects": 7,
+        "window_days": 5,
+        "top_year": None,
+        "top_set": 0,
     }
     assert manifest.complete is False
     # The notification is kept in the state, and acknowledged once the state that
@@ -692,6 +716,362 @@ def test_a_month_close_merges_counts_into_the_part(tmp_path):
     assert {row[0] for row in counts_rows(stream.open(CURRENT, DELTA))} == set(days)
     assert entries[PART_NOVEMBER].tables["counts"] == TableInfo(6, "append")
     assert stream.manifest().data_through == Watermark("2026-11-29", "day")
+
+
+# ---- the serving database
+
+
+def scripted_runs(stream: Stream, times: list[str]) -> dict[str, RunReport]:
+    """A run at each of `times`, UTC and from 09:00 on, in order, with a budget
+    notification of $0 for the run's billing month an hour before it, so that the
+    backfill goes on below the budget line. Each run starts at most two days. Returns
+    the reports by time."""
+    reports = {}
+    for at in times:
+        before = datetime.fromisoformat(at) - timedelta(hours=1)
+        stream.notify(0.0, at=f"{before:%Y-%m-%dT%H:%M:%SZ}", month=at[:7])
+        reports[at] = stream.run(at, max_seconds=2 * 600 - 1)
+    return reports
+
+
+def rebuilt_from_releases(stream: Stream, today: date) -> sqlite3.Connection:
+    """A serving database rebuilt from the published state and every published part
+    that holds counts, the open delta included, as a restore from the releases alone
+    makes it on `today`, opened."""
+    parts = coarsest_parts(stream.manifest().assets, frozenset({"counts"}))
+    paths = fetch_assets(stream.gh, parts, stream.folder("parts"))
+    path = stream.folder("rebuilt") / SERVING_DB
+    rebuild(path, stream.open(CURRENT, STATE), lambda: iter(paths), today=today)
+    conn = sqlite3.connect(path)
+    OPENED.append(conn)
+    return conn
+
+
+def test_the_bootstrap_publishes_a_serving_database(tmp_path):
+    stream = Stream(tmp_path)
+
+    report = stream.bootstrap(BOOTSTRAP_AT)
+
+    # The bootstrap builds it from its open delta, which holds the launch day.
+    assert (report.serving, report.serving_reason) == (
+        "rebuilt",
+        "the first run has no serving database to update",
+    )
+    entry = stream.entries()[SERVING]
+    assert (entry.tag, entry.role, entry.period, entry.closed) == (
+        CURRENT,
+        "public",
+        None,
+        False,
+    )
+    assert {table: info.history_class for table, info in entry.tables.items()} == (
+        dict.fromkeys(TABLES, "derived")
+    )
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    found = found_on(state, ["2026-11-09"])
+    assert rows(db, "folded") == [(day_number(LAUNCH), 6)]
+    assert rows(db, "months") == [(202611, 1, rows_of(LAUNCH), 10)]
+    assert rows(db, "monthly") == by_month(found)
+    assert rows(db, "recent") == found
+    # No month has closed since launch, so there is no top set and no daily count.
+    assert rows(db, "top_set") == rows(db, "daily") == []
+    check(db, state)
+
+
+def test_each_run_folds_the_days_it_counts(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.notify(0.0, at="2026-11-13T08:00:00Z")
+
+    first = stream.run("2026-11-13T09:00:00Z", max_seconds=4 * 600 - 1)
+
+    assert (first.serving, first.serving_reason) == ("updated", None)
+    assert folded_days(stream.open(CURRENT, SERVING)) == [
+        "2026-11-07",
+        "2026-11-08",
+        "2026-11-09",
+        "2026-11-10",
+        "2026-11-11",
+    ]
+
+    second = stream.run("2026-11-14T09:00:00Z", max_seconds=1)
+
+    assert second.counted == ["2026-11-12"]
+    assert (second.serving, second.serving_reason) == ("updated", None)
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    days = counted_days(state)
+    assert (
+        days
+        == folded_days(db)
+        == [
+            "2026-11-07",
+            "2026-11-08",
+            "2026-11-09",
+            "2026-11-10",
+            "2026-11-11",
+            "2026-11-12",
+        ]
+    )
+    assert (
+        rows(db, "folded")
+        == state.execute("SELECT day, seq FROM days ORDER BY day").fetchall()
+    )
+    found = found_on(state, days)
+    downloads = sum(row[2] for row in found)
+    mirrors = sum(row[3] for row in found)
+    assert rows(db, "months") == [(202611, 6, downloads, mirrors)]
+    assert rows(db, "monthly") == by_month(found)
+    # The six days are all within 30 of the newest.
+    assert rows(db, "recent") == found
+    assert rows(db, "top_set") == rows(db, "daily") == []
+    check(db, state)
+    coverage = stream.manifest().coverage
+    assert (coverage["window_days"], coverage["top_year"], coverage["top_set"]) == (
+        6,
+        None,
+        0,
+    )
+
+
+def test_a_month_close_adds_the_top_set(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap("2026-11-28T09:00:00Z")
+    stream.run("2026-11-29T09:00:00Z")
+
+    report = stream.run("2026-12-01T09:00:00Z")
+
+    assert report.counted == ["2026-11-28", "2026-11-29"]
+    # November's close makes 2026's first members, who keep every day of 2026, and the
+    # days already folded have no daily counts: the database is rebuilt.
+    assert report.serving == "rebuilt"
+    assert (report.serving_reason or "").startswith(
+        "the close of 2026-11 makes the first members of 2026's top set"
+    )
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    ids = project_ids(state)
+    # November is ranked by downloads less mirror downloads over the days counted
+    # before December began, 11-26 and 11-27, ties by name. The projects first seen on
+    # 11-28 and 11-29 were counted after it closed.
+    members = ["requests", "numpy", "new-20261126", "new-20261127"]
+    ranked = db.execute("SELECT * FROM top_set ORDER BY rank").fetchall()
+    assert ranked == [
+        (2026, ids[name], name, 202611, rank) for rank, name in enumerate(members, 1)
+    ]
+    # They entered at 2026's first close, so their daily counts are kept for every
+    # day of 2026, those counted after the close included.
+    kept = {ids[name] for name in members}
+    found = found_on(state, counted_days(state))
+    assert rows(db, "daily") == [row for row in found if row[0] in kept]
+    assert {day for _, day, *_ in rows(db, "daily")} == {
+        day_number(date(2026, 11, day)) for day in (26, 27, 28, 29)
+    }
+    check(db, state)
+    coverage = stream.manifest().coverage
+    assert (coverage["top_year"], coverage["top_set"]) == (2026, 4)
+
+
+def test_serving_that_lags_the_state_is_rebuilt(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    behind = stream.expand(CURRENT, SERVING)
+    stream.run("2026-11-12T09:00:00Z")
+    # The current release is given back the bootstrap's serving database, which lacks
+    # 11-10. The counts of 11-10 are in the open delta of 11-12, which the next run
+    # seals, and those of the launch day in the sealed delta of 11-11.
+    stream.publish_serving(behind)
+
+    report = stream.run("2026-11-13T09:00:00Z")
+
+    assert report.counted == ["2026-11-11"]
+    assert (report.serving, report.serving_reason) == (
+        "rebuilt",
+        "the delta holds 0 counts of 2026-11-10, where the state counted 3 projects "
+        "that day",
+    )
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    check(db, state)
+    assert folded_days(db) == ["2026-11-09", "2026-11-10", "2026-11-11"]
+    assert rows(db, "recent") == found_on(state, counted_days(state))
+
+
+def test_serving_that_fails_its_check_after_the_update_is_rebuilt(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    tampered = stream.expand(CURRENT, SERVING)
+    with closing(sqlite3.connect(tampered)) as conn, conn:
+        conn.execute(
+            "UPDATE monthly SET downloads = downloads + 1 WHERE project_id = 1"
+        )
+    stream.publish_serving(tampered)
+
+    report = stream.run("2026-11-12T09:00:00Z")
+
+    # The update folds 11-10 into it, and its check finds November's sums wrong.
+    assert (report.serving, report.serving_reason) == (
+        "rebuilt",
+        "monthly does not sum to months in 2026-11",
+    )
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    check(db, state)
+    assert rows(db, "monthly") == by_month(found_on(state, counted_days(state)))
+
+
+def test_a_run_without_a_prior_serving_database_rebuilds_it(tmp_path, monkeypatch):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.run("2026-11-12T09:00:00Z")
+    # The current release as the stream published it before it kept a serving
+    # database.
+    stream.publish_serving(None)
+    stream.notify(0.0, at="2026-11-14T08:00:00Z")
+    fetched: list[str] = []
+    folders: list[Path] = []
+
+    def fetch_one_at_a_time(gh, assets, workdir, **options):
+        # Each part is fetched into a new, empty directory of its own, once the one
+        # before has been deleted.
+        assert list(workdir.iterdir()) == []
+        assert not any(folder.exists() for folder in folders)
+        folders.append(workdir)
+        fetched.extend(asset.name for asset in assets)
+        return fetch_assets(gh, assets, workdir, **options)
+
+    monkeypatch.setattr(run_module, "fetch_assets", fetch_one_at_a_time)
+
+    report = stream.run("2026-11-14T09:00:00Z", max_seconds=3 * 600 - 1)
+
+    assert report.counted == ["2026-11-11", "2026-11-12", "2026-11-08"]
+    assert (report.serving, report.serving_reason) == (
+        "rebuilt",
+        f"the prior manifest lists no {SERVING}",
+    )
+    # The sealed delta of 11-11, which holds the launch day, is read from November's
+    # release on each of the rebuild's two passes, and deleted after each. The sealed
+    # delta of 11-12, which the rollover made and which holds 11-10, and the open delta
+    # are read where they are.
+    assert fetched == [sealed_name("2026-11-11")] * 2
+    assert len(set(folders)) == 2
+    assert not any(folder.exists() for folder in folders)
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    check(db, state)
+    assert folded_days(db) == counted_days(state)
+    assert len(counted_days(state)) == 5
+    assert stream.entries()[SERVING].tables["folded"] == TableInfo(5, "derived")
+
+
+def test_rebuild_from_the_releases_equals_the_runs(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap("2026-11-25T09:00:00Z")
+    first = date(2026, 11, 26)
+    times = [f"{first + timedelta(days=n)}T09:00:00Z" for n in range(39)]
+    # A second run on one day, which adds to that day's open delta.
+    times.insert(times.index("2026-12-10T09:00:00Z") + 1, "2026-12-10T15:00:00Z")
+
+    reports = scripted_runs(stream, times)
+
+    assert times[-1] == "2027-01-03T09:00:00Z"
+    # Only 2026's first close rebuilds. Every other run updates the database, the run
+    # of 2027-01-01, which closes December into 2027's set, included.
+    assert {at for at, report in reports.items() if report.serving != "updated"} == {
+        "2026-12-01T09:00:00Z"
+    }
+    published = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    check(published, state)
+    rebuilt = rebuilt_from_releases(stream, date(2027, 1, 3))
+    assert serving_tables(rebuilt) == serving_tables(published)
+    # What was compared holds both closes and the daily counts of both years: of the
+    # days of 2026 counted after its first close, by the backfill among them, and of
+    # 2027's first day.
+    entries = set(published.execute("SELECT DISTINCT year, entered FROM top_set"))
+    assert entries == {(2026, 202611), (2027, 202612)}
+    late = {
+        day
+        for day, counted_at in state.execute("SELECT day, counted_at FROM days")
+        if counted_at >= "2026-12-01" and day < day_number(date(2026, 11, 1))
+    }
+    daily = {day for (day,) in published.execute("SELECT DISTINCT day FROM daily")}
+    assert late and late <= daily
+    assert day_number(date(2027, 1, 1)) in daily
+    # Every day from launch on is folded, so the window holds 30, up to 2027-01-01.
+    (members,) = published.execute(
+        "SELECT count(*) FROM top_set WHERE year = 2027"
+    ).fetchone()
+    coverage = stream.manifest().coverage
+    assert (coverage["window_days"], coverage["top_year"], coverage["top_set"]) == (
+        30,
+        2027,
+        members,
+    )
+
+
+def test_a_run_after_a_gap_closes_each_month_it_missed(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap("2026-11-28T09:00:00Z")
+    scripted_runs(
+        stream,
+        [f"2026-{day}T09:00:00Z" for day in ("11-29", "12-01", "12-04", "12-05")],
+    )
+
+    # No run from 12-05 to 2027-02-03. The rollover closes December, the open delta's
+    # month, and the run closes January as well, both before it folds the days it
+    # counts.
+    report = stream.run("2027-02-03T09:00:00Z")
+
+    assert report.counted[0] == "2026-12-04"
+    assert (report.serving, report.serving_reason) == ("updated", None)
+    published = stream.open(CURRENT, SERVING)
+    check(published, stream.open(CURRENT, STATE))
+    rebuilt = rebuilt_from_releases(stream, date(2027, 2, 3))
+    assert serving_tables(rebuilt) == serving_tables(published)
+    # December's close ranks the days of December counted before 2027 began into
+    # 2027's set. January had no run, so its close adds no one.
+    entries = set(published.execute("SELECT DISTINCT year, entered FROM top_set"))
+    assert entries == {(2026, 202611), (2027, 202612)}
+
+
+def test_a_serving_database_that_fails_its_check_stops_the_run_before_it_publishes(
+    tmp_path, monkeypatch
+):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.notify(0.0, at="2026-11-12T08:00:00Z")
+    published = stream.github.asset_bytes(CURRENT, MANIFEST)
+    rebuilt: list[str] = []
+
+    def miscounting(state, conn, delta, counted, **options) -> int:
+        # Each project's count of a day written is one more than the day's row sums.
+        new = write_day(state, conn, delta, counted, **options)
+        conn.execute(
+            "UPDATE counts SET downloads = downloads + 1 WHERE day = ?",
+            (day_number(counted.day),),
+        )
+        return new
+
+    def noted_rebuild(path, state, sources, *, today):
+        rebuilt.append(path.name)
+        rebuild(path, state, sources, today=today)
+
+    monkeypatch.setattr(run_module, "write_day", miscounting)
+    monkeypatch.setattr(serving_module, "rebuild", noted_rebuild)
+
+    # The updated database disagrees with the state, and so does the one rebuilt from
+    # the same counts.
+    with pytest.raises(
+        ServingMismatch, match="months disagrees with the state's days in 2026-11"
+    ):
+        stream.run("2026-11-12T09:00:00Z")
+
+    assert rebuilt == [SERVING_DB]
+    assert stream.github.asset_bytes(CURRENT, MANIFEST) == published
+    assert stream.manifest().generated_at == BOOTSTRAP_AT
+    assert stream.cloud.acked == []
 
 
 # ---- the counter's job

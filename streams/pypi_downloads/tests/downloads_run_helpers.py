@@ -7,6 +7,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from compression import zstd
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,13 +17,17 @@ import pytest
 from obskit.gcp import Credentials, Federation, Google
 from obskit.github import GitHub
 from obskit.manifest import Asset, Manifest, instant, loads
+from obskit.names import canonical_name
+from obskit.release import prepare_asset, publish_current
 from obskit.testing import FakeGitHub, FakeGoogle
 from obskit.zst import decompress_file
+from pypi_downloads import STREAM
 from pypi_downloads import run as run_module
 from pypi_downloads.config import load
 from pypi_downloads.counts import COUNTS_SCHEMA
 from pypi_downloads.run import RunReport, run_once
-from pypi_downloads.store import day_date
+from pypi_downloads.serving import TABLES
+from pypi_downloads.store import day_date, day_number
 
 
 def counts_file(
@@ -100,6 +105,7 @@ DECEMBER = "pypi-downloads-month-2026-12"
 MANIFEST = "manifest.json"
 STATE = "pypi-downloads-state.db.zst"
 DELTA = "pypi-downloads-delta-open.db.zst"
+SERVING = "pypi-downloads-serving.db.zst"
 BASE_NOVEMBER = "pypi-downloads-state-base-2026-11.db.zst"
 BASE_DECEMBER = "pypi-downloads-state-base-2026-12.db.zst"
 PART_NOVEMBER = "pypi-downloads-2026-11.db.zst"
@@ -389,6 +395,33 @@ class Stream:
         OPENED.append(conn)
         return conn
 
+    def publish_serving(self, db: Path | None) -> None:
+        """Put `db` in the current release as its serving database, or with None leave
+        it without one, as a publish that kept none did. The state, the open delta and
+        the rest of the manifest stay as they are."""
+        folder = self.folder("serving")
+        manifest = self.manifest()
+        kept = [
+            asset
+            for asset in manifest.assets
+            if (asset.tag, asset.name) != (CURRENT, SERVING)
+        ]
+        files = []
+        for asset in kept:
+            if asset.tag == CURRENT:
+                path = folder / asset.name
+                path.write_bytes(self.github.asset_bytes(CURRENT, asset.name))
+                files.append(path)
+        if db is not None:
+            packed, entry = prepare_asset(
+                db, folder, tag=CURRENT, role="public", classes=CONFIG.tables
+            )
+            files.append(packed)
+            kept.append(entry)
+        publish_current(
+            self.gh, STREAM, files, replace(manifest, assets=kept), bootstrap=False
+        )
+
 
 def counted_days(state: sqlite3.Connection) -> list[str]:
     """The days of the state, oldest first, as YYYY-MM-DD."""
@@ -404,3 +437,54 @@ def counts_rows(conn: sqlite3.Connection) -> list[tuple[str, int, int, int]]:
         "ORDER BY day, project_id"
     )
     return [(day_date(day).isoformat(), *rest) for day, *rest in rows]
+
+
+# ---- the serving database
+
+
+def project_ids(state: sqlite3.Connection) -> dict[str, int]:
+    """The id of each project of the state, by its name."""
+    return {
+        name: pid
+        for pid, name in state.execute("SELECT project_id, name FROM projects")
+    }
+
+
+def found_on(
+    state: sqlite3.Connection, days: list[str]
+) -> list[tuple[int, int, int, int]]:
+    """What the fake counter found on `days`, given as YYYY-MM-DD, as (project id, day,
+    downloads, mirror downloads) rows, in that order, with the ids that the state gave
+    the names. Worked out from `downloads_of`, and not read from any published file."""
+    ids = project_ids(state)
+    return sorted(
+        (ids[canonical_name(name)], day_number(day), downloads, mirrors)
+        for day in map(date.fromisoformat, days)
+        for name, (downloads, mirrors) in downloads_of(day).items()
+    )
+
+
+def by_month(found: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    """`found` summed by project and month, as `monthly` holds it: (project id, month,
+    downloads, mirror downloads), where a month is year * 100 + month."""
+    sums: dict[tuple[int, int], tuple[int, int]] = {}
+    for project_id, day, downloads, mirrors in found:
+        month = int(f"{day_date(day):%Y%m}")
+        total, mirrored = sums.get((project_id, month), (0, 0))
+        sums[(project_id, month)] = (total + downloads, mirrored + mirrors)
+    return sorted((*key, *value) for key, value in sums.items())
+
+
+def rows(conn: sqlite3.Connection, table: str) -> list[tuple]:
+    """Every row of `table`, in the order of its first two columns."""
+    return conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall()
+
+
+def serving_tables(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
+    """Every row of every table of a serving database."""
+    return {table: rows(conn, table) for table in TABLES}
+
+
+def folded_days(conn: sqlite3.Connection) -> list[str]:
+    """The days that a serving database has folded, oldest first, as YYYY-MM-DD."""
+    return [day_date(day).isoformat() for day, _ in rows(conn, "folded")]
