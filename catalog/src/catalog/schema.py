@@ -218,7 +218,9 @@ CREATE TABLE download_day (
 
 -- Each project's downloads in the window of 30 days that ends with the newest day the
 -- stream has counted (`download_coverage` gives its days and how many of them are
--- counted), ranked by downloads without mirrors, highest first and ties by name.
+-- counted), ranked by downloads without mirrors, highest first and ties by name. The
+-- rank is among the projects that the registry knows, while download_top's rank is the
+-- stream's at the close, over every name that it counted.
 CREATE TABLE download_last30 (
     project_id INTEGER PRIMARY KEY,
     downloads INTEGER NOT NULL,
