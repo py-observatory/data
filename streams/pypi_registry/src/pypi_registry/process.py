@@ -37,7 +37,8 @@ such row out:
 A project is processed whole or not at all: the time budget is checked between
 projects, never inside one. Errors are not caught. A reply of the wrong shape raises
 ValueError and a failed request raises UpstreamError, and either one ends the run,
-which then publishes nothing to the current release.
+which then publishes nothing to the current release. The records pass alone writes
+nothing for a release record that it refuses and goes on (see `record_current`).
 """
 
 import json
@@ -307,10 +308,16 @@ def record_current(ctx: Context, name: str, incarnation: int) -> str:
     "recorded": the record was written, and nothing else. The state holds the version
     already, so writing it again would repeat a key of the month's deltas, and applying
     the record marks the version as recorded. "missing": the JSON API has no page for
-    the release (404 or 410), and nothing was written. "had": nothing was asked for,
-    because the version has a record, or the project has no current release, or the
-    state has not seen the version, whose record could not be applied. Raises as
-    `_fetch_record` does for a reply that does not make a record.
+    the release (404 or 410), and nothing was written. "refused": the reply makes no
+    record that can be kept (`_fetch_record` raised ValueError), and nothing was
+    written. "had": nothing was asked for, because the version has a record, or the
+    project has no current release, or the state has not seen the version, whose record
+    could not be applied.
+
+    This is the records pass's step, and only that pass goes on past a reply that it
+    refuses: it reads the releases from before the bootstrap, close to a million of
+    them, and one that the parser cannot read would otherwise stop it at the same name
+    in every run. A failed request still raises UpstreamError, as it may pass.
     """
     version = current_version(ctx.state, name, incarnation)
     if version is None:
@@ -322,7 +329,10 @@ def record_current(ctx: Context, name: str, incarnation: int) -> str:
     ).fetchone()
     if seen is None or seen[0]:
         return "had"
-    row = _fetch_record(ctx, name, incarnation, version)
+    try:
+        row = _fetch_record(ctx, name, incarnation, version)
+    except ValueError:
+        return "refused"
     if row is None:
         return "missing"
     ctx.delta.record(row)

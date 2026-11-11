@@ -44,8 +44,9 @@ projects lack the record of the release that they are at, which holds what a pro
 says of itself: its summary, its licence and its requirements. The records pass reads
 that record, from the JSON API, for each project that may lack it, in name order and a
 time budget at a time, at the sweep's pace (`_record_projects`). It writes the record
-alone, and applying it marks the version as recorded (see `store.apply_delta`). Like the
-sweep, it reads no root and keeps the prior manifest's `data_through`, `cursor` and
+alone, and applying it marks the version as recorded (see `store.apply_delta`). A reply
+that makes no record is counted as refused and passed over, so one release that the
+parser cannot read does not stop the pass. Like the sweep, it reads no root and keeps the prior manifest's `data_through`, `cursor` and
 backlog. Its coverage says where it stopped (`records_after`) and how many projects are
 left after that (`records_left`), so that the next records run goes on from there, and
 every other run carries both on as they were.
@@ -226,15 +227,17 @@ class RecordsReport:
     """What a records run did.
 
     `processed` counts the projects that it came to before its deadline. Of those,
-    `recorded` got the record of their current release, and `missing` are those whose
-    record PyPI does not have (404 or 410). The rest had nothing to ask for. `left`
-    counts the projects after the last one that it came to that may still lack a record,
-    and is 0 when it came to the end of the list.
+    `recorded` got the record of their current release, `missing` are those whose
+    record PyPI does not have (404 or 410), and `refused` those whose reply made no
+    record that could be kept, for which nothing was written. The rest had nothing to
+    ask for. `left` counts the projects after the last one that it came to that may
+    still lack a record, and is 0 when it came to the end of the list.
     """
 
     processed: int
     recorded: int
     missing: int
+    refused: int
     left: int
 
 
@@ -1324,9 +1327,10 @@ def _record_projects(
 
     A project is a candidate while any version of it lacks a record, and most keep an
     old version without one for good, so the pass comes to most projects only to find
-    nothing to ask for, which costs no request. A project is processed whole or not at
-    all: the deadline is checked between projects. The state is read and never written,
-    and the delta is not committed.
+    nothing to ask for, which costs no request. A project whose reply is refused is
+    processed too: nothing is written for it, and the place moves past it. A project is
+    processed whole or not at all: the deadline is checked between projects. The state
+    is read and never written, and the delta is not committed.
     """
     ctx = Context(state, delta, http, bootstrap_at(state))
     lacking = state.execute(_LACKING_RECORDS, (*INACTIVE, after, after)).fetchall()
@@ -1342,6 +1346,7 @@ def _record_projects(
         processed=processed,
         recorded=outcomes["recorded"],
         missing=outcomes["missing"],
+        refused=outcomes["refused"],
         left=len(lacking) - processed,
     )
     return report, last
@@ -1371,13 +1376,15 @@ def records(
 
     Its coverage gives the pass's place, `records_after`: the last project that it came
     to, or null when it came to the end of the list, so that the next records run starts
-    again from the first name. Until then a project whose record PyPI does not have is
-    not asked for again. `records_left` is the report's `left`. Every other run carries
-    both on from the prior manifest.
+    again from the first name. Until then a project whose record PyPI does not have, or
+    whose reply the run refused, is not asked for again. `records_left` is the report's
+    `left`. Every other run carries both on from the prior manifest.
 
     A gate failure raises GateError. The run takes no override reason, as the sweep
-    takes none. Every other error propagates as well, and an error before the publish
-    publishes nothing to the current release, so the next run does that work again.
+    takes none. Every other error propagates as well, a failed request among them, and
+    an error before the publish publishes nothing to the current release, so the next
+    run does that work again. A reply that makes no record is not an error here: it is
+    counted as `refused` (see `process.record_current`).
     """
     deadline = clock() + max_seconds
     if http is None:

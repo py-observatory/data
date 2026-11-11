@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from obskit.http import UpstreamError
 from obskit.release import PriorStateError
 from obskit.sqlite import table_counts
 from opened_connections import OPENED
@@ -30,6 +31,7 @@ from run_helpers import (
     meta_of,
     page,
     project_rows,
+    release,
     restored_differences,
     versions_of,
     written,
@@ -133,7 +135,9 @@ def test_a_project_without_its_current_record_gets_one(tmp_path):
     # Only the current release's record is asked for, and only that record is written.
     # The version is in the state already, and a second row for it would be a key that
     # the month's merge of deltas refuses.
-    assert report == RecordsReport(processed=1, recorded=1, missing=0, left=0)
+    assert report == RecordsReport(
+        processed=1, recorded=1, missing=0, refused=0, left=0
+    )
     assert requested(stream) == [version_url("alpha", "2.0")]
     assert written(stream.open(CURRENT, DELTA), before) == [
         ("record", "alpha", 1, "2.0"),
@@ -184,7 +188,9 @@ def test_a_current_version_that_has_a_record_is_not_fetched(tmp_path):
 
     report = stream.records(RECORDED_AT)
 
-    assert report == RecordsReport(processed=3, recorded=0, missing=0, left=0)
+    assert report == RecordsReport(
+        processed=3, recorded=0, missing=0, refused=0, left=0
+    )
     assert requested(stream) == []
     assert written(stream.open(CURRENT, DELTA), before) == []
     assert versions_of(stream.open(CURRENT, STATE)) == [
@@ -206,12 +212,93 @@ def test_a_missing_record_writes_nothing(tmp_path, status):
 
     # PyPI has no record of the release. Nothing is written, and the version still has
     # no record. The run publishes all the same, with its progress.
-    assert report == RecordsReport(processed=1, recorded=0, missing=1, left=0)
+    assert report == RecordsReport(
+        processed=1, recorded=0, missing=1, refused=0, left=0
+    )
     assert requested(stream) == [version_url("alpha", "1.0")]
     assert written(stream.open(CURRENT, DELTA), before) == []
     assert versions_of(stream.open(CURRENT, STATE)) == [("alpha", 1, "1.0", 0)]
     assert stream.manifest().generated_at == RECORDED_AT
     assert progress(stream) == (None, 0)
+
+
+REFUSED_REPLIES = [
+    pytest.param(b"<html>", id="not JSON"),
+    pytest.param({"info": "beta 1.0", "urls": []}, id="a record of the wrong shape"),
+    pytest.param(release("other", "1.0"), id="another project's record"),
+    pytest.param(release("beta", "2.0"), id="another release's record"),
+]
+
+
+@pytest.mark.parametrize("reply", REFUSED_REPLIES)
+def test_a_refused_record_is_counted_and_the_pass_goes_on(tmp_path, reply):
+    stream = swept(
+        tmp_path,
+        [
+            old_release("alpha", 10, "1.0"),
+            old_release("beta", 20, "1.0"),
+            old_release("gamma", 30, "1.0"),
+            old_release("zeta", 40, "1.0"),
+        ],
+    )
+    stream.pypi.add(version_url("beta", "1.0"), body=reply, times=1)
+    before = applied(stream)
+
+    # Each request takes a second, so two and a half seconds has time for three
+    # projects, and zeta is left.
+    report = stream.records(
+        RECORDED_AT, releases=[("alpha", "1.0"), ("gamma", "1.0")], max_seconds=2.5
+    )
+
+    # beta's reply makes no record. Nothing is written for it, its version still has no
+    # record, and the pass goes on to gamma.
+    assert report == RecordsReport(
+        processed=3, recorded=2, missing=0, refused=1, left=1
+    )
+    assert requested(stream) == [
+        version_url("alpha", "1.0"),
+        version_url("beta", "1.0"),
+        version_url("gamma", "1.0"),
+    ]
+    assert written(stream.open(CURRENT, DELTA), before) == [
+        ("record", "alpha", 1, "1.0"),
+        ("record", "gamma", 1, "1.0"),
+    ]
+    assert versions_of(stream.open(CURRENT, STATE)) == [
+        ("alpha", 1, "1.0", 1),
+        ("beta", 1, "1.0", 0),
+        ("gamma", 1, "1.0", 1),
+        ("zeta", 1, "1.0", 0),
+    ]
+    assert progress(stream) == ("gamma", 1)
+    assert restored_differences(stream) == []
+
+    # The next run goes on after gamma, and does not ask for beta's record again.
+    stream.pypi.requests.clear()
+
+    report = stream.records("2026-11-02T20:00:00Z", releases=[("zeta", "1.0")])
+
+    assert requested(stream) == [version_url("zeta", "1.0")]
+    assert report == RecordsReport(
+        processed=1, recorded=1, missing=0, refused=0, left=0
+    )
+    assert progress(stream) == (None, 0)
+
+
+def test_a_failed_request_still_stops_the_records_run(tmp_path):
+    stream = swept(
+        tmp_path, [old_release("alpha", 10, "1.0"), old_release("beta", 20, "1.0")]
+    )
+    # PyPI fails beta's request on every try. That may pass, unlike a reply that makes
+    # no record, so the run stops and publishes nothing, and the next run asks again.
+    stream.pypi.add(version_url("beta", "1.0"), status=503)
+    published = stream.writes()
+
+    with pytest.raises(UpstreamError):
+        stream.records(RECORDED_AT, releases=[("alpha", "1.0")])
+
+    assert stream.writes() == published
+    assert progress(stream) == (None, None)
 
 
 def test_the_pass_reads_the_swept_projects_that_are_not_removed_or_quarantined(
@@ -260,7 +347,9 @@ def test_the_pass_reads_the_swept_projects_that_are_not_removed_or_quarantined(
         version_url("alpha", "1.0"),
         version_url("beta", "1.0"),
     ]
-    assert report == RecordsReport(processed=2, recorded=2, missing=0, left=0)
+    assert report == RecordsReport(
+        processed=2, recorded=2, missing=0, refused=0, left=0
+    )
 
 
 def test_a_record_for_a_version_seen_this_month_merges_at_month_close(tmp_path):
@@ -320,7 +409,13 @@ def test_records_asks_for_another_run_while_work_is_left(tmp_path, monkeypatch, 
     assert main(["records", "--max-seconds", "1.5"]) == 3
 
     printed = json.loads(capsys.readouterr().out)
-    assert printed == {"processed": 2, "recorded": 1, "missing": 1, "left": 1}
+    assert printed == {
+        "processed": 2,
+        "recorded": 1,
+        "missing": 1,
+        "refused": 0,
+        "left": 1,
+    }
     assert progress(stream) == ("beta", 1)
     assert list((tmp_path / "work").iterdir()) == [], "the work directory is removed"
 
@@ -332,7 +427,13 @@ def test_records_asks_for_another_run_while_work_is_left(tmp_path, monkeypatch, 
 
     assert requested(stream) == [version_url("gamma", "1.0")]
     printed = json.loads(capsys.readouterr().out)
-    assert printed == {"processed": 1, "recorded": 1, "missing": 0, "left": 0}
+    assert printed == {
+        "processed": 1,
+        "recorded": 1,
+        "missing": 0,
+        "refused": 0,
+        "left": 0,
+    }
     assert progress(stream) == (None, 0)
 
 
@@ -344,7 +445,9 @@ def test_records_asks_for_another_run_while_work_is_left(tmp_path, monkeypatch, 
 def test_main_records_exit_code(tmp_path, monkeypatch, processed, left, code):
     # A run that processed nothing while projects are left made no progress, and a
     # chain that dispatched itself again each time could go round for ever.
-    report = RecordsReport(processed=processed, recorded=0, missing=0, left=left)
+    report = RecordsReport(
+        processed=processed, recorded=0, missing=0, refused=0, left=left
+    )
     monkeypatch.setattr("pypi_registry.run.records", lambda *args, **options: report)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
@@ -359,7 +462,7 @@ def test_main_records_with_its_budget_and_a_work_directory(tmp_path, monkeypatch
         # A work directory of its own, empty.
         assert list(workdir.iterdir()) == []
         calls.append((workdir.parent, options))
-        return RecordsReport(processed=0, recorded=0, missing=0, left=0)
+        return RecordsReport(processed=0, recorded=0, missing=0, refused=0, left=0)
 
     monkeypatch.setattr("pypi_registry.run.records", records_here)
     monkeypatch.chdir(tmp_path)
@@ -427,7 +530,9 @@ def test_other_runs_carry_the_records_progress(tmp_path):
     report = stream.records("2026-11-02T22:00:00Z", releases=[("beta", "1.0")])
 
     assert requested(stream) == [version_url("beta", "1.0")]
-    assert report == RecordsReport(processed=1, recorded=1, missing=0, left=0)
+    assert report == RecordsReport(
+        processed=1, recorded=1, missing=0, refused=0, left=0
+    )
     assert progress(stream) == (None, 0)
 
 
