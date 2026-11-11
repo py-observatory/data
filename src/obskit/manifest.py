@@ -117,6 +117,17 @@ def producer(repo: str) -> dict[str, str]:
     }
 
 
+def current_asset(manifest: Manifest, name: str) -> Asset | None:
+    """The asset of the stream's current release that is called `name`, or None when
+    the manifest lists none. A month's release may hold an asset of the same name, which
+    this does not find."""
+    tag = f"{manifest.stream}-current"
+    for asset in manifest.assets:
+        if asset.tag == tag and asset.name == name:
+            return asset
+    return None
+
+
 def _bad(where: str, key: str, expected: str, value: object) -> ManifestError:
     return ManifestError(f"{where}.{key} must be {expected}, not {value!r}")
 

@@ -10,6 +10,8 @@ puts are numbered by `seq` across all of its deltas, as every stream's deltas ar
 
 import sqlite3
 from contextlib import closing
+from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -75,6 +77,11 @@ TOY = cycle.Store(
     apply=apply,
 )
 
+# The toy stream with a database of derived tables beside its state, as written by
+# `write_rollup`.
+TOY_WITH_ROLLUP = replace(TOY, classes={**TOY.classes, "rollup": "derived"})
+ROLLUP = "kit-toy-rollup.db.zst"
+
 # The releases of the toy stream, and the assets that they hold, by name.
 REPO = "py-observatory/data"
 CURRENT = "kit-toy-current"
@@ -122,6 +129,16 @@ def write_state(path: Path, items: dict[str, str], *, applied_seq: int) -> Path:
         )
         state.executemany("INSERT INTO items (key, value) VALUES (?, ?)", items.items())
         state.commit()
+    return path
+
+
+def write_rollup(path: Path, rows: int) -> Path:
+    """Make a database at `path` with a table `rollup` of `rows` rows, which
+    `TOY_WITH_ROLLUP` says is derived."""
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("CREATE TABLE rollup (n INTEGER PRIMARY KEY)")
+        db.executemany("INSERT INTO rollup (n) VALUES (?)", [(n,) for n in range(rows)])
+        db.commit()
     return path
 
 
@@ -173,6 +190,7 @@ class ToyStream:
         self.tmp_path = tmp_path
         self.github = FakeGitHub(REPO)
         self.gh = GitHub(REPO, "t0ken", transport=self.github, sleep=no_sleep)
+        self.store = TOY  # what `run` publishes with, for the classes of its tables
         self.runs = 0
         self.made = 0  # files made by the helpers below, each in a folder of its own
 
@@ -310,6 +328,7 @@ class ToyStream:
         allowed_shrink: dict[str, int] | None = None,
         extra: list[GateFailure] | None = None,
         override_reason: str | None = None,
+        derived: Sequence[Path] = (),
     ) -> list[GateFailure]:
         """A run at `at`, a time with its zone, that goes on from the last publish as a
         stream does. It starts (see `start`), writes `puts`, each a key and a value, to
@@ -318,7 +337,7 @@ class ToyStream:
 
         The manifest says that the data reaches the run's day, gives the seq of the last
         put applied as the cursor, and counts the items as the coverage. `complete`,
-        `allowed_shrink` and `extra` are what the stream gives the publish.
+        `allowed_shrink`, `extra` and `derived` are what the stream gives the publish.
         """
         now = datetime.fromisoformat(at)
         today = now.astimezone(UTC).date()
@@ -326,7 +345,7 @@ class ToyStream:
         cursor, coverage = _write_and_apply(workdir, puts)
         return cycle.publish(
             self.gh,
-            TOY,
+            self.store,
             workdir,
             prior,
             added,
@@ -339,6 +358,7 @@ class ToyStream:
             allowed_shrink=allowed_shrink or {},
             extra=extra or [],
             override_reason=override_reason,
+            derived=derived,
         )
 
     def workdir(self) -> Path:

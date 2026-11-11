@@ -317,6 +317,31 @@ def test_fetch_prior_downloads_and_expands_state(gh, fake, tmp_path, workdir):
     assert {method for method, _ in requests(fake)} == {"GET"}, "it only reads"
 
 
+def test_fetch_prior_does_not_download_a_derived_asset(gh, fake, tmp_path, workdir):
+    src = tmp_path / "src"
+    state_file, state = pack(src, STATE, b"state\n" * 1000)
+    # A derived database of the current release is public, so a stream that wants it
+    # fetches it itself.
+    derived_file, derived = pack(
+        src,
+        "example-serving.db.zst",
+        b"serving\n" * 1000,
+        role="public",
+        tables={"rows": TableInfo(1, "derived")},
+    )
+    write_manifest(src / MANIFEST, [state, derived])
+    seed(
+        gh,
+        fake,
+        {STATE: state_file, derived.name: derived_file, MANIFEST: src / MANIFEST},
+    )
+
+    fetch_prior(gh, STREAM, workdir, bootstrap=False)
+
+    assert downloads(fake) == [MANIFEST, STATE]
+    assert contents(workdir) == sorted([MANIFEST, STATE, "example-state.db"])
+
+
 def test_falls_back_to_swap_prev_with_matching_digest(gh, fake, tmp_path, workdir):
     # A publish was killed between renaming the state to swap-prev- and renaming
     # swap-next- into its place, so no asset has the plain name.

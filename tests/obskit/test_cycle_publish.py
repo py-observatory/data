@@ -25,11 +25,14 @@ from toy_store import (
     NOVEMBER,
     PART_NOVEMBER,
     REPO,
+    ROLLUP,
     STATE,
     TOY,
+    TOY_WITH_ROLLUP,
     ToyStream,
     sealed_name,
     write_delta,
+    write_rollup,
     write_state,
 )
 
@@ -405,3 +408,107 @@ def test_cycle_end_to_end(tmp_path):
         BASE_DECEMBER,
         sealed_name("2026-12-01"),
     ]
+
+
+def test_a_derived_database_is_published_beside_the_state(tmp_path):
+    stream = ToyStream(tmp_path)
+    stream.store = TOY_WITH_ROLLUP
+    stream.seed(BASE, LAST_TWO_DAYS)
+    rollup = write_rollup(stream.folder("derived") / "kit-toy-rollup.db", 3)
+
+    stream.run("2026-11-30T12:00:00Z", [("d", "5")], derived=[rollup])
+
+    # The current release holds it beside the state and the open delta, and the
+    # manifest lists it as a public asset with no period that is not closed.
+    held = [name for name in stream.assets(CURRENT) if "swap-prev-" not in name]
+    assert held == sorted([STATE, DELTA, ROLLUP, MANIFEST])
+    manifest = stream.manifest()
+    assert [asset.name for asset in manifest.assets[:3]] == [STATE, DELTA, ROLLUP]
+    derived = manifest.assets[2]
+    assert (derived.tag, derived.role, derived.period, derived.closed) == (
+        CURRENT,
+        "public",
+        None,
+        False,
+    )
+    assert derived.tables == {"rollup": TableInfo(3, "derived")}
+    assert not_as_listed(stream) == []
+    # The month's release does not get it.
+    assert ROLLUP not in stream.assets(NOVEMBER)
+
+
+def test_publish_first_takes_a_derived_database_too(tmp_path):
+    stream = ToyStream(tmp_path)
+    workdir = stream.workdir()
+    write_state(workdir / TOY.state_db, BASE, applied_seq=2)
+    write_delta(workdir / TOY.open_delta_db, [(1, "a", "1"), (2, "b", "2")])
+    rollup = write_rollup(stream.folder("derived") / "kit-toy-rollup.db", 2)
+
+    publish_first(
+        stream.gh,
+        TOY_WITH_ROLLUP,
+        workdir,
+        today=date(2026, 11, 2),
+        moment="2026-11-02T06:00:00Z",
+        data_through=Watermark("2026-11-02", "day"),
+        cursor="2",
+        coverage={"items": 2},
+        complete=True,
+        derived=[rollup],
+    )
+
+    assert stream.assets(CURRENT) == sorted([STATE, DELTA, ROLLUP, MANIFEST])
+    assert stream.assets(NOVEMBER) == [BASE_NOVEMBER]
+    assert [asset.name for asset in stream.manifest().assets] == [
+        STATE,
+        DELTA,
+        ROLLUP,
+        BASE_NOVEMBER,
+    ]
+
+
+def test_a_derived_table_must_be_of_class_derived(tmp_path):
+    stream = ToyStream(tmp_path)
+    stream.store = TOY_WITH_ROLLUP
+    stream.seed(BASE, LAST_TWO_DAYS)
+    held = stream.github.asset_bytes(CURRENT, MANIFEST)
+    # The state is a snapshot table, so a database that holds it is not derived.
+    wrong = write_state(
+        stream.folder("derived") / "kit-toy-rollup.db", {}, applied_seq=0
+    )
+    stream.github.calls.clear()
+
+    with pytest.raises(ValueError, match="items"):
+        stream.run("2026-11-30T12:00:00Z", [("d", "5")], derived=[wrong])
+
+    assert stream.writes() == []
+    assert stream.github.asset_bytes(CURRENT, MANIFEST) == held
+
+
+def test_a_derived_asset_may_shrink_or_go_without_failing_a_gate(tmp_path):
+    stream = ToyStream(tmp_path)
+    stream.store = TOY_WITH_ROLLUP
+    stream.seed(BASE, LAST_TWO_DAYS)
+    folder = stream.folder("derived")
+    stream.run(
+        "2026-11-30T12:00:00Z",
+        [("d", "5")],
+        derived=[write_rollup(folder / "kit-toy-rollup.db", 5)],
+    )
+    assert stream.entries()[ROLLUP].tables["rollup"].rows == 5
+
+    # It loses rows, and no gate objects.
+    failures = stream.run(
+        "2026-11-30T13:00:00Z",
+        [("e", "6")],
+        derived=[write_rollup(stream.folder("derived") / "kit-toy-rollup.db", 2)],
+    )
+
+    assert failures == []
+    assert stream.entries()[ROLLUP].tables["rollup"].rows == 2
+
+    # It is left out of the next publish, and no gate objects to that either.
+    failures = stream.run("2026-11-30T14:00:00Z", [("f", "7")])
+
+    assert failures == []
+    assert ROLLUP not in stream.entries()
