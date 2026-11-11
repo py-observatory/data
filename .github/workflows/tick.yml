@@ -20,22 +20,24 @@ name: tick
 # starting a Cloud Run job that reads one day of PyPI's public BigQuery table, and
 # publishes the counts to the pypi-downloads-current release. It starts no day after 50
 # minutes (3,000 s, passed below), and starts none while the free tier or the budget says
-# to wait. That only decides whether a day starts: a day started just before the
-# deadline can wait the counter's task limit and a margin (1,800 + 300 = 2,100 s) and one
-# 30 s poll, and publishing takes a few minutes, so 3,000 + 2,100 + about 300 s is about
-# 90 minutes. The step that runs it gives up after 97 minutes, three before the job's
-# limit of 100. Its job runs in the `gcp` environment, which only main may use, and has
-# `id-token: write` for the sign-in to Google Cloud (no key): no other job of this
-# workflow has either. The catalog does not wait for it.
+# to wait. That only decides whether a day starts: a day started just before the deadline
+# can wait the counter's task limit and a margin (1,800 + 300 = 2,100 s) and one 30 s
+# poll, so the counting can last 3,000 + 2,100 + 30 s, about 86 minutes. Then the run
+# brings the serving database up to date, or rebuilds it from the published counts when it
+# cannot, compresses it at level 19 and publishes, and the deadline bounds none of that.
+# The step that runs it gives up after 97 minutes, three before the job's limit of 100,
+# which leaves about 11 minutes after the counting. Its job runs in the `gcp` environment,
+# which only main may use, and has `id-token: write` for the sign-in to Google Cloud (no
+# key): no other job of this workflow has either. The catalog does not wait for it.
 #
-# The catalog builds one serving database from what the two streams last published, and
+# The catalog builds one serving database from what the three streams last published, and
 # publishes it to the catalog-current release. It has no time budget of its own: its step
 # gives up after 57 minutes, three before the job's limit of 60. Its job waits for
-# osv-pypi, which takes half an hour at most, so that a build follows the fresh advisories,
-# and runs whether or not osv-pypi succeeded, because a stream that failed is read from
-# its last publish. It does not wait for the registry's job, which can queue for hours
-# behind the sweep, and so reads the registry's last publish. The step after the build
-# keeps the scheduled runs enabled (scripts/keepalive.sh).
+# osv-pypi, which takes half an hour at most, so that a build follows the fresh
+# advisories, and runs whether or not osv-pypi succeeded, because a stream that failed is
+# read from its last publish. It does not wait for the registry's job, which can queue for
+# hours behind the sweep or the records pass, and so reads the registry's last publish.
+# The step after the build keeps the scheduled runs enabled (scripts/keepalive.sh).
 #
 # Run a stream by hand with `bootstrap` to build its first state. The input names the one
 # stream that it is for, and is accepted only for a stream that has never published.
@@ -43,7 +45,7 @@ name: tick
 # reason. It is for the one stream that `override_for` names, and a reason with no stream
 # named overrides nothing. On a scheduled run every input is empty, so it never
 # bootstraps or overrides any stream. The first run of the catalog is a dispatch with
-# `bootstrap` set to catalog, once both streams have published.
+# `bootstrap` set to catalog, once the three streams have published.
 #
 # The order of the first runs is in streams/pypi_registry/README.md,
 # streams/osv_pypi/README.md and streams/pypi_downloads/README.md, under "On GitHub".
@@ -87,8 +89,9 @@ jobs:
     permissions:
       contents: write
       issues: write
-    # The tick and the sweep both publish pypi-registry-current, so they run one at a
-    # time. A run that is waiting is never started over one that is running.
+    # The tick and the backfill (the sweep or the records pass) both publish
+    # pypi-registry-current, so they run one at a time. A run that is waiting is never
+    # started over one that is running.
     concurrency:
       group: stream-pypi-registry
       cancel-in-progress: false
@@ -141,7 +144,7 @@ jobs:
       issues: write
     # Only this job publishes osv-pypi-current, so its runs go one at a time. A run that
     # is waiting is never started over one that is running. The group is the stream's
-    # own, so it never waits for a run of the registry, or for its sweep.
+    # own, so it never waits for a run of the registry, or for its backfill.
     concurrency:
       group: stream-osv-pypi
       cancel-in-progress: false
@@ -220,8 +223,9 @@ jobs:
         #
         # --max-seconds only decides whether a day starts. A day started just before it
         # waits for the counter's job (its task limit of 1,800 s, a margin of 300 s and
-        # one 30 s poll) and then publishes, so 3,000 + 2,100 + about 300 s is about 90
-        # minutes, inside the 97 of this step.
+        # one 30 s poll), so the counting can last 3,000 + 2,100 + 30 s, about 86 minutes.
+        # The update or rebuild of the serving database, its compression at level 19 and
+        # the publish come after it, in the 11 or so minutes left of this step's 97.
         #
         # The run exits with 2 after it has published when a day failed, a partition
         # moved or could not be checked, or the guard held the run for spend, for the
@@ -259,9 +263,9 @@ jobs:
 
   catalog:
     # It waits for osv-pypi, which is short, and not for the registry's job, which can
-    # queue for hours behind the sweep: it reads the registry's last publish, and says in
-    # its manifest how old that is. `!cancelled()` runs it after an osv-pypi that failed
-    # too, because that stream is then read from its last publish.
+    # queue for hours behind the sweep or the records pass: it reads the registry's last
+    # publish, and says in its manifest how old that is. `!cancelled()` runs it after an
+    # osv-pypi that failed too, because that stream is then read from its last publish.
     needs: osv-pypi
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
