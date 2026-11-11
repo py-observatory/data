@@ -46,10 +46,11 @@ that record, from the JSON API, for each project that may lack it, in name order
 time budget at a time, at the sweep's pace (`_record_projects`). It writes the record
 alone, and applying it marks the version as recorded (see `store.apply_delta`). A reply
 that makes no record is counted as refused and passed over, so one release that the
-parser cannot read does not stop the pass. Like the sweep, it reads no root and keeps the prior manifest's `data_through`, `cursor` and
-backlog. Its coverage says where it stopped (`records_after`) and how many projects are
-left after that (`records_left`), so that the next records run goes on from there, and
-every other run carries both on as they were.
+parser cannot read does not stop the pass. Like the sweep, it reads no root and keeps
+the prior manifest's `data_through`, `cursor` and backlog. Its coverage says where it
+stopped (`records_after`) and how many projects are left after that (`records_left`), so
+that the next records run goes on from there, and every other run carries both on as
+they were.
 
 The status pass is the daily run's. Archiving a project moves no serial, so the root
 never shows it. The downloads stream publishes the set of the most downloaded projects
