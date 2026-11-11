@@ -154,7 +154,7 @@ BUDGET=$(gcloud billing budgets list --billing-account=$ACCOUNT \
   --billing-project=$P --format='value(name)')
 gcloud billing budgets update "$BUDGET" --billing-account=$ACCOUNT \
   --billing-project=$P --credit-types-treatment=include-specified-credits \
-  --credit-types=FREE_TIER
+  --filter-credit-types=FREE_TIER
 
 # Workload Identity Federation: GitHub's OIDC tokens from this repository, on main, in the
 # gcp environment, and nothing else.

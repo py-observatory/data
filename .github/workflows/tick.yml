@@ -224,9 +224,10 @@ jobs:
         # minutes, inside the 97 of this step.
         #
         # The run exits with 2 after it has published when a day failed, a partition
-        # moved or the guard held the run for a reason other than the budget line. That
-        # fails the step on purpose: the stream's issue opens, and the first run that
-        # finds nothing wrong closes it.
+        # moved or could not be checked, or the guard held the run for spend, for the
+        # 98% stop, or for want of any budget notification in 48 hours. That fails the
+        # step on purpose: the stream's issue opens, and the first run that finds
+        # nothing wrong closes it. A hold at the budget line is normal and exits 0.
         #
         # The inputs name the stream that they are for, so this job takes `bootstrap`, and
         # the reason, only when they name pypi-downloads. On a scheduled run every input is
