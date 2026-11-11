@@ -145,16 +145,17 @@ gcloud iam service-accounts add-iam-policy-binding counter-runtime@$SA_SUFFIX --
 gcloud artifacts repositories add-iam-policy-binding counter --location=$R --project=$P \
   --member=serviceAccount:counter-deployer@$SA_SUFFIX --role=roles/artifactregistry.writer
 
-# The budget counts what is owed: Cloud Run's free tier arrives as a FREE_TIER credit, so
-# a budget that excludes every credit reports free use as spend and the stream would hold
-# for good. Promotions (a trial's credit) stay excluded, so they cannot hide a real charge.
+# The budget counts what is owed: Cloud Run's free tier arrives as a spending-based discount
+# (the DISCOUNT credit type) and other services' as FREE_TIER, so a budget that excludes every
+# credit reports free use as spend and the stream would hold for good. Promotions (a trial's
+# credit) stay excluded, so they cannot hide a real charge.
 ACCOUNT=$(gcloud billing projects describe $P --format='value(billingAccountName)')
 ACCOUNT=${ACCOUNT#billingAccounts/}
 BUDGET=$(gcloud billing budgets list --billing-account=$ACCOUNT \
   --billing-project=$P --format='value(name)')
 gcloud billing budgets update "$BUDGET" --billing-account=$ACCOUNT \
   --billing-project=$P --credit-types-treatment=include-specified-credits \
-  --filter-credit-types=FREE_TIER
+  --filter-credit-types=FREE_TIER,DISCOUNT
 
 # Workload Identity Federation: GitHub's OIDC tokens from this repository, on main, in the
 # gcp environment, and nothing else.
