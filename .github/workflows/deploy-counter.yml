@@ -1,0 +1,80 @@
+name: deploy-counter
+
+# Builds the downloads counter's image and deploys it as the Cloud Run job that the
+# stream starts, whenever the counter or this workflow changes on main, and when it is
+# dispatched by hand (the first deploy is a dispatch: see streams/pypi_downloads/README.md).
+# It deploys too when stream.toml or run.py changes, because the job's template is made
+# from stream.toml's [counter] values by run.py's counter_template, and the run takes its
+# reserve and its wait from the same values: a change merged without a deploy would leave
+# the job on its last template. Deploys run one at a time, and one that has begun is
+# never cancelled: a newer one waits for it, and replaces any older one still waiting.
+#
+# The job runs in the `gcp` environment, which only main may deploy to, and signs in as
+# the deployer service account with GitHub's OIDC token (Workload Identity Federation,
+# no key). `obskit.gcp` makes the access token, and nothing here uses gcloud. The token
+# goes to a file in the runner's temp folder, is masked in the step that writes it and
+# is removed by a step that runs whatever happened. The image is built on the runner,
+# whose linux/amd64 is what Cloud Run runs, and is named for the commit.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "streams/pypi_downloads/counter/**"
+      - "streams/pypi_downloads/stream.toml"
+      - "streams/pypi_downloads/src/pypi_downloads/run.py"
+      - ".github/workflows/deploy-counter.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: gcp
+    concurrency:
+      group: deploy-counter
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - run: uv sync --locked --package pypi-downloads
+      - name: Sign in as the deployer
+        # The values come from stream.toml, so that the workflow and the stream agree on
+        # them. The step also names the image, for the steps after it: the repository
+        # from stream.toml, and the commit as the tag. The token is written to a file and
+        # masked on the last line, and the log never shows it.
+        run: |
+          values=$(uv run --package pypi-downloads python -c '
+          import tomllib
+          with open("streams/pypi_downloads/stream.toml", "rb") as file:
+              gcp = tomllib.load(file)["gcp"]
+          print(gcp["project_number"], gcp["pool"], gcp["provider"], gcp["deployer"],
+                gcp["image_repo"])
+          ')
+          read -r number pool provider deployer image_repo <<< "$values"
+          echo "IMAGE=$image_repo:$GITHUB_SHA" >> "$GITHUB_ENV"
+          uv run --package pypi-downloads python -m obskit.gcp token \
+            --project-number "$number" --pool "$pool" --provider "$provider" \
+            --service-account "$deployer" > "$RUNNER_TEMP/token"
+          echo "::add-mask::$(cat "$RUNNER_TEMP/token")"
+      - name: Build the image
+        run: docker build -t "$IMAGE" streams/pypi_downloads/counter
+      - name: Sign in to the registry
+        run: docker login -u oauth2accesstoken --password-stdin https://us-central1-docker.pkg.dev < "$RUNNER_TEMP/token"
+      - name: Push the image
+        run: docker push "$IMAGE"
+      - name: Deploy the job
+        run: uv run --package pypi-downloads python -m pypi_downloads deploy --image "$IMAGE"
+      - name: Remove the token
+        if: always()
+        run: rm -f "$RUNNER_TEMP/token"

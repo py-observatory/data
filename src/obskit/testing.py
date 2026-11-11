@@ -1,14 +1,17 @@
-"""Fakes for tests, and texts for tests to share. FakeGitHub is the GitHub releases API
-and FakeHttp is a set of web pages that obskit.http reads, both held in memory. The
+"""Fakes for tests, and texts for tests to share. FakeGitHub is the GitHub releases API,
+FakeHttp is a set of web pages that obskit.http reads, and FakeGoogle is the Google
+Cloud APIs, all held in memory. The
 lists at the end are the texts that the tests of obskit.emails share with the tests of
 each stream that uses it."""
 
+import base64
 import itertools
 import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 _Reply = tuple[int, dict[str, str], bytes]
@@ -416,6 +419,314 @@ class FakeHttp:
             if entry.remaining == 0:
                 del entries[0]
         return entry.status, dict(entry.headers), entry.body
+
+
+@dataclass
+class _GoogleCall:
+    """A request that matched a route of FakeGoogle: its URL, headers and JSON body."""
+
+    method: str
+    url: str
+    headers: dict[str, str]
+    body: bytes | None
+
+
+class FakeGoogle:
+    """The Google Cloud APIs that `obskit.gcp` calls, held in memory, as a Transport.
+
+    The sign-in is three calls: GitHub's OIDC endpoint (at `oidc_url`), Google's STS and
+    the impersonation of a service account. Each issues a token the next one must be
+    given, and one that is not known is a 401. The impersonated tokens are named
+    "sa-token-1", "sa-token-2" and so on, in the order issued, and each one ends
+    `access_token_lifetime` seconds after it was issued, by the wall clock.
+
+    A test reads what the sign-in sent: `last_oidc_audience`, the audience asked of
+    GitHub, and `last_sts_body`, the JSON body of the latest STS request.
+    `oidc_tokens_issued` counts the OIDC tokens. `fail_next` makes a request fail.
+
+    Cloud Run, Cloud Storage, Pub/Sub and BigQuery are served from stores that a test
+    fills and reads:
+
+    - `objects` maps (bucket, name) to bytes.
+    - `jobs` maps a job's name to the template it was deployed with.
+    - `executions` is the list of Executions, newest last. `run_job` calls `on_run` with
+      the env dict of the run (name to value), and `on_run` may add to `objects`; it
+      returns the Execution to finish with, and without one a finished Execution that
+      succeeded once is used. The Execution is given a `name` when it has none.
+    - `operations` maps an operation's name to the operation, so a test can make one
+      that never finishes, or ends in an error.
+    - `messages` holds the Pub/Sub messages as JSON objects, and `pull` drains them,
+      each under a new ackId, with `publish_time` as the time it says it was published
+      at. A message pulled and not acknowledged is held back from later pulls until
+      `expire_leases`, as Pub/Sub holds it until the subscription's ack deadline, and
+      is then delivered again, first, with the time it was first given. The ackIds that
+      `acknowledge` was sent are in `acked`. An ackId whose lease has run out
+      acknowledges nothing, as Pub/Sub may ignore it.
+    - `partitions` maps a partition id (such as "20261109") to (total_rows, modified),
+      and the one BigQuery query that is served, a read of INFORMATION_SCHEMA.PARTITIONS,
+      answers with a row `[partition_id, str(total_rows), modified]` for each id it
+      lists that is held. The SQL of every query is in `queries`. Any other SQL raises
+      NotImplementedError: nothing may scan table data.
+
+    Routes are a table of (method, URL prefix, handler), tried in order, and `route`
+    adds one. A request that no route takes raises NotImplementedError, never a 404.
+    """
+
+    def __init__(self, oidc_url: str = "https://gh.example/oidc") -> None:
+        # (method, url) of every request, in order, failed ones included.
+        self.requests: list[tuple[str, str]] = []
+        self.oidc_tokens_issued = 0
+        self.access_token_lifetime = 3600
+        self.last_oidc_audience: str | None = None
+        self.last_sts_body: dict | None = None
+        self._failures: list[tuple[int, str]] = []
+        self._federated: set[str] = set()
+        self._access_tokens_issued = 0
+        self.objects: dict[tuple[str, str], bytes] = {}
+        self.jobs: dict[str, dict] = {}
+        self.executions: list[dict] = []
+        self.on_run: Callable[[dict[str, str]], dict] | None = None
+        self.operations: dict[str, dict] = {}
+        self.messages: list[dict] = []
+        self.acked: list[str] = []
+        # The messages pulled and not acknowledged, by ackId, and those whose lease has
+        # run out, to be delivered again, each with its time of publishing.
+        self._leased: dict[str, tuple[dict, str]] = {}
+        self._redelivered: list[tuple[dict, str]] = []
+        self.publish_time = "2026-11-06T07:00:00.000Z"
+        self.partitions: dict[str, tuple[int, str]] = {}
+        self.queries: list[str] = []
+        self._pulled = 0
+        self._routes: list[tuple[str, str, Callable[[_GoogleCall], _Reply]]] = []
+        self.route("GET", oidc_url, self._oidc)
+        self.route("POST", "https://sts.googleapis.com/v1/token", self._sts)
+        self.route(
+            "POST",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/",
+            self._impersonate,
+        )
+        run = "https://run.googleapis.com/v2/projects/"
+        self.route("POST", run, self._run_post)
+        self.route("PATCH", run, self._run_patch)
+        self.route("GET", run, self._run_get)
+        self.route("GET", "https://storage.googleapis.com/storage/v1/b/", self._object)
+        self.route("POST", "https://pubsub.googleapis.com/v1/projects/", self._pubsub)
+        self.route(
+            "POST", "https://bigquery.googleapis.com/bigquery/v2/projects/", self._query
+        )
+
+    def route(
+        self, method: str, url_prefix: str, handler: Callable[[_GoogleCall], _Reply]
+    ) -> None:
+        """Answer the requests that use `method` and whose URL starts with `url_prefix`
+        with `handler`, after the routes already added."""
+        self._routes.append((method, url_prefix, handler))
+
+    def fail_next(self, status: int, *, url_contains: str = "") -> None:
+        """Answer the next request whose URL contains `url_contains` (any, by default)
+        with `status` and a Google-shaped error, without carrying it out."""
+        self._failures.append((status, url_contains))
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], body: bytes | None
+    ) -> _Reply:
+        self.requests.append((method, url))
+        for index, (status, needle) in enumerate(self._failures):
+            if needle in url:
+                del self._failures[index]
+                return _reply(status, {"error": {"message": f"refused with {status}"}})
+        call = _GoogleCall(method, url, dict(headers), body)
+        for route_method, prefix, handler in self._routes:
+            if method == route_method and url.startswith(prefix):
+                return handler(call)
+        raise NotImplementedError(f"FakeGoogle has no route for {method} {url}")
+
+    def _oidc(self, call: _GoogleCall) -> _Reply:
+        query = parse_qs(urlsplit(call.url).query)
+        self.last_oidc_audience = query.get("audience", [""])[0]
+        self.oidc_tokens_issued += 1
+        return _reply(200, {"value": f"oidc-jwt-{self.oidc_tokens_issued}"})
+
+    def _sts(self, call: _GoogleCall) -> _Reply:
+        body = _json_object(call.body) or {}
+        self.last_sts_body = body
+        if not str(body.get("subjectToken", "")).startswith("oidc-jwt-"):
+            return _problem(400, "the subject token is not one that was issued")
+        token = f"sts-token-{body['subjectToken'].removeprefix('oidc-jwt-')}"
+        self._federated.add(token)
+        return _reply(200, {"access_token": token})
+
+    def _impersonate(self, call: _GoogleCall) -> _Reply:
+        bearer = call.headers.get("Authorization", "").removeprefix("Bearer ")
+        if bearer not in self._federated:
+            return _problem(401, "the federated token is not one that was issued")
+        self._access_tokens_issued += 1
+        ends = datetime.now(UTC) + timedelta(seconds=self.access_token_lifetime)
+        return _reply(
+            200,
+            {
+                "accessToken": f"sa-token-{self._access_tokens_issued}",
+                "expireTime": ends.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+
+    def _run_post(self, call: _GoogleCall) -> _Reply:
+        path, _, query = call.url.partition("?")
+        parts = path.removeprefix("https://run.googleapis.com/v2/").split("/")
+        # projects/P/locations/R/jobs/J:run, or projects/P/locations/R/jobs?jobId=J
+        if len(parts) == 6 and parts[4] == "jobs" and parts[5].endswith(":run"):
+            return self._run(call, parts[1], parts[3], parts[5].removesuffix(":run"))
+        if len(parts) == 5 and parts[4] == "jobs":
+            job = parse_qs(query).get("jobId", [""])[0]
+            return self._deploy(call, parts[1], parts[3], job, create=True)
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _run_patch(self, call: _GoogleCall) -> _Reply:
+        parts = call.url.removeprefix("https://run.googleapis.com/v2/").split("/")
+        if len(parts) == 6 and parts[4] == "jobs":
+            return self._deploy(
+                call, parts[1], parts[3], unquote(parts[5]), create=False
+            )
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _run_get(self, call: _GoogleCall) -> _Reply:
+        path, _, query = call.url.partition("?")
+        parts = path.removeprefix("https://run.googleapis.com/v2/").split("/")
+        if len(parts) == 6 and parts[4] == "jobs":
+            job = self.jobs.get(unquote(parts[5]))
+            return (
+                _google_error(404, "the job is not there")
+                if job is None
+                else _reply(200, job)
+            )
+        if len(parts) == 7 and parts[6] == "executions":
+            return self._execution_page(parse_qs(query).get("pageToken", [""])[0])
+        if len(parts) == 6 and parts[4] == "operations":
+            return self._operation(path.removeprefix("https://run.googleapis.com/v2/"))
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _operation(self, name: str) -> _Reply:
+        operation = self.operations.get(name)
+        if operation is None:
+            return _google_error(404, "the operation is not there")
+        return _reply(200, operation)
+
+    def _new_operation(self, project: str, region: str, response: dict) -> _Reply:
+        name = f"projects/{project}/locations/{region}/operations/op-{len(self.operations) + 1}"
+        self.operations[name] = {"name": name, "done": True, "response": response}
+        return _reply(200, {"name": name})
+
+    def _run(self, call: _GoogleCall, project: str, region: str, job: str) -> _Reply:
+        body = _json_object(call.body) or {}
+        containers = body.get("overrides", {}).get("containerOverrides", [{}])
+        env = {item["name"]: item["value"] for item in containers[0].get("env", [])}
+        if self.on_run is not None:
+            execution = dict(self.on_run(env))
+        else:
+            execution = {"succeededCount": 1, "failedCount": 0}
+        number = len(self.executions) + 1
+        execution.setdefault(
+            "name",
+            f"projects/{project}/locations/{region}/jobs/{job}/executions/{job}-{number}",
+        )
+        self.executions.append(execution)
+        return self._new_operation(project, region, execution)
+
+    def _deploy(
+        self, call: _GoogleCall, project: str, region: str, job: str, *, create: bool
+    ) -> _Reply:
+        if create == (job in self.jobs):
+            return _google_error(409 if create else 404, "the job is not as expected")
+        self.jobs[job] = (_json_object(call.body) or {}).get("template", {})
+        return self._new_operation(project, region, {"name": job})
+
+    def _execution_page(self, token: str) -> _Reply:
+        # Pages of two, so that a test sees the page tokens followed. The token is the
+        # index of the page's first Execution.
+        start = int(token) if token else 0
+        page = self.executions[start : start + 2]
+        reply: dict[str, object] = {"executions": page}
+        if start + 2 < len(self.executions):
+            reply["nextPageToken"] = str(start + 2)
+        return _reply(200, reply)
+
+    def _object(self, call: _GoogleCall) -> _Reply:
+        path = urlsplit(call.url).path.removeprefix("/storage/v1/b/")
+        bucket, _, name = path.partition("/o/")
+        data = self.objects.get((unquote(bucket), unquote(name)))
+        if data is None:
+            return _google_error(404, "no such object")
+        return 200, {"content-type": "application/octet-stream"}, data
+
+    def expire_leases(self) -> None:
+        """Let the lease of every message pulled and not acknowledged run out, as when
+        the subscription's ack deadline passes: the next pull delivers them again,
+        before any other message, under new ackIds."""
+        self._redelivered.extend(self._leased.values())
+        self._leased.clear()
+
+    def _pubsub(self, call: _GoogleCall) -> _Reply:
+        body = _json_object(call.body) or {}
+        if call.url.endswith(":pull"):
+            limit = body.get("maxMessages", 100)
+            batch = self._redelivered[:limit]
+            del self._redelivered[: len(batch)]
+            fresh = self.messages[: limit - len(batch)]
+            del self.messages[: len(fresh)]
+            batch += [(message, self.publish_time) for message in fresh]
+            received = []
+            for message, published in batch:
+                self._pulled += 1
+                ack_id = f"ack-{self._pulled}"
+                self._leased[ack_id] = (message, published)
+                data = base64.b64encode(json.dumps(message).encode()).decode()
+                received.append(
+                    {
+                        "ackId": ack_id,
+                        "message": {"data": data, "publishTime": published},
+                    }
+                )
+            return _reply(200, {"receivedMessages": received} if received else {})
+        if call.url.endswith(":acknowledge"):
+            for ack_id in body.get("ackIds", []):
+                self.acked.append(ack_id)
+                self._leased.pop(ack_id, None)
+            return _reply(200, {})
+        raise NotImplementedError(
+            f"FakeGoogle has no route for {call.method} {call.url}"
+        )
+
+    def _query(self, call: _GoogleCall) -> _Reply:
+        sql = (_json_object(call.body) or {}).get("query", "")
+        self.queries.append(sql)
+        if "INFORMATION_SCHEMA.PARTITIONS" not in sql:
+            raise NotImplementedError(
+                f"FakeGoogle serves no SQL but INFORMATION_SCHEMA.PARTITIONS: {sql}"
+            )
+        listed = re.findall(r"'([0-9]{8})'", sql)
+        rows = [
+            {
+                "f": [
+                    {"v": pid},
+                    {"v": str(self.partitions[pid][0])},
+                    {"v": self.partitions[pid][1]},
+                ]
+            }
+            for pid in listed
+            if pid in self.partitions
+        ]
+        return _reply(200, {"jobComplete": True, "rows": rows})
+
+
+def _google_error(status: int, message: str) -> _Reply:
+    """An error reply shaped like Google's: an `error` with a message."""
+    return _reply(status, {"error": {"message": message}})
 
 
 # ---- Texts for the tests of obskit.emails, and of every stream that uses it.
