@@ -6,7 +6,7 @@ How many times each PyPI project was downloaded on each UTC day, counted from Py
 
 Counting a day means reading the whole of its partition, which is too much for a runner. So the work is done by a Cloud Run job, the counter (`counter/`), that reads one day through the BigQuery Storage Read API and hands the day over as a small file in a bucket. The stream starts the counter, takes the file, and publishes it.
 
-- `pypi-downloads-current` holds the state (`pypi-downloads-state.db.zst`), the open delta (`pypi-downloads-delta-open.db.zst`) and `manifest.json`.
+- `pypi-downloads-current` holds the state (`pypi-downloads-state.db.zst`), the open delta (`pypi-downloads-delta-open.db.zst`), the serving database (`pypi-downloads-serving.db.zst`, see "The serving database") and `manifest.json`.
 - `pypi-downloads-month-YYYY-MM` holds the state as the month began, the delta of each day that had a run, and once the month is over, the month's deltas merged into one database and the month's manifest. Its assets are never replaced.
 
 Every counted day, whether it was due or part of the backfill, goes into the run's open delta, so each day is published in the month in which it was counted. Each row carries its `day`, so a reader loses nothing.
@@ -26,6 +26,28 @@ The history class of each table is in `stream.toml`.
 - `spend` (state, snapshot): for each billing month, the cost and the budget that the newest budget notification reported, and when it was sent.
 - `clearances` (state, snapshot): for each billing month whose spend a person has cleared, the `cost` that was cleared, the `reason` they gave and `cleared_at` (see "Clearing a spend hold").
 - `counts` (delta only, append): `project_id`, `day`, `downloads` and `mirror_downloads`, keyed by the project and the day. The state holds no counts: they are in the deltas and in the months' merged databases. A day counted twice in one month would break the merge loudly, and so cannot be counted twice without notice.
+
+### The serving database
+
+The counts grow to tens of gigabytes as the backfill goes back, far more than a reader should fetch. `pypi-downloads-serving.db.zst` holds what readers need of them. It is a public asset of `pypi-downloads-current` with no period, every table of class `derived`, and it comes with every publish, the bootstrap's included. It is not part of the state: it is made from the state and the counts, and can always be made again from them. Months are numbered `year * 100 + month`, and days as the state numbers them.
+
+- `folded`: each day whose counts the other tables hold, with its `seq`. It is always exactly the state's `days`.
+- `months`: for each month, how many of its days are folded (`days`), and their `downloads` and `mirror_downloads`.
+- `monthly`: each project's `downloads` and `mirror_downloads` in each month.
+- `recent`: each project's counts on the folded days from 29 days before the newest folded day on, so 30 days when none is missing.
+- `top_set`: for each `year`, the projects whose daily counts are kept, with their `name`, the month at whose close each `entered` the year's set, and its `rank` at that close.
+- `daily`: the daily counts that are kept of the projects of `top_set`.
+
+These rules decide what it holds:
+
+1. `monthly` and `months` sum the counts of every folded day, and `months.days` is how many days of the month are folded.
+2. `recent` holds the counts of each folded day that is at most 29 days before the newest folded day.
+3. A month closes at the first instant (UTC) of the month after it, and each month from the launch month on closes once it is over. At the close, projects are ranked by their downloads less mirror downloads over the days of the month that were counted before it closed, highest first and ties by name, and the first 15,000 whose sum is above zero are the close's set, ranked from 1. Each of them that is not yet in the set of the year in which the close falls enters it, with the month and its rank. December's close falls in the next year, so it starts that year's set. The ranking takes a calendar month of 28 to 31 days, rather than the last 30, because `monthly` holds its sums already and a month is what the site shows.
+4. `daily` holds a project's counts of a day when the project is in the set of the day's year, and either it entered at that year's first close, or the day was counted at or after the close at which it entered. So a project that enters keeps its daily counts for the rest of the year from its entry on, and the first members of a year keep every day of it.
+
+Daily counts cover only the top 15,000 of each year, from the launch year on, and are never the whole of PyPI. Years before launch have no set, so their days have monthly totals only.
+
+Each run brings it up to date before it publishes. It takes the prior one from the current release. It closes each month that has ended since the last run, before it folds anything counted after the month's end, so that a close ranks just the days counted before it. Then it folds the days that the state holds and it does not, from the open delta, and checks the database against the state. It is made again instead, from the published parts that hold the counts (each month's merged database, and the sealed deltas of the months not yet merged) and the open delta, when the prior manifest lists no serving database, when the release does not hold it with the bytes that the manifest gives (as after a publish that stopped part way, which the next publish repairs) or it lacks a table of the schema, when a day to fold is not in the open delta, when the database disagrees with the state, and at 2026's first close on 2026-12-01, whose first members keep days that were folded before it. The parts are read one at a time: a part that the run did not make itself is downloaded only when it is read, and deleted before the next, so a rebuild never needs every part on disk at once, though it downloads each part twice. A database made again that still disagrees with the state stops the run before it publishes anything. The run's report says whether the database was `updated` or `rebuilt` (`serving`), and why it was rebuilt (`serving_reason`). The manifest's coverage gives `window_days`, how many folded days `recent` holds, `top_year`, the newest year with a set (null before the first close), and `top_set`, how many projects that year's set holds.
 
 ## The counts file
 
@@ -63,7 +85,7 @@ Before it starts each day, the run asks the guard, which holds the run in these 
 
 The usage is taken from Cloud Run itself: the vCPU- and GiB-seconds of every execution of the job that started this billing month, which includes executions of runs that died. The bytes read are summed from the days counted this month. Each Read API session is limited to one day's partition.
 
-The budget counts the free tier's credit and no other: Cloud Run's free tier arrives as a credit, so a budget that excludes every credit reports free use as spend, and the stream would hold. Promotions stay excluded, so that a trial's credit cannot hide a real charge. The setup under "Google Cloud" sets this.
+The budget counts two kinds of credit, FREE_TIER and DISCOUNT, and no other. Cloud Run books its free tier as a spending-based discount, of the type DISCOUNT, and other services book theirs as FREE_TIER, so a budget that leaves either out reports free use as spend, and the stream would hold. Promotions stay excluded, so that a trial's credit cannot hide a real charge. The setup under "Google Cloud" sets this.
 
 The budget's notifications come from a Pub/Sub subscription, `budget-alerts-pull`, which each run reads. The newest one of the month is kept in the `spend` table, and a message is acknowledged only once its spend is published.
 
@@ -240,5 +262,5 @@ An override is a dispatch of `tick.yml` that names the stream in `override_for` 
 ## In this folder
 
 - `stream.toml`: the stream's id, its upstream, each table with its history class, and the `[gcp]` and `[counter]` values that the run, the deploy and the workflows read.
-- `src/pypi_downloads/`: the stream. `plan.py` says which days are due and holds the budget guard, `counts.py` reads and checks a counts file, `store.py` holds the databases, and `run.py` is the run and its command line.
+- `src/pypi_downloads/`: the stream. `plan.py` says which days are due and holds the budget guard, `counts.py` reads and checks a counts file, `store.py` holds the databases, `serving.py` keeps the serving database, and `run.py` is the run and its command line.
 - `counter/`: the Cloud Run job, with its own `pyproject.toml`, `uv.lock` and `Dockerfile`. It is not a member of the workspace, and it never imports the stream's code or the kit.

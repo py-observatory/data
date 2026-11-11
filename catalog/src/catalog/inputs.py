@@ -34,32 +34,23 @@ from pathlib import Path
 from catalog.config import StreamAdmission
 from obskit.github import GitHub, GitHubError
 from obskit.manifest import Asset, Manifest
+from obskit.parts import (
+    DAY,
+    MONTH,
+    SQLITE,
+    PeriodlessPartError,
+    coarsest_parts,
+    last_month,
+    order_key,
+    period_of,
+)
 from obskit.release import PriorStateError, fetch_manifest
 from obskit.tags import current_tag
-
-_SQLITE = "sqlite+zstd"
-# How long each shape of a period is, as obskit.cycle tells a day from the others.
-_YEAR = len("YYYY")
-_MONTH = len("YYYY-MM")
-_DAY = len("YYYY-MM-DD")
 
 
 class InputError(ValueError):
     """A stream's manifest does not list what the catalog needs of it, or lists it in a
     way that leaves the catalog unable to tell which entry is meant."""
-
-
-def _period(asset: Asset) -> str:
-    """The period of `asset`, and an empty string for an asset with none, which is no
-    year, month or day."""
-    return asset.period or ""
-
-
-def _order(asset: Asset) -> tuple[str, str]:
-    """How the catalog puts assets in order: by period, and by name for equal periods.
-    As the shorter text comes first, a year comes before its months, and a month before
-    its days."""
-    return _period(asset), asset.name
 
 
 def _only(manifest: Manifest, found: list[Asset], what: str) -> Asset | None:
@@ -101,55 +92,29 @@ def _state(manifest: Manifest) -> Asset:
 def _open_delta(manifest: Manifest) -> Asset | None:
     """The open delta: the asset of the current release with the role state and a day
     for its period, or None when there is none. Raises InputError for more than one."""
-    found = [a for a in _in_current(manifest) if len(_period(a)) == _DAY]
+    found = [a for a in _in_current(manifest) if len(period_of(a)) == DAY]
     return _only(manifest, found, "open delta")
 
 
-def _delta_parts(
+def _coarsest_delta_parts(
     manifest: Manifest, wanted: frozenset[str], assets: list[Asset]
 ) -> list[Asset]:
-    """The delta parts among `assets`: the sqlite assets that hold a table of `wanted`,
-    which are the admitted tables that the state lacks.
+    """The delta parts among `assets` that `obskit.parts.coarsest_parts` chooses: the
+    sqlite assets that hold a table of `wanted`, which are the admitted tables that the
+    state lacks.
 
     Raises InputError for a part with no period, which could be neither put in order
     nor matched with the part that replaces it.
     """
-    parts = [
-        a for a in assets if a.format == _SQLITE and not wanted.isdisjoint(a.tables)
-    ]
-    for part in parts:
-        if part.period is None:
-            raise InputError(
-                f"{part.tag}/{part.name} in the manifest of {manifest.stream} holds a "
-                "table of the delta but has no period, so where it falls in the "
-                "stream's history is not known"
-            )
-    return parts
-
-
-def _coarsest(parts: list[Asset]) -> list[Asset]:
-    """`parts` without the days that a closed month part covers and the months that a
-    closed year part covers, so that each row is read from one part.
-
-    A part that is not closed can still change, so it covers nothing. What a closed part
-    covers is told from the closed parts of `parts` as they are given, and not from those
-    that are left, so a day goes with its month, and the month with its year.
-    """
-    closed = {_period(part) for part in parts if part.closed}
-
-    def covered(period: str) -> bool:
-        if len(period) == _DAY:
-            return period[:_MONTH] in closed
-        if len(period) == _MONTH:
-            return period[:_YEAR] in closed
-        return False
-
-    return [part for part in parts if not covered(_period(part))]
-
-
-def _last_month(period: str) -> str:
-    """The month, as YYYY-MM, in which `period` ends. A year ends in December."""
-    return f"{period}-12" if len(period) == _YEAR else period[:_MONTH]
+    try:
+        return coarsest_parts(assets, wanted)
+    except PeriodlessPartError as error:
+        part = error.asset
+        raise InputError(
+            f"{part.tag}/{part.name} in the manifest of {manifest.stream} holds a "
+            "table of the delta but has no period, so where it falls in the "
+            "stream's history is not known"
+        ) from error
 
 
 def needed_assets(manifest: Manifest, tables: frozenset[str]) -> list[Asset]:
@@ -159,15 +124,15 @@ def needed_assets(manifest: Manifest, tables: frozenset[str]) -> list[Asset]:
 
     A delta part is a sqlite asset that holds an admitted table that the state lacks
     (see the top of this module). A closed month part stands for the sealed deltas of its
-    month, and a closed year part for the parts of its months (see `_coarsest`).
+    month, and a closed year part for the parts of its months (see `coarsest_parts`).
 
     Raises InputError when the manifest lists no state, when an admitted table is held by
     none of the assets chosen, and when a delta part has no period.
     """
     state = _state(manifest)
     own = set(state.tables)
-    parts = _coarsest(_delta_parts(manifest, tables - own, manifest.assets))
-    needed = [*([state] if tables & own else []), *sorted(parts, key=_order)]
+    parts = _coarsest_delta_parts(manifest, tables - own, manifest.assets)
+    needed = [*([state] if tables & own else []), *parts]
     held = {table for asset in needed for table in asset.tables}
     missing = sorted(tables - held)
     if missing:
@@ -230,7 +195,7 @@ def open_day(manifest: Manifest) -> date | None:
     Raises InputError when it lists more than one.
     """
     delta = _open_delta(manifest)
-    return None if delta is None else date.fromisoformat(_period(delta))
+    return None if delta is None else date.fromisoformat(period_of(delta))
 
 
 def sealed_through(manifest: Manifest) -> date | None:
@@ -284,20 +249,17 @@ def pin_assets(manifest: Manifest, tables: frozenset[str], day: date) -> list[As
     sealed = [
         a
         for a in created
-        if a.format == _SQLITE
-        and len(_period(a)) == _DAY
-        and _period(a)[:_MONTH] == month
-        and _period(a) <= last
+        if a.format == SQLITE
+        and len(period_of(a)) == DAY
+        and period_of(a)[:MONTH] == month
+        and period_of(a) <= last
     ]
     # Parts that reach into `day`'s month or past it cannot cover what is before it, so
     # they are set aside before the coarsest of the rest are chosen. When `tables` holds
     # no table of the delta, no asset is a delta part, and so none is named.
-    before = [
-        part
-        for part in _delta_parts(manifest, tables - own, created)
-        if _last_month(_period(part)) < month
-    ]
-    return sorted([base, *sealed, *_coarsest(before)], key=_order)
+    before = [a for a in created if last_month(period_of(a)) < month]
+    parts = _coarsest_delta_parts(manifest, tables - own, before)
+    return sorted([base, *sealed, *parts], key=order_key)
 
 
 def asset_url(repo: str, asset: Asset) -> str:

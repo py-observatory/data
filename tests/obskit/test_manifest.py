@@ -753,3 +753,16 @@ def test_instant_is_utc_to_the_second(moment, written):
     # A manifest accepts it as the time that it was made.
     m = replace(sample(), generated_at=instant(moment))
     assert loads(dumps(m)) == m
+
+
+def test_current_asset_finds_an_asset_by_name():
+    serving = replace(state_asset(), name="serving.db.zst", role="public")
+    # Same name in a month's release, which is not the current one.
+    old = replace(serving, tag="example-month-2026-11", period="2026-11", closed=True)
+    m = replace(with_assets(state_asset(), old, serving), stream="example")
+
+    assert manifest.current_asset(m, "serving.db.zst") == serving
+    assert manifest.current_asset(m, "state.db.zst") == state_asset()
+    assert manifest.current_asset(m, "absent.db.zst") is None
+    # An asset of the month's release alone is not a current asset.
+    assert manifest.current_asset(replace(m, assets=[old]), "serving.db.zst") is None

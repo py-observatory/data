@@ -45,7 +45,7 @@ import os
 import shutil
 import sqlite3
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from datetime import date
@@ -69,7 +69,7 @@ from obskit.release import (
     prepare_asset,
     publish_current,
 )
-from obskit.sqlite import consolidate, diff_tables, open_db
+from obskit.sqlite import consolidate, diff_tables, open_db, table_counts
 from obskit.tags import current_tag, month_tag
 from obskit.zst import sha256_file
 
@@ -487,11 +487,32 @@ def roll_over(
     return [asset for _, asset in added]
 
 
+def _require_derived(store: Store, derived: Sequence[Path]) -> None:
+    """Raise ValueError unless every table of each database in `derived` is of class
+    derived. The gates skip derived tables, so a table of another class kept there
+    would lose rows unchecked."""
+    for db in derived:
+        wrong = [
+            table for table in table_counts(db) if store.classes.get(table) != "derived"
+        ]
+        if wrong:
+            raise ValueError(
+                f"{db} has tables that are not of class derived: {', '.join(wrong)}"
+            )
+
+
 def prepare_current(
-    store: Store, workdir: Path, today: date
+    store: Store, workdir: Path, today: date, derived: Sequence[Path] = ()
 ) -> tuple[list[Path], list[Asset]]:
     """Compress the state and the open delta, which is today's, for the current
-    release. Returns their files and their entries."""
+    release. Returns their files and their entries.
+
+    Each database in `derived` follows them, as a public asset of the current release
+    with no period that is not closed. Its tables must all be of class derived
+    (ValueError otherwise, before anything is compressed), because it is not part of
+    the state that a replay rebuilds and no gate holds it to its rows.
+    """
+    _require_derived(store, derived)
     tag = current_tag(store.stream)
     state = prepare_asset(
         workdir / store.state_db, workdir, tag=tag, role="state", classes=store.classes
@@ -504,7 +525,14 @@ def prepare_current(
         classes=store.classes,
         period=today.isoformat(),
     )
-    return [state[0], delta[0]], [state[1], delta[1]]
+    extra = [
+        prepare_asset(db, workdir, tag=tag, role="public", classes=store.classes)
+        for db in derived
+    ]
+    return (
+        [state[0], delta[0], *(path for path, _ in extra)],
+        [state[1], delta[1], *(asset for _, asset in extra)],
+    )
 
 
 def build_manifest(
@@ -592,18 +620,20 @@ def publish(
     allowed_shrink: dict[str, int],
     extra: list[GateFailure],
     override_reason: str | None,
+    derived: Sequence[Path] = (),
 ) -> list[GateFailure]:
     """Publish the state that a run left in `workdir`: the end of every run that goes
     on from a published state.
 
-    It compresses the state and the open delta, writes the manifest (see
+    It compresses the state and the open delta, and the databases of `derived` tables
+    (see `prepare_current`), writes the manifest (see
     `build_manifest`) from them, the closed assets of `prior` and the `added` entries
     of the rollover, checks it against `prior` (see `gate`), and swaps the files and
     the manifest into the current release. Returns the failures that `override_reason`
     overrode, and raises GateError for any that it did not, before anything is
     published.
     """
-    files, current = prepare_current(store, workdir, today)
+    files, current = prepare_current(store, workdir, today, derived)
     closed = [asset for asset in prior.assets if asset.closed]
     manifest = build_manifest(
         store,
@@ -640,11 +670,13 @@ def publish_first(
     coverage: dict,
     complete: bool,
     series_breaks: list[dict] | None = None,
+    derived: Sequence[Path] = (),
 ) -> None:
     """Publish a stream's first state, which its first run left in `workdir` with the
     open delta.
 
-    Both are compressed, and the state is copied as the base of today's month and
+    Both are compressed, with the databases of `derived` tables (see
+    `prepare_current`), and the state is copied as the base of today's month and
     added to the month's release. Then both are swapped into the current release,
     which is created, with a manifest that has no prior (see `build_manifest`).
     `series_breaks` starts the manifest's log of series breaks, for a stream that
@@ -656,7 +688,7 @@ def publish_first(
     added before `publish_current` refuses a current release that holds a state
     already (PriorStateError).
     """
-    files, current = prepare_current(store, workdir, today)
+    files, current = prepare_current(store, workdir, today, derived)
     # The first run starts today's month with a base copy, as plan_rollover says.
     base = _base_copy(store, workdir, current[0], (today.year, today.month))
     _add_create_once(gh, store, [base])

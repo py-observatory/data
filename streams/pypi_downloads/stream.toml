@@ -15,6 +15,13 @@ breaks = "append"
 spend = "snapshot"
 clearances = "snapshot"
 counts = "append"
+# The serving database, which is made from the state and the counts.
+folded = "derived"
+months = "derived"
+monthly = "derived"
+top_set = "derived"
+daily = "derived"
+recent = "derived"
 
 [gcp]
 project = "py-observatory"
