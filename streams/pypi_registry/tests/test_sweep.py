@@ -69,9 +69,10 @@ def applied(stream: Stream) -> int:
 
 
 def report_of(**counted: int) -> RunReport:
-    """The report of a run that counted `counted`, and 0 of the rest."""
+    """The report of a sweep that counted `counted`, and 0 of the rest. A sweep makes no
+    status pass."""
     zeros = {field.name: 0 for field in dataclasses.fields(RunReport)}
-    return RunReport(**{**zeros, "gate_failures": [], **counted})
+    return RunReport(**{**zeros, "gate_failures": [], "status": None, **counted})
 
 
 def test_sweep_marks_projects_swept_with_inexact_files(tmp_path):
@@ -148,6 +149,7 @@ def test_sweep_marks_projects_swept_with_inexact_files(tmp_path):
         "bootstrap_at": BOOTSTRAP,
         "records_after": None,
         "records_left": None,
+        "status_slice": 0,
     }
     assert manifest.complete is True
     assert manifest.generated_at == SWEPT_AT

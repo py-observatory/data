@@ -9,7 +9,8 @@ afterwards, with `store.apply_delta`, as a replay of the month's deltas does.
 `process_new`, `process_changed` and `process_unswept` are the steps for one project,
 and are public so that the sweep can share them. `record_current` is the step of the
 records pass, which reads the record of a project's current release when the state
-holds that version without one.
+holds that version without one. `process_status` is the step of the status pass, which
+records a change of a project's status, and `process_changed` takes it too.
 
 Every row of a delta is replayed into the state and published in a monthly part that is
 never replaced, so a row written in error is there for good. Each rule below keeps one
@@ -381,23 +382,40 @@ def process_unswept(
     ctx.swept += 1
 
 
+def process_status(
+    ctx: Context, name: str, incarnation: int, status: str, page: ProjectPage
+) -> bool:
+    """Write `status_changed`, with the page's status as its detail, when the page of a
+    swept project shows another status than `status`, and say whether it did.
+
+    `status` is the project's status as the rows written so far leave it. This is the
+    status step of `process_changed`, and all that the run's status pass writes for a
+    page that it re-reads: the pass reads projects whose serial has not moved, because
+    archiving a project moves no serial, so nothing else would see it.
+    """
+    if page.status == status:
+        return False
+    ctx.delta.event(Event(name, incarnation, "status_changed", detail=page.status))
+    return True
+
+
 def process_changed(
     ctx: Context, name: str, incarnation: int, status: str, page: ProjectPage
 ) -> None:
     """Record how the page of a swept project differs from the state.
 
     `status` is the project's status as the rows written so far leave it. A page with
-    another status writes `status_changed`. A file that the state lacks is written as
-    exact, since it is seen as it comes, and a stored file that the page lacks is a
-    `file_removed` event. A file whose yank or reason changed is a `yanked` or
-    `unyanked` event. Each version that the state has not seen gets its record.
+    another status writes `status_changed` (see `process_status`). A file that the
+    state lacks is written as exact, since it is seen as it comes, and a stored file
+    that the page lacks is a `file_removed` event. A file whose yank or reason changed
+    is a `yanked` or `unyanked` event. Each version that the state has not seen gets
+    its record.
 
     Raises ValueError for a quarantined page, before anything is written: it lists no
     files, and a diff of it would remove every stored one.
     """
     changes = diff_files(_stored_files(ctx.state, name, incarnation), page)
-    if page.status != status:
-        ctx.delta.event(Event(name, incarnation, "status_changed", detail=page.status))
+    process_status(ctx, name, incarnation, status, page)
     for info in changes.added:
         ctx.delta.file(name, incarnation, info, exact=True)
     for filename in changes.removed:

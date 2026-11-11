@@ -21,7 +21,7 @@ from obskit.manifest import Asset, TableInfo, Watermark
 from obskit.release import CreateOnceError, PriorStateError
 from obskit.sqlite import table_counts
 from obskit.zst import compress_file, sha256_file
-from pypi_registry.run import GateError, RunReport, StaleRootError, main
+from pypi_registry.run import GateError, RunReport, StaleRootError, StatusReport, main
 from pypi_registry.simple import ACCEPT, ROOT_URL, project_url
 from run_helpers import (
     BASE_DECEMBER,
@@ -150,6 +150,8 @@ def test_bootstrap_publishes_state_base_and_manifest(tmp_path, monkeypatch):
         # No records run has run, so nothing is known of what the pass has left.
         "records_after": None,
         "records_left": None,
+        # The status pass starts from the first slice.
+        "status_slice": 0,
     }
     # The bootstrap read no page, so every project is unswept, and until a sweep has read
     # them the data is not complete.
@@ -244,9 +246,16 @@ def test_second_run_records_changes(tmp_path):
         "bootstrap_at": "2026-11-02T06:00:00Z",
         "records_after": None,
         "records_left": None,
+        "status_slice": 0,
     }
     # The run left no project to the next one, but two are still unswept.
     assert manifest.complete is False
+    # The downloads stream has not published, so the status pass has no set to read:
+    # the run goes on without it, and leaves the slice to the next run.
+    skipped = (
+        f"{REPO} has no release pypi-downloads-current, so the stream pypi-downloads "
+        "has never published"
+    )
     assert report == RunReport(
         new=0,
         changed=1,
@@ -257,6 +266,7 @@ def test_second_run_records_changes(tmp_path):
         swept=1,
         remaining=0,
         gate_failures=[],
+        status=StatusReport(slot=0, members=0, read=0, changed=0, skipped=skipped),
     )
 
 
@@ -368,6 +378,7 @@ def test_month_close_builds_month_part_and_new_base(tmp_path):
         "bootstrap_at": "2026-11-27T06:00:00Z",
         "records_after": None,
         "records_left": None,
+        "status_slice": 0,
     }
 
     stream.run(

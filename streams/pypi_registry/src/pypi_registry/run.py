@@ -13,7 +13,9 @@ the stored cursor, which is a stale copy, before it writes anything. Then:
    refuses to go on unless that equals the state. Only then does it merge the deltas
    into the month's part, and copy the state as the base of the new month.
 2. It processes each project that the root gives work for (`process.process_projects`),
-   writing what it learns to the open delta, until its time is up.
+   writing what it learns to the open delta, until its time is up. In what time is
+   left, it re-reads the pages of one slice of the most downloaded projects and records
+   any change of status (the status pass, `_status_pass`).
 3. It applies the delta to the state with `store.apply_delta`, as a restore does.
 4. It writes the manifest, checks it against the prior one with the publish gates, and
    swaps the state, the open delta and the manifest into the current release.
@@ -47,6 +49,13 @@ sweep, it reads no root and keeps the prior manifest's `data_through`, `cursor` 
 backlog. Its coverage says where it stopped (`records_after`) and how many projects are
 left after that (`records_left`), so that the next records run goes on from there, and
 every other run carries both on as they were.
+
+The status pass is the daily run's. Archiving a project moves no serial, so the root
+never shows it. The downloads stream publishes the set of the most downloaded projects
+in its serving database (`top_names`), and each daily run re-reads the pages of one of
+SLICES slices of it (`in_slot`). The coverage's `status_slice` is the slice that the next
+pass reads: a daily run that reads its slice to the end moves it on, and every other
+run, the sweep and the records run among them, carries it on as it was.
 
 A manifest says that the data is `complete` when neither is left: no project to the next
 daily run, and none unswept. That holds for every run, so the bootstrap, which has read
@@ -85,16 +94,18 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from pathlib import Path
 
 from obskit.gates import GateError, GateFailure, check
-from obskit.github import GitHub
+from obskit.github import GitHub, GitHubError
 from obskit.http import Http
 from obskit.manifest import (
     Asset,
     Manifest,
     ManifestError,
     Watermark,
+    current_asset,
     dumps,
     instant,
     loads,
@@ -104,6 +115,7 @@ from obskit.release import (
     PriorStateError,
     add_create_once,
     fetch_assets,
+    fetch_manifest,
     fetch_prior,
     prepare_asset,
     publish_current,
@@ -129,6 +141,7 @@ from pypi_registry.process import (
     get_page,
     get_root,
     process_projects,
+    process_status,
     process_unswept,
     record_current,
 )
@@ -172,10 +185,40 @@ _ACTIVE = f"status NOT IN ({', '.join('?' * len(INACTIVE))})"
 # came to the end of the list, and how many projects that may lack a record come after
 # it.
 _RECORDS_PROGRESS = ("records_after", "records_left")
+# The slices of the most downloaded projects that the status pass reads, one in each
+# daily run that reads its slice to the end. GitHub fires two or three of the tick's
+# four scheduled runs a day, so each project is read again about once a week.
+SLICES = 16
+# The stream that publishes the set of the most downloaded projects, and the asset of
+# its current release that holds the set, in its table top_set.
+_DOWNLOADS = "pypi-downloads"
+_SERVING_ASSET = "pypi-downloads-serving.db.zst"
+# The names of the newest year's set, in name order.
+_TOP_NAMES = """
+SELECT name FROM top_set WHERE year = (SELECT max(year) FROM top_set) ORDER BY name
+"""
 
 
 class StaleRootError(RuntimeError):
     """The Simple API root is older than the state: its serial is below the cursor."""
+
+
+@dataclass(frozen=True)
+class StatusReport:
+    """What the status pass of a daily run did.
+
+    `slot` is the slice of the most downloaded projects that it read (see `in_slot`).
+    `members` counts the projects of the set in that slice that the state holds and
+    that are neither removed nor quarantined, `read` the pages of them that it asked
+    for, and `changed` the `status_changed` events that it wrote. `skipped` says why
+    the pass read nothing when the set could not be read, and is None otherwise.
+    """
+
+    slot: int
+    members: int
+    read: int
+    changed: int
+    skipped: str | None
 
 
 @dataclass(frozen=True)
@@ -206,7 +249,8 @@ class RunReport:
     is not the `remaining` of the manifest's coverage, which is always what the last
     daily run left to the next one. `requests` counts the requests to PyPI, the retries
     among them. `gate_failures` lists the failures that a person overrode, and is empty
-    when no gate failed.
+    when no gate failed. `status` is what the status pass did, and is None for a
+    bootstrap and a sweep, which make none.
     """
 
     new: int
@@ -218,6 +262,7 @@ class RunReport:
     swept: int
     remaining: int
     gate_failures: list[GateFailure]
+    status: StatusReport | None = None
 
 
 def _stream_toml() -> dict:
@@ -572,12 +617,25 @@ def _removals(delta: sqlite3.Connection, *, after_seq: int) -> int:
     return count
 
 
-def _records_progress(prior: Manifest | None) -> dict:
-    """The records pass's progress as the coverage of the prior manifest gives it, for a
-    run that carries it on. A key that the coverage lacks, as a manifest from before any
-    records run does, is null: nothing is known of what is left."""
+def _status_slice(coverage: dict) -> int:
+    """The slice that the next status pass reads, as `coverage` gives it as
+    `status_slice`. It is the first when the coverage gives none, as before the first
+    status pass, or gives a value that is not a slice."""
+    value = coverage.get("status_slice")
+    return value if type(value) is int and 0 <= value < SLICES else 0
+
+
+def _progress(prior: Manifest | None) -> dict:
+    """Where the records pass and the status pass stand, as the coverage of the prior
+    manifest gives it, for a run that carries it on. A records key that the coverage
+    lacks, as a manifest from before any records run does, is null: nothing is known of
+    what is left. The status pass's slice is the first when the coverage gives none
+    (see `_status_slice`)."""
     coverage = prior.coverage if prior else {}
-    return {key: coverage.get(key) for key in _RECORDS_PROGRESS}
+    return {
+        **{key: coverage.get(key) for key in _RECORDS_PROGRESS},
+        "status_slice": _status_slice(coverage),
+    }
 
 
 def _coverage(state: sqlite3.Connection, remaining: int, progress: dict) -> dict:
@@ -585,9 +643,11 @@ def _coverage(state: sqlite3.Connection, remaining: int, progress: dict) -> dict
     nor quarantined, which are the ones that the sweep reads, and `swept` and
     `unswept` split them by whether their page has been read in full. `remaining`
     counts the projects that the last daily run left to the next one, which a sweep
-    carries on, and `bootstrap_at` is when the state was first built. `progress` is the
-    records pass's place and what it has left after it, which a records run sets and
-    every other run carries on (see `_records_progress`)."""
+    carries on, and `bootstrap_at` is when the state was first built. `progress` is
+    where the records pass and the status pass stand: the records pass's place and what
+    it has left after it, which a records run sets, and the slice that the next status
+    pass reads, which a daily run sets. Every other run carries each on (see
+    `_progress`)."""
     projects, swept = state.execute(
         f"SELECT count(*), coalesce(sum(swept), 0) FROM projects WHERE {_ACTIVE}",
         INACTIVE,
@@ -616,8 +676,10 @@ def _apply_run(
     the rows above it are the run's. Returns the number of `removed` events among them,
     and what the state covers once they are applied (see `_coverage`), where `remaining`
     is the projects that the last daily run left to the next one: this run's own for a
-    daily run, and the prior manifest's for a sweep and a records run. `progress` is the
-    records pass's: its own for a records run, and the prior manifest's for the others.
+    daily run, and the prior manifest's for a sweep and a records run. `progress` is
+    where the records pass and the status pass stand: a records run gives its own place
+    in the records pass, a daily run its own slice of the status pass, and each gives
+    the prior manifest's for the other.
     """
     conn.commit()
     removals = _removals(conn, after_seq=applied)
@@ -757,10 +819,15 @@ def _publish(
 
 
 def _report(
-    processed: ProcessReport, *, requests: int, failures: list[GateFailure]
+    processed: ProcessReport,
+    *,
+    requests: int,
+    failures: list[GateFailure],
+    status: StatusReport | None = None,
 ) -> RunReport:
     """The report of a run that processed projects: the counts of `processed`, the
-    `requests` that it made and the gate `failures` that were overridden."""
+    `requests` that it made, the gate `failures` that were overridden and what its
+    status pass did, when it made one."""
     return RunReport(
         new=processed.new,
         changed=processed.changed,
@@ -771,6 +838,7 @@ def _report(
         swept=processed.swept,
         remaining=processed.remaining,
         gate_failures=failures,
+        status=status,
     )
 
 
@@ -800,7 +868,7 @@ def _bootstrap(
         ]
         state.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", meta)
         state.commit()
-        coverage = _coverage(state, remaining=0, progress=_records_progress(None))
+        coverage = _coverage(state, remaining=0, progress=_progress(None))
     open_db(workdir / OPEN_DELTA_DB, DELTA_SCHEMA, create=True).close()
     files, current = _prepare_current(workdir, today)
     # The first run starts today's month with a base copy, as plan_rollover says.
@@ -830,6 +898,153 @@ def _bootstrap(
     )
 
 
+# ---- the status pass
+
+
+def in_slot(name: str, slot: int) -> bool:
+    """Whether the project `name` is in the slice `slot` of the status pass: the first
+    eight bytes of the sha256 of its name, as a number, modulo SLICES. The hash spreads
+    the names evenly over the slices, and a name keeps its slice from run to run and
+    from one year's set to the next."""
+    return int.from_bytes(sha256(name.encode()).digest()[:8], "big") % SLICES == slot
+
+
+def _read_top_names(path: Path) -> list[str]:
+    """The names of the newest year's set in the serving database at `path`, in name
+    order. The database is data from outside, so it is opened read-only and read with
+    plain SQL. Raises ValueError for a file that SQLite cannot read, for one with no
+    table of the sets, and for a name that is not text."""
+    try:
+        with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as db:
+            names = [name for (name,) in db.execute(_TOP_NAMES)]
+    except sqlite3.Error as error:
+        raise ValueError(
+            f"{path.name} cannot be read for the most downloaded projects: {error}"
+        ) from error
+    if not all(isinstance(name, str) for name in names):
+        raise ValueError(f"the top_set of {path.name} holds a name that is not text")
+    return names
+
+
+def top_names(gh: GitHub, workdir: Path) -> list[str]:
+    """The names of the newest year's set of the most downloaded projects, which the
+    downloads stream publishes in its serving database in `pypi-downloads-current`.
+    The set is empty until that stream's first month close.
+
+    The manifest and the database go to a new directory in `workdir`, which is removed
+    before this returns, and the database is checked against its entry (see
+    `fetch_assets`). Raises PriorStateError when the stream has not published, when its
+    manifest lists no serving database, and when the file does not match its entry, and
+    ValueError for a manifest that cannot be read and a database whose set cannot be
+    read (see `_read_top_names`).
+    """
+    folder = Path(tempfile.mkdtemp(prefix="downloads-", dir=workdir))
+    try:
+        manifest = fetch_manifest(gh, _DOWNLOADS, folder)
+        asset = current_asset(manifest, _SERVING_ASSET)
+        if asset is None:
+            raise PriorStateError(
+                f"the manifest of {_DOWNLOADS} lists no {_SERVING_ASSET} in "
+                f"{current_tag(_DOWNLOADS)}"
+            )
+        (path,) = fetch_assets(gh, [asset], folder)
+        return _read_top_names(path)
+    finally:
+        shutil.rmtree(folder)
+
+
+def _read_by_run(conn: sqlite3.Connection, *, after_seq: int) -> set[str]:
+    """The projects that the run has written a serial or an event for, in the rows of
+    the open delta `conn` above `after_seq`: it has read their pages already."""
+    rows = conn.execute(
+        "SELECT name FROM serials WHERE seq > ? UNION SELECT name FROM events "
+        "WHERE seq > ?",
+        (after_seq, after_seq),
+    )
+    return {name for (name,) in rows}
+
+
+def _slice_members(
+    state: sqlite3.Connection, names: list[str], slot: int
+) -> list[tuple[str, int, int, str, bool]]:
+    """The projects of `names` in the slice `slot` that the state holds and that are
+    neither removed nor quarantined, in name order, each with its incarnation, serial,
+    status and whether a run has read its page in full. A name that the state does not
+    hold is left out."""
+    members = []
+    for name in sorted(names):
+        if not in_slot(name, slot):
+            continue
+        row = state.execute(
+            "SELECT incarnation, last_serial, status, swept FROM projects "
+            "WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is not None and row[2] not in INACTIVE:
+            incarnation, serial, status, swept = row
+            members.append((name, incarnation, serial, status, bool(swept)))
+    return members
+
+
+def _status_pass(
+    gh: GitHub,
+    workdir: Path,
+    ctx: Context,
+    *,
+    slot: int,
+    read_by_run: set[str],
+    deadline: float,
+    clock: Callable[[], float],
+) -> tuple[StatusReport, bool]:
+    """Re-read the pages of the projects of the slice `slot` of the most downloaded
+    projects (see `top_names` and `_slice_members`), one at a time until `clock()`
+    reaches `deadline`, and write a `status_changed` event for each whose status has
+    changed (see `process.process_status`). Returns the report, and whether the pass
+    read the slice to its end.
+
+    Archiving a project moves no serial, so the root never shows it, and this pass is
+    what sees a project become archived or stop being archived. It compares a page only
+    when nothing else could have changed: the rest is left to the daily run, which reads
+    the files and the serial with the status. So it leaves a page that is missing (404
+    or 410), a page whose serial is not the stored one (a newer page, which the root
+    will show, or an old copy), and a quarantined page, which the daily run probes when
+    the root stops listing the project. It asks for no page of a project in
+    `read_by_run`, which the run has read already, nor of one that no run has read in
+    full: its status was never read, so a change of it cannot be told, and the sweep
+    records it with the rest of the page.
+
+    A set that cannot be read skips the pass, and the run goes on without it: the
+    report says why, and the slice is read by the next run. A page that fails or does
+    not parse raises, as in the rest of the run.
+    """
+    try:
+        names = top_names(gh, workdir)
+    except (PriorStateError, ValueError, GitHubError) as error:
+        report = StatusReport(
+            slot=slot, members=0, read=0, changed=0, skipped=str(error)
+        )
+        return report, False
+    members = _slice_members(ctx.state, names, slot)
+    read = changed = 0
+    finished = True
+    for name, incarnation, serial, status, swept in members:
+        if name in read_by_run or not swept:
+            continue
+        if clock() >= deadline:
+            finished = False
+            break
+        _, page = get_page(ctx.http, name)
+        read += 1
+        if page is None or page.serial != serial or page.status == "quarantined":
+            continue
+        if process_status(ctx, name, incarnation, status, page):
+            changed += 1
+    report = StatusReport(
+        slot=slot, members=len(members), read=read, changed=changed, skipped=None
+    )
+    return report, finished
+
+
 def run_once(
     gh: GitHub,
     http: Http,
@@ -849,16 +1064,23 @@ def run_once(
     the root, and raises StaleRootError, before it writes anything, for a root whose
     serial is below the state's cursor. It rolls over (see `_roll_over`), processes
     the projects that the root gives work for until `max_seconds` from its start on
-    `clock` have passed, writes the root's serial to the delta as the cursor, and
-    applies the delta to the state. It then writes the manifest, checks it with the
-    gates (see `_gate`), and swaps the state, the open delta and the manifest into the
-    current release. The manifest carries the records pass's progress on from the prior
-    one (see `records`).
+    `clock` have passed, re-reads the status of one slice of the most downloaded
+    projects in what is left of that time (see `_status_pass`), writes the root's
+    serial to the delta as the cursor, and applies the delta to the state. It then
+    writes the manifest, checks it with the gates (see `_gate`), and swaps the state,
+    the open delta and the manifest into the current release. The manifest carries the
+    records pass's progress on from the prior one (see `records`).
 
-    Every error propagates, and an error before the publish publishes nothing to the
-    current release. What a rollover already added to a month's release stays. The
-    next run adds the same files when it builds the same month part, which takes the
-    same zstd and SQLite, and otherwise stops with CreateOnceError.
+    The slice is the one that the prior manifest's coverage gives as `status_slice`,
+    and the manifest gives the next one when the pass read it to its end. A pass that
+    skips, because the set of the most downloaded projects cannot be read, or that
+    stops at the deadline, leaves the slice for the next run.
+
+    Every error propagates but a set that cannot be read, and an error before the
+    publish publishes nothing to the current release. What a rollover already added to
+    a month's release stays. The next run adds the same files when it builds the same
+    month part, which takes the same zstd and SQLite, and otherwise stops with
+    CreateOnceError.
     """
     deadline = clock() + max_seconds
     requests = http.requests
@@ -887,13 +1109,26 @@ def run_once(
         processed = process_projects(
             state, delta, http, root, deadline=deadline, clock=clock
         )
+        progress = _progress(prior)
+        slot = progress["status_slice"]
+        status, finished = _status_pass(
+            gh,
+            workdir,
+            Context(state, delta, http, bootstrap_at(state)),
+            slot=slot,
+            read_by_run=_read_by_run(conn, after_seq=resume.applied),
+            deadline=deadline,
+            clock=clock,
+        )
+        if finished:
+            progress["status_slice"] = (slot + 1) % SLICES
         delta.cursor(root.serial, moment)
         removals, coverage = _apply_run(
             state,
             conn,
             applied=resume.applied,
             remaining=processed.remaining,
-            progress=_records_progress(prior),
+            progress=progress,
         )
     failures = _publish(
         gh,
@@ -909,7 +1144,9 @@ def run_once(
         removals=removals,
         override_reason=override_reason,
     )
-    return _report(processed, requests=http.requests - requests, failures=failures)
+    return _report(
+        processed, requests=http.requests - requests, failures=failures, status=status
+    )
 
 
 def _sweep_projects(
@@ -997,7 +1234,8 @@ def sweep(
     `data_through`, the `cursor` and the backlog of the prior one, because no root was
     read: the coverage's `remaining` stays what the last daily run left to the next one
     (`_backlog`), and its `unswept` is how many projects the sweep has left. The data is
-    complete when both are 0. The records pass's progress is carried on as well.
+    complete when both are 0. The records pass's progress and the status pass's slice
+    are carried on as well.
 
     The report's `swept` is the number of projects that this sweep read, and its
     `remaining` is the number that are still unswept. Each sweep reads what it has the
@@ -1033,7 +1271,7 @@ def sweep(
             conn,
             applied=resume.applied,
             remaining=backlog,
-            progress=_records_progress(prior),
+            progress=_progress(prior),
         )
     failures = _publish(
         gh,
@@ -1129,7 +1367,7 @@ def records(
     where the last records run stopped, until `max_seconds` from its start on `clock`
     have passed (see `_record_projects`), and applies the delta. It then publishes as
     the sweep does, and its manifest keeps the `data_through`, the `cursor` and the
-    backlog of the prior one, because no root was read.
+    backlog of the prior one, because no root was read, and the status pass's slice.
 
     Its coverage gives the pass's place, `records_after`: the last project that it came
     to, or null when it came to the end of the list, so that the next records run starts
@@ -1156,7 +1394,8 @@ def records(
         )
     resume = _resume(prior, workdir)
     backlog = _backlog(prior)
-    after = _records_progress(prior)["records_after"]
+    progress = _progress(prior)
+    after = progress["records_after"]
     added = _roll_over(gh, workdir, prior, resume.carried, today)
     with (
         closing(open_db(workdir / STATE_DB, STATE_SCHEMA)) as state,
@@ -1177,7 +1416,7 @@ def records(
             conn,
             applied=resume.applied,
             remaining=backlog,
-            progress={"records_after": place, "records_left": report.left},
+            progress={**progress, "records_after": place, "records_left": report.left},
         )
     _publish(
         gh,
