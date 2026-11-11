@@ -395,6 +395,17 @@ class Stream:
         OPENED.append(conn)
         return conn
 
+    def unlike_manifest(self) -> list[str]:
+        """The assets of the current manifest in the current release whose name holds
+        bytes other than those that the manifest gives them, sorted."""
+        return sorted(
+            asset.name
+            for asset in self.manifest().assets
+            if asset.tag == CURRENT
+            and hashlib.sha256(self.github.asset_bytes(CURRENT, asset.name)).hexdigest()
+            != asset.asset_sha256
+        )
+
     def publish_serving(self, db: Path | None) -> None:
         """Put `db` in the current release as its serving database, or with None leave
         it without one, as a publish that kept none did. The state, the open delta and

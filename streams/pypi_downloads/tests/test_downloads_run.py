@@ -54,10 +54,10 @@ from pypi_downloads.store import STATE_SCHEMA, STATE_TABLES, day_number
 
 from obskit import cycle
 from obskit.gcp import GoogleError
-from obskit.github import GitHubError
+from obskit.github import GitHub, GitHubError
 from obskit.manifest import TableInfo, Watermark
 from obskit.parts import coarsest_parts
-from obskit.release import fetch_assets
+from obskit.release import PriorStateError, fetch_assets
 from obskit.sqlite import diff_tables, open_db
 
 # Most tests start with a bootstrap at this time, whose newest due day is the launch.
@@ -921,6 +921,72 @@ def test_serving_that_fails_its_check_after_the_update_is_rebuilt(tmp_path):
     assert rows(db, "monthly") == by_month(found_on(state, counted_days(state)))
 
 
+class Stopped(Exception):
+    """The runner stopping part way through a publish."""
+
+
+def test_a_publish_stopped_after_the_serving_rename_is_healed_by_the_next(
+    tmp_path, monkeypatch
+):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    rename = GitHub.rename
+
+    def stop_after_the_serving_rename(self, asset, name):
+        renamed = rename(self, asset, name)
+        if name == SERVING:
+            raise Stopped("the runner stopped before the manifest moved in")
+        return renamed
+
+    with monkeypatch.context() as patch, pytest.raises(Stopped):
+        patch.setattr(GitHub, "rename", stop_after_the_serving_rename)
+        stream.run("2026-11-12T09:00:00Z")
+
+    # The new serving database holds its name, and the live manifest still names the
+    # old one, which is under a swap name. Only a publish puts it back.
+    assert stream.unlike_manifest() == sorted([STATE, DELTA, SERVING])
+
+    healed = stream.run("2026-11-13T09:00:00Z")
+
+    assert healed.counted == ["2026-11-11"]
+    assert healed.reused == ["2026-11-10"]
+    assert healed.serving == "rebuilt"
+    assert (healed.serving_reason or "").startswith(
+        f"the prior {SERVING} could not be read: {SERVING} in {CURRENT} has sha256 "
+    )
+    assert stream.unlike_manifest() == []
+    check(stream.open(CURRENT, SERVING), stream.open(CURRENT, STATE))
+
+    after = stream.run("2026-11-14T09:00:00Z")
+
+    assert (after.serving, after.serving_reason) == ("updated", None)
+    assert stream.unlike_manifest() == []
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    check(db, state)
+    assert folded_days(db) == counted_days(state)
+
+
+def test_a_prior_serving_database_of_another_schema_is_rebuilt(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    other = stream.expand(CURRENT, SERVING)
+    with closing(sqlite3.connect(other)) as conn, conn:
+        conn.execute("DROP TABLE recent")
+    stream.publish_serving(other)
+
+    report = stream.run("2026-11-12T09:00:00Z")
+
+    assert report.serving == "rebuilt"
+    reason = report.serving_reason or ""
+    assert reason.startswith(f"the prior {SERVING} does not open as a serving database")
+    assert reason.endswith("is not a database of this schema: it lacks recent")
+    db = stream.open(CURRENT, SERVING)
+    state = stream.open(CURRENT, STATE)
+    check(db, state)
+    assert rows(db, "recent") == found_on(state, counted_days(state))
+
+
 def test_a_run_without_a_prior_serving_database_rebuilds_it(tmp_path, monkeypatch):
     stream = Stream(tmp_path)
     stream.bootstrap(BOOTSTRAP_AT)
@@ -963,6 +1029,28 @@ def test_a_run_without_a_prior_serving_database_rebuilds_it(tmp_path, monkeypatc
     assert folded_days(db) == counted_days(state)
     assert len(counted_days(state)) == 5
     assert stream.entries()[SERVING].tables["folded"] == TableInfo(5, "derived")
+
+
+def test_a_part_that_cannot_be_fetched_for_a_rebuild_stops_the_run(
+    tmp_path, monkeypatch
+):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.run("2026-11-12T09:00:00Z")
+    stream.publish_serving(None)
+    published = stream.github.asset_bytes(CURRENT, MANIFEST)
+
+    def refused(gh, assets, workdir, **options):
+        raise PriorStateError(f"{assets[0].tag} holds no {assets[0].name}")
+
+    monkeypatch.setattr(run_module, "fetch_assets", refused)
+
+    # Only the serving database's own fetch is a reason to rebuild. A part that the
+    # rebuild needs and cannot have fails the run before it publishes.
+    with pytest.raises(PriorStateError, match=sealed_name("2026-11-11")):
+        stream.run("2026-11-13T09:00:00Z")
+
+    assert stream.github.asset_bytes(CURRENT, MANIFEST) == published
 
 
 def test_rebuild_from_the_releases_equals_the_runs(tmp_path):

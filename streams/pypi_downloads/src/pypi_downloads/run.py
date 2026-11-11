@@ -43,9 +43,9 @@ Every publish carries the serving database (`serving`), which holds what readers
 the counts: monthly totals, the newest 30 days and the daily counts of each year's top
 15,000. A run takes the prior one from the current release, closes in it each month that
 has ended since the last run, before it folds the days that it counted, and checks it
-against the state. One that cannot be brought up to date that way, or that the prior
-manifest lacks, is made afresh from the published parts, read one at a time, and one
-that still disagrees with the state stops the run before it publishes. The bootstrap
+against the state. One that cannot be read or brought up to date that way, or that the
+prior manifest lacks, is made afresh from the published parts, read one at a time, and
+one that still disagrees with the state stops the run before it publishes. The bootstrap
 makes the first from its launch day.
 
 `main` exits 2 when a day failed, a partition moved or the drift is unknown, or the
@@ -77,7 +77,7 @@ from obskit.gcp import Credentials, Federation, Google, GoogleError
 from obskit.github import GitHub
 from obskit.manifest import Asset, Manifest, Watermark, current_asset, instant
 from obskit.parts import coarsest_parts
-from obskit.release import fetch_assets, fetch_prior
+from obskit.release import PriorStateError, fetch_assets, fetch_prior
 from obskit.runs import github_from_env, run_directory
 from obskit.sqlite import open_db
 from obskit.tags import current_tag
@@ -579,17 +579,27 @@ def _summary(
 # ---- the serving database
 
 
-def _fetch_serving(gh: GitHub, prior: Manifest, workdir: Path) -> bool:
+def _fetch_serving(gh: GitHub, prior: Manifest, workdir: Path) -> str | None:
     """Download the serving database that the prior manifest lists in the current
     release, and expand it to `workdir`, checked against its entry (see
-    `fetch_assets`). Returns whether the manifest lists one: none was published before
-    the stream kept it. One that does not download as its entry says raises
-    PriorStateError."""
+    `fetch_assets`). Returns None when it is there, and otherwise why there is none to
+    update, which makes the run build it afresh.
+
+    The manifest lists none before the stream kept one. The release may hold other
+    bytes under its name (PriorStateError) when a publish stopped between renaming the
+    serving database and renaming the manifest, and only a later publish puts the
+    release back (see `publish_current`), so a run that failed here would never publish
+    again. A partial download is deleted. Every other error propagates."""
     asset = current_asset(prior, SERVING_ASSET)
     if asset is None:
-        return False
-    fetch_assets(gh, [asset], workdir)
-    return True
+        return f"the prior manifest lists no {SERVING_ASSET}"
+    try:
+        fetch_assets(gh, [asset], workdir)
+    except PriorStateError as error:
+        (workdir / SERVING_ASSET).unlink(missing_ok=True)
+        (workdir / serving.SERVING_DB).unlink(missing_ok=True)
+        return f"the prior {SERVING_ASSET} could not be read: {error}"
+    return None
 
 
 def _months_to_close(
@@ -661,8 +671,16 @@ def _update_serving(
     month of `closes`, in order, then fold the days that the state holds and it does
     not, from the open delta `conn`, and check it (see `serving`). The closes come
     first, so that each ranks only what was counted before its month ended. Raises
-    NeedsRebuild or ServingMismatch when the database cannot be brought up to date."""
-    with closing(open_db(path, serving.SCHEMA)) as db:
+    NeedsRebuild or ServingMismatch when the database cannot be brought up to date,
+    NeedsRebuild too when it lacks a table of the serving schema (the ValueError of
+    `open_db`), as one published before a change of the schema would."""
+    try:
+        prior = open_db(path, serving.SCHEMA)
+    except ValueError as error:
+        raise serving.NeedsRebuild(
+            f"the prior {SERVING_ASSET} does not open as a serving database: {error}"
+        ) from error
+    with closing(prior) as db:
         for month in closes:
             serving.close(db, state, month)
         serving.fold(db, state, conn)
@@ -689,7 +707,7 @@ def _serve(
     state: sqlite3.Connection,
     conn: sqlite3.Connection,
     *,
-    fetched: bool,
+    unread: str | None,
     closes: list[int],
     sources: Callable[[], Iterator[Path]],
     today: date,
@@ -697,13 +715,14 @@ def _serve(
     """Bring the serving database at `path` up to date with the state, and return why
     it was rebuilt, or None when it was updated.
 
-    When `fetched`, `path` holds the prior serving database, which is updated (see
-    `_update_serving`). When the prior manifest listed none, or the update raises
-    NeedsRebuild, or the database that it leaves fails its check (ServingMismatch), the
-    file is deleted and made afresh from `sources` (see `_rebuild_serving`). The state
-    and the open delta `conn` must have committed what the run wrote."""
-    if not fetched:
-        reason = f"the prior manifest lists no {SERVING_ASSET}"
+    When `unread` is None, `path` holds the prior serving database, which is updated
+    (see `_update_serving`). When `unread` says why the prior one could not be read
+    (see `_fetch_serving`), or the update raises NeedsRebuild, or the database that it
+    leaves fails its check (ServingMismatch), the file is deleted and made afresh from
+    `sources` (see `_rebuild_serving`). The state and the open delta `conn` must have
+    committed what the run wrote."""
+    if unread is not None:
+        reason = unread
     else:
         try:
             _update_serving(path, state, conn, closes)
@@ -901,12 +920,12 @@ def run_once(
     It brings the serving database up to date (see `_serve`): the prior one, fetched
     from the current release before the rollover, closes each month that has ended
     since the last run, folds the days that the state holds and it does not, and is
-    checked against the state. One that cannot be brought up to date, or that the prior
-    manifest lacks, is made afresh from the published parts that hold the counts and
-    the open delta. It then publishes (`cycle.publish`): the manifest is checked with
-    the gates, and the state, the open delta, the serving database and the manifest
-    are swapped into the current release. Only then are the notifications
-    acknowledged.
+    checked against the state. One that cannot be read or brought up to date, or that
+    the prior manifest lacks, is made afresh from the published parts that hold the
+    counts and the open delta. It then publishes (`cycle.publish`): the manifest is
+    checked with the gates, and the state, the open delta, the serving database and
+    the manifest are swapped into the current release. Only then are the
+    notifications acknowledged.
 
     Every error other than a failed day propagates, and an error before the publish
     publishes nothing to the current release and acknowledges no notification, so the
@@ -937,7 +956,7 @@ def run_once(
     resume = _resume(prior, workdir)
     launch = resume.launch
     serving_db = workdir / serving.SERVING_DB
-    fetched = _fetch_serving(gh, prior, workdir)
+    unread = _fetch_serving(gh, prior, workdir)
     # When a month has ended since the prior open delta began, the rollover closes the
     # delta's month, and the serving database closes it too, with each month after it.
     open_day = date.fromisoformat(resume.carried[1].period or "")
@@ -993,7 +1012,7 @@ def run_once(
             serving_db,
             state,
             conn,
-            fetched=fetched,
+            unread=unread,
             closes=closes,
             sources=_sources(gh, workdir, _rebuild_parts(prior, added), added),
             today=today,
