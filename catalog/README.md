@@ -12,7 +12,7 @@ Months and pins are prereleases, so they never show as Latest.
 
 ## The tables
 
-Ids (`project_id`, `advisory_id`, `requirement_id`, `classifier_id`) are made afresh by each build, in name order for projects and in id order for advisories, so link rows by name, and by version, and not by id across builds. The download tables use the `project_id` of `project`, found by the name that the downloads stream gives.
+Ids (`project_id`, `advisory_id`, `requirement_id`, `classifier_id`, `requires_python_id`, `wheel_tag_id`) are made afresh by each build, in name order for projects, in id order for advisories, in text order for requires-python and in tag order for wheel tags, so link rows by name, version, text or tag, and not by id across builds. The download tables use the `project_id` of `project`, found by the name that the downloads stream gives.
 
 - `input`: one row for each stream that the build read, with the time of its manifest, its `data_through`, its fingerprint, `complete`, which is 1 when the stream's manifest says that its data is complete, and `carried`, which is 1 when the stream could not be read and its tables are the previous build's. A carried stream keeps the row of the build that read it, `complete` included. The manifest's coverage says `complete` of each stream in the same way.
 - `attribution`: the upstreams of each stream and their licences and terms, as the stream's manifest gives them.

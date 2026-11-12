@@ -5,8 +5,8 @@ The registry is staged as two databases (see catalog.stage): its state, as it ke
 and the stage, which holds what was taken from its deltas. A project is a row of the
 state's projects. Its releases are the versions that the state has seen of its current
 incarnation, and each takes the upload time, the file counts and the requires-python that
-the stage summed for it. The events are copied as they are, those of every incarnation, because they are the
-history of a name and not only of the project that holds it now.
+the stage summed for it. The events are copied as they are, those of every incarnation,
+because they are the history of a name and not only of the project that holds it now.
 
 A release's record gives a project the rest of what it says of itself, such as its summary
 and its licence. Those columns are left empty here, and are filled afterwards from the
