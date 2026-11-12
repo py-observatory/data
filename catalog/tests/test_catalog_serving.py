@@ -17,14 +17,23 @@ from catalog.serving import (
     build_serving,
     over_budget,
 )
-from catalog.stage import stage_osv, stage_registry
-from catalog_helpers import REPO, TOKEN, no_sleep, publish_osv, publish_registry
+from catalog.stage import stage_downloads, stage_osv, stage_registry
+from catalog_helpers import (
+    REPO,
+    TOKEN,
+    no_sleep,
+    publish_downloads,
+    publish_osv,
+    publish_registry,
+)
 from obskit.github import GitHub
 from obskit.manifest import Manifest, Watermark
 from obskit.testing import FakeGitHub
 
 REGISTRY = load_config().streams["pypi-registry"]
 OSV = load_config().streams["osv-pypi"]
+# The years of daily downloads that a build keeps, as a run passes it.
+DAILY_YEARS = load_config().download_daily_years
 FIRST = "2026-11-02"
 SECOND = "2026-11-03"
 
@@ -96,6 +105,7 @@ def stream_input(stream: str, manifest: Manifest, assets, staged) -> StreamInput
         complete=manifest.complete,
         fingerprint=fingerprint(assets),
         licences=manifest.licences,
+        coverage=manifest.coverage,
         staged=staged,
     )
 
@@ -129,6 +139,33 @@ def osv_input(
     return stream_input("osv-pypi", manifest, assets, stage_osv(gh, assets, work))
 
 
+def downloads_input(
+    gh: GitHub,
+    tmp_path: Path,
+    *,
+    state: Mapping[str, Sequence[Mapping[str, object]]],
+    serving: Mapping[str, Sequence[Mapping[str, object]]],
+    coverage: Mapping[str, object],
+    day: str = FIRST,
+) -> StreamInput:
+    """Publish pypi-downloads as its run on `day` leaves it, with these rows of its state
+    and its serving database and this coverage in its manifest, and stage it."""
+    manifest = publish_downloads(
+        gh,
+        state=state,
+        serving=serving,
+        open_day=day,
+        open_delta={},
+        coverage=coverage,
+    )
+    work = tmp_path / f"downloads-{day}"
+    work.mkdir()
+    assets = needed_assets(manifest, load_config().streams["pypi-downloads"].tables)
+    return stream_input(
+        "pypi-downloads", manifest, assets, stage_downloads(gh, assets, work)
+    )
+
+
 def carried(item: StreamInput) -> StreamInput:
     """The input as a build has it when the stream could not be read. Its values are
     not those of `item`, so that a test sees that the carried rows do not come from
@@ -140,6 +177,7 @@ def carried(item: StreamInput) -> StreamInput:
         complete=not item.complete,
         fingerprint="ignored",
         licences=[],
+        coverage={},
         staged=None,
     )
 
@@ -213,7 +251,7 @@ def test_a_build_fills_every_table_from_fresh_inputs(gh, tmp_path):
     osv = osv_input(gh, tmp_path, [affected_by("foo", "1.0", "1.1", id="PYSEC-1")])
     out = tmp_path / "out.db"
 
-    report = build_serving(out, [registry, osv], None)
+    report = build_serving(out, [registry, osv], None, daily_years=DAILY_YEARS)
 
     assert report.carried == []
     assert report.unparsed_requirements == 0
@@ -249,14 +287,18 @@ def test_a_build_fills_every_table_from_fresh_inputs(gh, tmp_path):
 def test_a_stream_without_input_keeps_its_tables_from_the_previous_build(gh, tmp_path):
     registry = a_registry(gh, tmp_path)
     previous = tmp_path / "previous.db"
-    build_serving(previous, [registry, osv_input(gh, tmp_path, [])], None)
+    build_serving(
+        previous, [registry, osv_input(gh, tmp_path, [])], None, daily_years=DAILY_YEARS
+    )
 
     # The next day's osv has an advisory for a release that the carried registry has.
     osv = osv_input(
         gh, tmp_path, [affected_by("foo", "1.0", "1.1", id="PYSEC-2")], day=SECOND
     )
     out = tmp_path / "out.db"
-    report = build_serving(out, [carried(registry), osv], previous)
+    report = build_serving(
+        out, [carried(registry), osv], previous, daily_years=DAILY_YEARS
+    )
 
     assert report.carried == ["pypi-registry"]
     assert_carried(out, previous, "pypi-registry")
@@ -280,7 +322,7 @@ def test_carried_advisories_meet_new_releases(gh, tmp_path):
     previous = tmp_path / "previous.db"
     old = registry_input(gh, tmp_path, [project("foo", "1.0")], [record("foo", "1.0")])
     osv = osv_input(gh, tmp_path, [affected_by("foo", "1.0", "2.0", id="PYSEC-1")])
-    build_serving(previous, [old, osv], None)
+    build_serving(previous, [old, osv], None, daily_years=DAILY_YEARS)
 
     new = registry_input(
         gh,
@@ -290,7 +332,7 @@ def test_carried_advisories_meet_new_releases(gh, tmp_path):
         day=SECOND,
     )
     out = tmp_path / "out.db"
-    report = build_serving(out, [new, carried(osv)], previous)
+    report = build_serving(out, [new, carried(osv)], previous, daily_years=DAILY_YEARS)
 
     assert report.carried == ["osv-pypi"]
     assert_carried(out, previous, "osv-pypi")
@@ -307,23 +349,28 @@ def test_carrying_without_a_previous_build_fails(gh, tmp_path):
     out = tmp_path / "out.db"
 
     with pytest.raises(CarryError):
-        build_serving(out, [carried(registry)], None)
+        build_serving(out, [carried(registry)], None, daily_years=DAILY_YEARS)
     assert not out.exists()
 
 
 def test_carrying_a_stream_that_the_previous_build_lacks_fails(gh, tmp_path):
     previous = tmp_path / "previous.db"
-    build_serving(previous, [osv_input(gh, tmp_path, [])], None)
+    build_serving(
+        previous, [osv_input(gh, tmp_path, [])], None, daily_years=DAILY_YEARS
+    )
 
     with pytest.raises(CarryError):
         build_serving(
-            tmp_path / "out.db", [carried(a_registry(gh, tmp_path))], previous
+            tmp_path / "out.db",
+            [carried(a_registry(gh, tmp_path))],
+            previous,
+            daily_years=DAILY_YEARS,
         )
 
 
 def test_search_finds_projects_by_name_summary_and_keywords(gh, tmp_path):
     out = tmp_path / "out.db"
-    build_serving(out, [a_registry(gh, tmp_path)], None)
+    build_serving(out, [a_registry(gh, tmp_path)], None, daily_years=DAILY_YEARS)
 
     def found(term: str) -> list[tuple]:
         return select(out, f"SELECT name FROM search WHERE search MATCH '{term}'")
@@ -336,7 +383,7 @@ def test_search_finds_projects_by_name_summary_and_keywords(gh, tmp_path):
 
 def test_tombstone_lists_removed_and_quarantined_projects(gh, tmp_path):
     out = tmp_path / "out.db"
-    build_serving(out, [a_registry(gh, tmp_path)], None)
+    build_serving(out, [a_registry(gh, tmp_path)], None, daily_years=DAILY_YEARS)
 
     assert select(out, "SELECT name, status, status_since FROM tombstone ORDER BY name") == [
         ("gone", "removed", "2026-10-02T00:00:00Z"),
@@ -350,7 +397,7 @@ def test_a_failed_build_leaves_no_database(gh, tmp_path):
     out = tmp_path / "out.db"
 
     with pytest.raises(KeyError):
-        build_serving(out, [broken], None)
+        build_serving(out, [broken], None, daily_years=DAILY_YEARS)
     assert not out.exists()
 
 
@@ -370,19 +417,19 @@ def test_building_into_an_existing_file_leaves_it_alone(gh, tmp_path):
     out.write_bytes(b"not mine to remove")
 
     with pytest.raises(FileExistsError):
-        build_serving(out, [osv_input(gh, tmp_path, [])], None)
+        build_serving(out, [osv_input(gh, tmp_path, [])], None, daily_years=DAILY_YEARS)
     assert out.read_bytes() == b"not mine to remove"
 
 
 def test_a_previous_build_that_lacks_a_table_is_refused(gh, tmp_path):
     registry = a_registry(gh, tmp_path)
     previous = tmp_path / "previous.db"
-    build_serving(previous, [registry], None)
+    build_serving(previous, [registry], None, daily_years=DAILY_YEARS)
     with closing(sqlite3.connect(previous)) as con:
         con.execute("DROP TABLE change")
         con.commit()
     out = tmp_path / "out.db"
 
     with pytest.raises(ValueError, match="change"):
-        build_serving(out, [carried(registry)], previous)
+        build_serving(out, [carried(registry)], previous, daily_years=DAILY_YEARS)
     assert not out.exists()

@@ -5,10 +5,12 @@ import tempfile
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+from test_catalog_downloads import counts, coverage
 
 from catalog import run as catalog_run
 from catalog import serving
@@ -16,13 +18,21 @@ from catalog.config import load_config
 from catalog.inputs import fingerprint, needed_assets
 from catalog.run import RunReport, main, run_once
 from catalog.serving import CarryError
-from catalog_helpers import REPO, TOKEN, no_sleep, publish_osv, publish_registry
+from catalog_helpers import (
+    REPO,
+    TOKEN,
+    no_sleep,
+    publish_downloads,
+    publish_osv,
+    publish_registry,
+)
 from obskit.gates import GateError
 from obskit.github import GitHub, GitHubError
 from obskit.manifest import Manifest, Watermark, instant, loads
 from obskit.release import CreateOnceError, add_create_once, publish_current
 from obskit.testing import FakeGitHub
 from obskit.zst import decompress_file
+from pypi_downloads.store import day_number
 
 CONFIG = load_config()
 CURRENT = "catalog-current"
@@ -137,6 +147,41 @@ def osv(
     )
 
 
+def downloads(
+    gh: GitHub,
+    day: str,
+    *names: str,
+    sealed: tuple[str, ...] = (),
+) -> Manifest:
+    """Publish the downloads stream as its run on `day` leaves it, launched on the day
+    before, which it has counted, with a download of each of `names` in that day's
+    month, and an empty sealed delta of each day of `sealed`. Its backfill has years to
+    go, so its manifest says that its data is not complete, as the live stream's does."""
+    counted = date.fromisoformat(day) - timedelta(days=1)
+    month = counted.year * 100 + counted.month
+    ids = range(1, len(names) + 1)
+    return publish_downloads(
+        gh,
+        state={
+            "projects": [{"project_id": i, "name": n} for i, n in zip(ids, names)],
+            "days": [{"day": day_number(counted), "seq": 1}],
+        },
+        serving={"monthly": [counts(i, "month", month, 1) for i in ids]},
+        open_day=day,
+        open_delta={},
+        coverage=coverage(
+            launch=counted.isoformat(),
+            first_day=counted.isoformat(),
+            last_day=counted.isoformat(),
+            days=1,
+            backfill_left=(counted - date(2016, 1, 22)).days,
+            projects=len(names),
+            window_days=1,
+        ),
+        sealed={sealed_day: {} for sealed_day in sealed},
+    )
+
+
 def fingerprint_of(manifest: Manifest) -> str:
     """The fingerprint of what the catalog reads of the stream that published
     `manifest`."""
@@ -213,6 +258,7 @@ def a_registry_502(fake: FakeGitHub) -> None:
 def test_bootstrap_publishes_catalog_current_as_the_latest_release(gh, fake, tmp_path):
     registry_manifest = registry(gh, FIRST, "foo")
     osv_manifest = osv(gh, "2026-11-01", "PYSEC-1")
+    downloads_manifest = downloads(gh, FIRST, "foo")
 
     assert run(gh, tmp_path, T0, bootstrap=True) == report(
         built=True, reason="bootstrap"
@@ -268,6 +314,16 @@ def test_bootstrap_publishes_catalog_current_as_the_latest_release(gh, fake, tmp
                 "generated_at": "2026-11-01T00:00:00Z",
                 "stale": False,
             },
+            "pypi-downloads": {
+                "carried": False,
+                "complete": False,
+                "data_through": {"granularity": "day", "value": "2026-11-02"},
+                "data_through_since": "2026-11-02T12:00:00Z",
+                "error": None,
+                "fingerprint": fingerprint_of(downloads_manifest),
+                "generated_at": "2026-11-02T00:00:00Z",
+                "stale": False,
+            },
         },
     }
     # Each upstream once, with its stream, by stream and then by name.
@@ -276,10 +332,15 @@ def test_bootstrap_publishes_catalog_current_as_the_latest_release(gh, fake, tmp
         ("osv-pypi", "OSV.dev data dumps"),
         ("osv-pypi", "OpenSSF Malicious Packages (MAL-*)"),
         ("osv-pypi", "PyPA Advisory Database (PYSEC-*)"),
+        (
+            "pypi-downloads",
+            "PyPI downloads in BigQuery (bigquery-public-data.pypi.file_downloads)",
+        ),
         ("pypi-registry", "PyPI Simple and JSON APIs"),
     ]
     upstreams = {
         "osv-pypi": osv_manifest.licences,
+        "pypi-downloads": downloads_manifest.licences,
         "pypi-registry": registry_manifest.licences,
     }
     for licence in manifest.licences:
@@ -288,22 +349,27 @@ def test_bootstrap_publishes_catalog_current_as_the_latest_release(gh, fake, tmp
     db = serving_db(fake, tmp_path)
     assert select(db, "SELECT stream, carried FROM input ORDER BY stream") == [
         ("osv-pypi", 0),
+        ("pypi-downloads", 0),
         ("pypi-registry", 0),
     ]
     assert select(db, "SELECT name FROM project") == [("foo",)]
     assert select(db, "SELECT id FROM advisory") == [("PYSEC-1",)]
+    assert select(db, "SELECT project_id, month FROM download_month") == [(1, 202611)]
 
 
 def never_published(gh: GitHub, fake: FakeGitHub) -> None:
-    """osv has published, and the registry never has, so its release is a 404."""
+    """osv and the downloads stream have published, and the registry never has, so its
+    release is a 404."""
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
 
 
 def fails_to_stage(gh: GitHub, fake: FakeGitHub) -> None:
-    """Both streams have published, and every attempt to download osv's state gets a
+    """Every stream has published, and every attempt to download osv's state gets a
     502."""
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     fake.fail("GET", "name=osv-pypi-state.db.zst", 502, times=6)
 
 
@@ -329,6 +395,7 @@ def test_bootstrap_refuses_when_a_stream_cannot_be_read(
 def test_unchanged_inputs_build_nothing(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     fake.calls.clear()
 
@@ -341,6 +408,7 @@ def test_unchanged_inputs_build_nothing(gh, fake, tmp_path):
 def test_changed_inputs_wait_for_the_min_gap(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     changed = registry(gh, FIRST, "foo", "bar")
     fake.calls.clear()
@@ -362,6 +430,7 @@ def test_changed_inputs_wait_for_the_min_gap(gh, fake, tmp_path):
 def test_the_heartbeat_builds_after_the_max_gap(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
 
     assert run(gh, tmp_path, T0 + 24 * HOUR - MINUTE) == report(reason="unchanged")
@@ -378,6 +447,7 @@ def test_a_build_over_the_budget_warns_and_still_publishes(
 ):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     monkeypatch.setattr(serving, "BUDGET_BYTES", 0)
 
     with pytest.warns(UserWarning, match="over the budget"):
@@ -394,6 +464,7 @@ def test_an_unreadable_stream_is_carried_from_the_previous_build(
 ):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     before = published(fake).coverage["streams"]["pypi-registry"]
     osv(gh, SECOND, "PYSEC-1", "PYSEC-2")
@@ -427,6 +498,7 @@ def test_an_unreadable_stream_is_carried_from_the_previous_build(
     assert select(db, "SELECT name FROM project") == [("foo",)]
     assert select(db, "SELECT stream, carried FROM input ORDER BY stream") == [
         ("osv-pypi", 0),
+        ("pypi-downloads", 0),
         ("pypi-registry", 1),
     ]
     assert select(db, "SELECT id FROM advisory ORDER BY id") == [
@@ -440,6 +512,7 @@ def test_a_carried_stream_that_can_be_read_again_is_rebuilt(
 ):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     osv(gh, SECOND, "PYSEC-1", "PYSEC-2")
     a_registry_502(fake)
@@ -471,6 +544,7 @@ def test_a_carried_stream_that_can_be_read_again_is_rebuilt(
     db = serving_db(fake, tmp_path)
     assert select(db, "SELECT stream, carried FROM input ORDER BY stream") == [
         ("osv-pypi", 0),
+        ("pypi-downloads", 0),
         ("pypi-registry", 0),
     ]
 
@@ -480,6 +554,7 @@ def test_a_run_that_builds_nothing_fails_while_the_catalog_is_incomplete(
 ):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     a_registry_502(fake)
     carried_at = T0 + HOUR
@@ -561,6 +636,7 @@ def osv_state_not_zstd(gh: GitHub, fake: FakeGitHub, tmp_path: Path) -> None:
 def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path, broken, error):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     before = published(fake).coverage["streams"]["osv-pypi"]
     osv(gh, SECOND, "PYSEC-1", "PYSEC-2")
@@ -596,9 +672,11 @@ def test_a_stream_that_fails_to_stage_is_carried(gh, fake, tmp_path, broken, err
 
 
 def test_each_stream_says_whether_its_data_is_complete(gh, fake, tmp_path):
-    # The registry's sweep has not read every project yet.
+    # The registry's sweep has not read every project yet, and the downloads stream's
+    # backfill has years to go.
     registry(gh, FIRST, "foo", complete=False)
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
 
     assert run(gh, tmp_path, T0, bootstrap=True) == report(
         built=True, reason="bootstrap"
@@ -606,15 +684,17 @@ def test_each_stream_says_whether_its_data_is_complete(gh, fake, tmp_path):
 
     manifest = published(fake)
     streams = manifest.coverage["streams"]
-    assert (streams["pypi-registry"]["complete"], streams["osv-pypi"]["complete"]) == (
-        False,
-        True,
-    )
+    assert {stream: streams[stream]["complete"] for stream in streams} == {
+        "pypi-registry": False,
+        "osv-pypi": True,
+        "pypi-downloads": False,
+    }
     # The catalog read every stream, and none is stale, so its own data is complete.
     assert manifest.complete is True
     db = serving_db(fake, tmp_path)
     assert select(db, "SELECT stream, complete FROM input ORDER BY stream") == [
         ("osv-pypi", 1),
+        ("pypi-downloads", 0),
         ("pypi-registry", 0),
     ]
 
@@ -632,13 +712,58 @@ def test_each_stream_says_whether_its_data_is_complete(gh, fake, tmp_path):
         db, "SELECT stream, complete, carried FROM input ORDER BY stream"
     ) == [
         ("osv-pypi", 1, 0),
+        ("pypi-downloads", 0, 0),
         ("pypi-registry", 0, 1),
     ]
+
+
+def test_a_stream_still_backfilling_leaves_the_catalog_complete(
+    gh, fake, tmp_path, main_at, capsys
+):
+    # The downloads stream's manifest says that its data is not complete, as it will
+    # until its backfill reaches 2016-01-22. It can be read and it is not stale.
+    registry(gh, FIRST, "foo")
+    osv(gh, FIRST, "PYSEC-1")
+    assert downloads(gh, FIRST, "foo").complete is False
+
+    assert main_at(T0, ["run", "--bootstrap"]) == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["built"], printed["complete"]) == (True, True)
+    assert (printed["carried"], printed["stale"], printed["unreadable"]) == ([], [], [])
+    manifest = published(fake)
+    assert manifest.complete is True
+    entry = manifest.coverage["streams"]["pypi-downloads"]
+    assert (entry["complete"], entry["carried"], entry["stale"]) == (
+        False,
+        False,
+        False,
+    )
+    db = serving_db(fake, tmp_path)
+    assert select(
+        db, "SELECT complete, carried FROM input WHERE stream = 'pypi-downloads'"
+    ) == [(0, 0)]
+
+    # Its next publish, a day on, is built in the same way, and so is a run that
+    # builds nothing.
+    downloads(gh, SECOND, "foo")
+    assert main_at(T0 + HOUR, ["run"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["built"], printed["reason"], printed["complete"]) == (
+        True,
+        "inputs changed",
+        True,
+    )
+    assert published(fake).complete is True
+    assert main_at(T0 + 2 * HOUR, ["run"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert (printed["built"], printed["complete"]) == (False, True)
 
 
 def test_a_stream_whose_data_through_stands_still_turns_stale(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
 
     # Nothing has changed, so the heartbeat builds, and the registry's data_through
@@ -671,6 +796,7 @@ def test_a_stream_whose_data_through_stands_still_turns_stale(gh, fake, tmp_path
 def test_a_stream_that_turns_stale_counts_as_a_change(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     last_build = T0 + 29 * HOUR + 30 * MINUTE
     assert run(gh, tmp_path, last_build) == report(built=True, reason="heartbeat")
@@ -693,6 +819,7 @@ def test_a_stream_that_turns_stale_counts_as_a_change(gh, fake, tmp_path):
 def test_a_stream_that_turns_unreadable_counts_as_a_change(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
 
     # Nothing else changes, and the registry cannot be read. The manifest says that it
@@ -724,6 +851,7 @@ def test_a_stream_that_turns_unreadable_counts_as_a_change(gh, fake, tmp_path):
 def test_data_through_is_the_oldest_input_generated_at(gh, fake, tmp_path):
     registry(gh, FIRST, "foo")
     osv(gh, "2026-11-01", "PYSEC-1")
+    downloads(gh, FIRST, "foo")
 
     run(gh, tmp_path, T0, bootstrap=True)
 
@@ -740,6 +868,7 @@ def test_data_through_is_the_oldest_input_generated_at(gh, fake, tmp_path):
 def test_older_inputs_need_an_override(gh, fake, tmp_path):
     registry(gh, SECOND, "foo")
     osv(gh, SECOND, "PYSEC-1")
+    downloads(gh, SECOND, "foo")
     first = T0 + 24 * HOUR
     run(gh, tmp_path, first, bootstrap=True)
     # osv publishes again, saying that the publish was made a day before its last.
@@ -772,6 +901,7 @@ def test_older_inputs_need_an_override(gh, fake, tmp_path):
 def test_a_build_that_lost_registry_events_needs_an_override(gh, fake, tmp_path):
     registry(gh, FIRST, "foo", "bar", created=("foo", "bar"))
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     run(gh, tmp_path, T0, bootstrap=True)
     # The registry is published again from an earlier state, which had seen only the
     # first of the two events.
@@ -803,6 +933,7 @@ def test_main_prints_the_report_and_returns_its_code(
 ):
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     work = tmp_path / "elsewhere"
 
     assert main_at(T0, ["run", "--bootstrap", "--workdir", str(work)]) == 0
@@ -837,11 +968,13 @@ def test_the_run_writes_each_pin_that_is_ready_and_records_the_last(
     monkeypatch.setenv("GITHUB_SHA", "8f3c2a1")
     registry(gh, FIRST, "foo")
     osv(gh, FIRST, "PYSEC-1")
+    downloads(gh, FIRST, "foo")
     first = datetime(2026, 11, 2, 23, 40, tzinfo=UTC)
     run(gh, tmp_path, first, bootstrap=True)
-    # Early on the 3rd, both streams seal the 2nd.
+    # Early on the 3rd, every stream seals the 2nd.
     registry(gh, SECOND, "foo", sealed=(FIRST,))
     osv(gh, SECOND, "PYSEC-1", sealed=(FIRST,))
+    downloads(gh, SECOND, "foo", sealed=(FIRST,))
 
     # It is too soon to build, and the pin of the 2nd is written all the same.
     assert run(gh, tmp_path, first + 30 * MINUTE) == report(
@@ -849,7 +982,7 @@ def test_the_run_writes_each_pin_that_is_ready_and_records_the_last(
     )
     pin = json.loads(fake.asset_bytes("v2026-11-02", "release.json"))
     assert (pin["day"], pin["commit"], pin["repo"]) == (FIRST, "8f3c2a1", REPO)
-    assert [stream["complete"] for stream in pin["streams"].values()] == [True, True]
+    assert [stream["complete"] for stream in pin["streams"].values()] == [True] * 3
     assert published(fake).coverage["last_pin"] is None
     written = fake.release("v2026-11-02")
 
@@ -860,11 +993,12 @@ def test_the_run_writes_each_pin_that_is_ready_and_records_the_last(
     assert fake.release("v2026-11-02") == written
     assert published(fake).coverage["last_pin"] == FIRST
 
-    # On the 5th, the registry has sealed the 3rd, and osv the 3rd and the 4th. The
-    # build writes the pin of the 3rd and records it in its own manifest. The pin of
-    # the 4th waits for the registry.
+    # On the 5th, the registry has sealed the 3rd, and osv and the downloads stream the
+    # 3rd and the 4th. The build writes the pin of the 3rd and records it in its own
+    # manifest. The pin of the 4th waits for the registry.
     registry(gh, "2026-11-04", "foo", sealed=(SECOND,))
     osv(gh, "2026-11-05", "PYSEC-1", sealed=(SECOND, "2026-11-04"))
+    downloads(gh, "2026-11-05", "foo", sealed=(SECOND, "2026-11-04"))
     assert run(gh, tmp_path, datetime(2026, 11, 5, 1, 0, tzinfo=UTC)) == report(
         built=True, reason="inputs changed", pins=["v2026-11-03"]
     )
@@ -873,11 +1007,12 @@ def test_the_run_writes_each_pin_that_is_ready_and_records_the_last(
 
 
 def bootstrap_at_the_end_of_november(gh: GitHub, tmp_path: Path) -> datetime:
-    """Publish both streams on the last day of November, bootstrap the catalog late
+    """Publish every stream on the last day of November, bootstrap the catalog late
     that day, and return the time of the build. No pin is due until December's runs,
     and none is ready before the streams seal the 30th."""
     registry(gh, LAST, "foo")
     osv(gh, LAST, "PYSEC-1")
+    downloads(gh, LAST, "foo")
     built = datetime(2026, 11, 30, 23, 40, tzinfo=UTC)
     run(gh, tmp_path, built, bootstrap=True)
     return built

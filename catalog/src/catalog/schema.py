@@ -187,6 +187,101 @@ CREATE TABLE affected (
 ) WITHOUT ROWID;
 CREATE INDEX affected_by_advisory ON affected (advisory_id);
 
+-- Downloads, from pypi-downloads, each counted for a UTC day. `downloads` includes the
+-- downloads by mirrors, which `mirror_downloads` counts, so downloads without mirrors
+-- are the difference. Days are numbered from 1970-01-01 and months as year * 100 +
+-- month, as the stream numbers them. A row's project is the project of the registry
+-- that has the stream's name for it: the downloads of a name that the registry does not
+-- know are left out of these tables and counted in `download_coverage`.
+
+-- Each project's downloads in each month that the stream has counted days of. A month
+-- holds only the days of it that the stream has counted (see download_period).
+CREATE TABLE download_month (
+    project_id INTEGER NOT NULL,
+    month INTEGER NOT NULL,
+    downloads INTEGER NOT NULL,
+    mirror_downloads INTEGER NOT NULL,
+    PRIMARY KEY (project_id, month)
+) WITHOUT ROWID;
+
+-- The daily downloads of the projects of each year's set (see download_top), from the
+-- close at which each entered it, or for the whole year for those that entered at its
+-- first close. Only the newest years are kept (`download_daily_years` in catalog.toml),
+-- counted back from the year of the newest day that the stream has counted.
+CREATE TABLE download_day (
+    project_id INTEGER NOT NULL,
+    day INTEGER NOT NULL,
+    downloads INTEGER NOT NULL,
+    mirror_downloads INTEGER NOT NULL,
+    PRIMARY KEY (project_id, day)
+) WITHOUT ROWID;
+
+-- Each project's downloads in the window of 30 days that ends with the newest day the
+-- stream has counted (`download_coverage` gives its days and how many of them are
+-- counted), ranked by downloads without mirrors, highest first and ties by name. The
+-- rank is among the projects that the registry knows, while download_top's rank is the
+-- stream's at the close, over every name that it counted.
+CREATE TABLE download_last30 (
+    project_id INTEGER PRIMARY KEY,
+    downloads INTEGER NOT NULL,
+    mirror_downloads INTEGER NOT NULL,
+    rank INTEGER NOT NULL
+);
+
+-- For each year, the projects whose daily downloads are kept: the top 15,000 of each
+-- month's close that falls in the year, by downloads without mirrors, with the month
+-- at whose close each entered the set and its rank then. December's close falls in the
+-- next year, and years before the stream's launch have no set.
+CREATE TABLE download_top (
+    year INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    entered INTEGER NOT NULL,          -- year * 100 + month
+    rank INTEGER NOT NULL,
+    PRIMARY KEY (year, project_id)
+) WITHOUT ROWID;
+
+-- For each month that the stream has counted days of: how many of them, how many days
+-- the month has, and every project's downloads on them, the names that the registry
+-- does not know included. A project's share of a month is its download_month row
+-- against this one, and a month with fewer days than it has is not complete.
+CREATE TABLE download_period (
+    month INTEGER PRIMARY KEY,
+    days INTEGER NOT NULL,
+    days_in_month INTEGER NOT NULL,
+    downloads INTEGER NOT NULL,
+    mirror_downloads INTEGER NOT NULL
+);
+
+-- The days from which what PyPI counts changed, with a note on why, so that a series
+-- is not read across one as if nothing had.
+CREATE TABLE download_break (
+    day TEXT PRIMARY KEY,              -- YYYY-MM-DD
+    note TEXT NOT NULL
+);
+
+-- How far the counted history reaches, as the stream's manifest says, in one row. Days
+-- are YYYY-MM-DD. `launch` is the first day that the stream counted, and it counts
+-- forward from there and back towards 2016-01-22, the first day of PyPI's table:
+-- `first_day` is the start of the unbroken run of counted days that ends at launch,
+-- `last_day` the newest day counted, `days` how many days are counted, and
+-- `backfill_left` how many days before `first_day` are left to count. The window of
+-- download_last30 runs from `window_from` to `window_to` and has `window_days` of its
+-- 30 days counted; with no day counted, both are the launch day and it has none.
+-- `unmatched_projects` counts the names with downloads that the registry does not know,
+-- and `unmatched_downloads` their downloads in the window.
+CREATE TABLE download_coverage (
+    launch TEXT NOT NULL,
+    first_day TEXT NOT NULL,
+    last_day TEXT NOT NULL,
+    days INTEGER NOT NULL,
+    backfill_left INTEGER NOT NULL,
+    window_from TEXT NOT NULL,
+    window_to TEXT NOT NULL,
+    window_days INTEGER NOT NULL,
+    unmatched_projects INTEGER NOT NULL,
+    unmatched_downloads INTEGER NOT NULL
+);
+
 -- Search over name, summary and keywords.
 CREATE VIRTUAL TABLE search USING fts5(
     name, summary, keywords,
@@ -214,6 +309,15 @@ SOURCED: dict[str, tuple[str, ...]] = {
         "event",
     ),
     "osv-pypi": ("advisory", "advisory_package"),
+    "pypi-downloads": (
+        "download_month",
+        "download_day",
+        "download_last30",
+        "download_top",
+        "download_period",
+        "download_break",
+        "download_coverage",
+    ),
 }
 # Made from the tables of more than one stream.
 JOINT = ("affected",)

@@ -24,6 +24,10 @@ REGISTRY_TABLES = frozenset(
     {"projects", "versions_seen", "files_current", "files", "release_records", "events"}
 )
 OSV_TABLES = frozenset({"advisories"})
+DOWNLOADS_TABLES = frozenset(
+    {"projects", "days", "breaks"}
+    | {"folded", "months", "monthly", "top_set", "daily", "recent"}
+)
 
 
 def digest(label: str) -> str:
@@ -208,6 +212,35 @@ OSV = Stream(
     state_tables=("meta", "advisories"),
     delta_tables=("versions", "events", "cursors"),
 )
+
+
+DOWNLOADS = Stream(
+    "pypi-downloads",
+    state_tables=("meta", "projects", "days", "breaks", "spend", "clearances"),
+    delta_tables=("projects", "days", "breaks", "spend", "clearances", "counts"),
+)
+SERVING_TABLES = ("folded", "months", "monthly", "top_set", "daily", "recent")
+
+
+def serving_db() -> Asset:
+    """The downloads stream's derived database: an asset of the current release with the
+    role public, no period and derived tables, which each run makes anew."""
+    return DOWNLOADS._entry(
+        "pypi-downloads-serving.db.zst",
+        current_tag(DOWNLOADS.id),
+        role="public",
+        tables={t: TableInfo(10, "derived") for t in SERVING_TABLES},
+        period=None,
+        closed=False,
+    )
+
+
+def downloads_on_2026_11_04() -> Manifest:
+    return DOWNLOADS.manifest(
+        DOWNLOADS.open_delta("2026-11-04"),
+        serving_db(),
+        *DOWNLOADS.month("2026-11", 1, 2, 3),
+    )
 
 
 def registry_on_2026_11_04() -> Manifest:
@@ -778,3 +811,109 @@ def test_the_choice_does_not_read_names():
         manifest, pinned
     )
     assert open_day(nameless) == open_day(manifest) == date(2027, 2, 3)
+
+
+def test_a_derived_asset_holding_admitted_tables_is_needed():
+    manifest = downloads_on_2026_11_04()
+
+    # The state serves projects, days and breaks, and the derived database the rest. The
+    # counts of the deltas are not admitted, so no delta is needed.
+    assert names(needed_assets(manifest, DOWNLOADS_TABLES)) == [
+        "pypi-downloads-state.db.zst",
+        "pypi-downloads-serving.db.zst",
+    ]
+
+
+def test_a_derived_asset_that_holds_no_admitted_table_is_not_needed():
+    manifest = downloads_on_2026_11_04()
+
+    assert names(needed_assets(manifest, frozenset({"projects", "days"}))) == [
+        "pypi-downloads-state.db.zst"
+    ]
+
+
+def test_no_part_is_asked_for_tables_a_derived_asset_holds():
+    # Here the deltas and the state hold a table that the derived database holds too.
+    # Its rows are read from the derived database alone, so neither is asked for it.
+    manifest = downloads_on_2026_11_04()
+    shared = {"monthly": TableInfo(5, "append")}
+    for asset in [
+        DOWNLOADS.open_delta("2026-11-04"),
+        DOWNLOADS.sealed("2026-11-01"),
+        DOWNLOADS.sealed("2026-11-02"),
+        DOWNLOADS.sealed("2026-11-03"),
+    ]:
+        manifest = changed(manifest, asset, tables={**asset.tables, **shared})
+
+    assert names(needed_assets(manifest, frozenset({"monthly", "daily"}))) == [
+        "pypi-downloads-serving.db.zst"
+    ]
+
+
+def test_a_pin_names_the_parts_behind_the_derived_tables():
+    # November is over, and December has begun. The derived database is made from the
+    # counts of every day folded so far, which only the stream's parts hold, so a pin of
+    # a December day names November's part beside December's base copy and deltas.
+    manifest = DOWNLOADS.manifest(
+        DOWNLOADS.open_delta("2026-12-03"),
+        serving_db(),
+        *DOWNLOADS.closed_month("2026-11", 1, 2, 30),
+        *DOWNLOADS.month("2026-12", 1, 2),
+    )
+
+    assert names(pin_assets(manifest, DOWNLOADS_TABLES, date(2026, 12, 2))) == [
+        "pypi-downloads-2026-11.db.zst",
+        "pypi-downloads-state-base-2026-12.db.zst",
+        "pypi-downloads-delta-2026-12-01.db.zst",
+        "pypi-downloads-delta-2026-12-02.db.zst",
+    ]
+
+    # Without a derived table admitted, the pin rebuilds the state of the day and names
+    # no earlier part, as osv's does.
+    state_only = frozenset({"projects", "days", "breaks"})
+    assert names(pin_assets(manifest, state_only, date(2026, 12, 2))) == [
+        "pypi-downloads-state-base-2026-12.db.zst",
+        "pypi-downloads-delta-2026-12-01.db.zst",
+        "pypi-downloads-delta-2026-12-02.db.zst",
+    ]
+
+
+def test_the_registry_and_osv_need_what_they_needed_without_a_derived_asset():
+    assert names(needed_assets(osv_on_2026_11_04(), OSV_TABLES)) == [
+        "osv-pypi-state.db.zst"
+    ]
+    assert needed_assets(registry_on_2026_11_04(), REGISTRY_TABLES)[-1].name == (
+        "pypi-registry-delta-open.db.zst"
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(
+            {
+                "tables": {
+                    "monthly": TableInfo(10, "derived"),
+                    "daily": TableInfo(5, "append"),
+                }
+            },
+            id="a table of another class",
+        ),
+        pytest.param({"closed": True}, id="a closed asset"),
+        pytest.param({"tables": {}}, id="no tables"),
+    ],
+)
+def test_a_public_asset_that_is_not_derived_is_not_taken_as_one(change):
+    # The state holds the admitted tables, so it is asked for them when the public asset
+    # is not a derived one.
+    serving = serving_db()
+    manifest = changed(downloads_on_2026_11_04(), serving, **change)
+    state = replace(
+        DOWNLOADS.state(),
+        tables={**DOWNLOADS.state().tables, "monthly": TableInfo(1, "append")},
+    )
+    manifest = replace(manifest, assets=[state, *manifest.assets[1:]])
+
+    assert names(needed_assets(manifest, frozenset({"monthly"}))) == [
+        "pypi-downloads-state.db.zst"
+    ]

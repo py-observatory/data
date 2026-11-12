@@ -7,7 +7,10 @@ reads the state, fetches pages and release records, and writes what it learns to
 open delta as numbered rows. It never writes the state: the run applies the delta
 afterwards, with `store.apply_delta`, as a replay of the month's deltas does.
 `process_new`, `process_changed` and `process_unswept` are the steps for one project,
-and are public so that the sweep can share them.
+and are public so that the sweep can share them. `record_current` is the step of the
+records pass, which reads the record of a project's current release when the state
+holds that version without one. `process_status` is the step of the status pass, which
+records a change of a project's status, and `process_changed` takes it too.
 
 Every row of a delta is replayed into the state and published in a monthly part that is
 never replaced, so a row written in error is there for good. Each rule below keeps one
@@ -26,14 +29,16 @@ such row out:
   kept.
 - A file, version or release record that the state holds is never written again. A
   delta holds each once, and a month's deltas are merged by key, which refuses a key
-  that comes twice.
+  that comes twice. So the records pass writes a record alone, for a version that the
+  state holds without one, and never the version again.
 - A page that is read in full ends with a swept row, so the sweep does not read it
   again and write its files a second time.
 
 A project is processed whole or not at all: the time budget is checked between
 projects, never inside one. Errors are not caught. A reply of the wrong shape raises
 ValueError and a failed request raises UpstreamError, and either one ends the run,
-which then publishes nothing to the current release.
+which then publishes nothing to the current release. The records pass alone writes
+nothing for a release record that it refuses and goes on (see `record_current`).
 """
 
 import json
@@ -45,7 +50,7 @@ from datetime import UTC, datetime
 
 from obskit.http import Http, HttpResponse, UpstreamError
 from pypi_registry.diff import Event, classify_probe, diff_files, diff_root
-from pypi_registry.names import canonical_name, version_from_filename
+from pypi_registry.names import canonical_name, latest_version, version_from_filename
 from pypi_registry.records import release_record
 from pypi_registry.simple import (
     ACCEPT,
@@ -233,22 +238,22 @@ def _json_object(body: bytes, what: str) -> dict:
     return document
 
 
-def _record_version(ctx: Context, name: str, incarnation: int, version: str) -> None:
-    """Write a version that the state has not seen, with its release record.
+def _fetch_record(
+    ctx: Context, name: str, incarnation: int, version: str
+) -> dict | None:
+    """The release record of a version, or None when the JSON API has no page for it
+    (404 or 410).
 
-    The record comes from the JSON API, asked for by the canonical version, which PyPI
-    resolves to the release. The version is written with record=True and the record,
-    or with record=False when the API has no page for it (404 or 410). A reply about
-    another project or another version is refused: the record would be kept for good
-    under this project, and keyed by a version that the state may hold already.
-    Raises ValueError for a reply that does not make a record.
+    The record is asked for by the canonical version, which PyPI resolves to the
+    release. A reply about another project or another version is refused: the record
+    would be kept for good under this project, and keyed by a version that the state
+    may hold already. Raises ValueError for a reply that does not make a record.
     """
     url = version_url(name, version)
     response = _get(ctx.http, url)
     ctx.versions_fetched += 1
     if response.status in _GONE:
-        ctx.delta.version(name, incarnation, version, record=False)
-        return
+        return None
     document = _json_object(response.body, f"the JSON of {name} {version}")
     row = release_record(
         name,
@@ -265,8 +270,73 @@ def _record_version(ctx: Context, name: str, incarnation: int, version: str) -> 
         raise ValueError(
             f"{url} is the release {row['version_raw'][:_SHOWN]!r}, not {version!r}"
         )
-    ctx.delta.version(name, incarnation, version, record=True)
+    return row
+
+
+def _record_version(ctx: Context, name: str, incarnation: int, version: str) -> None:
+    """Write a version that the state has not seen, with its release record (see
+    `_fetch_record`): with record=True and the record, or with record=False when the
+    API has no page for it. The version comes first, because applying a record marks
+    a version that the state must hold."""
+    row = _fetch_record(ctx, name, incarnation, version)
+    ctx.delta.version(name, incarnation, version, record=row is not None)
+    if row is not None:
+        ctx.delta.record(row)
+
+
+def current_version(
+    state: sqlite3.Connection, name: str, incarnation: int
+) -> str | None:
+    """The version that a project is at: the latest (see `names.latest_version`) of
+    the versions that its files in the state carry, leaving out the yanked files, or
+    None when it has no such file. A file whose name carries no version that can be
+    read is left out. The versions are canonical, as the state keeps them."""
+    rows = state.execute(
+        "SELECT filename FROM files_current "
+        "WHERE name = ? AND incarnation = ? AND yanked = 0",
+        (name, incarnation),
+    )
+    versions = (version_from_filename(filename) for (filename,) in rows)
+    return latest_version(version for version in versions if version is not None)
+
+
+def record_current(ctx: Context, name: str, incarnation: int) -> str:
+    """Write the release record of a project's current release (see
+    `current_version`) when the state holds that version without one, and say what
+    came of it.
+
+    "recorded": the record was written, and nothing else. The state holds the version
+    already, so writing it again would repeat a key of the month's deltas, and applying
+    the record marks the version as recorded. "missing": the JSON API has no page for
+    the release (404 or 410), and nothing was written. "refused": the reply makes no
+    record that can be kept (`_fetch_record` raised ValueError), and nothing was
+    written. "had": nothing was asked for, because the version has a record, or the
+    project has no current release, or the state has not seen the version, whose record
+    could not be applied.
+
+    This is the records pass's step, and only that pass goes on past a reply that it
+    refuses: it reads the releases from before the bootstrap, close to a million of
+    them, and one that the parser cannot read would otherwise stop it at the same name
+    in every run. A failed request still raises UpstreamError, as it may pass.
+    """
+    version = current_version(ctx.state, name, incarnation)
+    if version is None:
+        return "had"
+    seen = ctx.state.execute(
+        "SELECT record FROM versions_seen "
+        "WHERE name = ? AND incarnation = ? AND version = ?",
+        (name, incarnation, version),
+    ).fetchone()
+    if seen is None or seen[0]:
+        return "had"
+    try:
+        row = _fetch_record(ctx, name, incarnation, version)
+    except ValueError:
+        return "refused"
+    if row is None:
+        return "missing"
     ctx.delta.record(row)
+    return "recorded"
 
 
 def _unseen(versions: list[str], seen: set[str]) -> list[str]:
@@ -322,23 +392,40 @@ def process_unswept(
     ctx.swept += 1
 
 
+def process_status(
+    ctx: Context, name: str, incarnation: int, status: str, page: ProjectPage
+) -> bool:
+    """Write `status_changed`, with the page's status as its detail, when the page of a
+    swept project shows another status than `status`, and say whether it did.
+
+    `status` is the project's status as the rows written so far leave it. This is the
+    status step of `process_changed`, and all that the run's status pass writes for a
+    page that it re-reads: the pass reads projects whose serial has not moved, because
+    archiving a project moves no serial, so nothing else would see it.
+    """
+    if page.status == status:
+        return False
+    ctx.delta.event(Event(name, incarnation, "status_changed", detail=page.status))
+    return True
+
+
 def process_changed(
     ctx: Context, name: str, incarnation: int, status: str, page: ProjectPage
 ) -> None:
     """Record how the page of a swept project differs from the state.
 
     `status` is the project's status as the rows written so far leave it. A page with
-    another status writes `status_changed`. A file that the state lacks is written as
-    exact, since it is seen as it comes, and a stored file that the page lacks is a
-    `file_removed` event. A file whose yank or reason changed is a `yanked` or
-    `unyanked` event. Each version that the state has not seen gets its record.
+    another status writes `status_changed` (see `process_status`). A file that the
+    state lacks is written as exact, since it is seen as it comes, and a stored file
+    that the page lacks is a `file_removed` event. A file whose yank or reason changed
+    is a `yanked` or `unyanked` event. Each version that the state has not seen gets
+    its record.
 
     Raises ValueError for a quarantined page, before anything is written: it lists no
     files, and a diff of it would remove every stored one.
     """
     changes = diff_files(_stored_files(ctx.state, name, incarnation), page)
-    if page.status != status:
-        ctx.delta.event(Event(name, incarnation, "status_changed", detail=page.status))
+    process_status(ctx, name, incarnation, status, page)
     for info in changes.added:
         ctx.delta.file(name, incarnation, info, exact=True)
     for filename in changes.removed:

@@ -6,7 +6,9 @@ previous build, so that the database stays whole and says, in `input.carried`, w
 stream it could not refresh. The joint tables are never carried. `affected` and the
 search index are made again from whatever the stream tables hold, carried or fresh, so a
 new advisory meets the releases of a carried registry, and a new release meets the
-advisories of a carried osv.
+advisories of a carried osv. The download tables name the registry's projects by the
+build's numbers for them, so carried download rows are linked to a registry read afresh
+by name (see `carry_downloads`).
 """
 
 import sqlite3
@@ -16,15 +18,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import osv_pypi
+import pypi_downloads
 import pypi_registry
 from obskit.manifest import Watermark
 from obskit.sqlite import open_db, table_counts
 
 from catalog.advisories import build_advisories, expand_affected
+from catalog.downloads import build_downloads, carry_downloads
 from catalog.records import build_records
 from catalog.registry import build_registry
 from catalog.schema import SERVING_SCHEMA, SOURCED
-from catalog.stage import OsvStage, RegistryStage, attach_read_only
+from catalog.stage import OsvStage, RegistryStage, Stage, attach_read_only
 
 # The most that the compressed serving database may be before a run warns that it is
 # over budget. The build still publishes.
@@ -35,9 +39,10 @@ BUDGET_BYTES = 200_000_000
 class StreamInput:
     """What the build has of one stream: its manifest's time, the watermark of its data,
     whether its manifest says that the data is complete, the fingerprint of the assets
-    read, and its licences as its manifest lists them. `staged` is what the builders
+    read, its licences as its manifest lists them, and its manifest's coverage, which
+    the download tables copy from the downloads stream's. `staged` is what the builders
     read, or None when the stream could not be read and its tables are to be carried
-    over from the previous build."""
+    over from the previous build, and then `coverage` is empty."""
 
     stream: str
     generated_at: str
@@ -45,7 +50,8 @@ class StreamInput:
     complete: bool
     fingerprint: str
     licences: list[dict]
-    staged: RegistryStage | OsvStage | None
+    coverage: dict
+    staged: Stage | None
 
 
 @dataclass(frozen=True)
@@ -75,11 +81,24 @@ def _build_osv(con: sqlite3.Connection, stage: OsvStage) -> int:
 
 
 # How each stream's tables are built from its stage. Each returns the requirements that
-# PEP 508 refused.
+# PEP 508 refused. The downloads stream's are built by `_build`.
 BUILDERS: dict[str, Callable[..., int]] = {
     pypi_registry.STREAM: _build_registry,
     osv_pypi.STREAM: _build_osv,
 }
+
+
+def _build(con: sqlite3.Connection, item: StreamInput, daily_years: int) -> int:
+    """Build the tables of the stream of `item` from its stage, and return the
+    requirements that PEP 508 refused. The downloads stream's builder also takes the
+    stream's coverage and the years of daily rows to keep, and reads no requirement."""
+    if item.stream == pypi_downloads.STREAM:
+        build_downloads(
+            con, item.staged, coverage=item.coverage, daily_years=daily_years
+        )
+        return 0
+    return BUILDERS[item.stream](con, item.staged)
+
 
 _INSERT_INPUT = """
 INSERT INTO main.input (
@@ -111,11 +130,12 @@ FROM previous.attribution WHERE stream = ?
 
 
 def build_serving(
-    out: Path, inputs: list[StreamInput], previous: Path | None
+    out: Path, inputs: list[StreamInput], previous: Path | None, *, daily_years: int
 ) -> BuildReport:
     """Make the serving database at `out`, which must not exist, from `inputs`.
 
-    An input with a stage is built from it. One without is carried from the database at
+    An input with a stage is built from it, the downloads stream's with the daily rows
+    of the newest `daily_years` years. One without is carried from the database at
     `previous`: its tables with their ids, its `input` row marked carried, and its
     attribution. Raises CarryError when there is such an input and `previous` is None or
     has no `input` row for its stream, and ValueError when it lacks a table of the
@@ -128,7 +148,7 @@ def build_serving(
     con = open_db(out, SERVING_SCHEMA, create=True)
     try:
         with closing(con):
-            carried, refused = _fill(con, inputs, previous)
+            carried, refused = _fill(con, inputs, previous, daily_years)
         return BuildReport(
             carried=carried, unparsed_requirements=refused, tables=table_counts(out)
         )
@@ -138,10 +158,14 @@ def build_serving(
 
 
 def _fill(
-    con: sqlite3.Connection, inputs: list[StreamInput], previous: Path | None
+    con: sqlite3.Connection,
+    inputs: list[StreamInput],
+    previous: Path | None,
+    daily_years: int,
 ) -> tuple[list[str], int]:
-    """Build or carry each input into `con`, then make the joint tables and the search
-    index. Returns the streams carried and the requirements that PEP 508 refused."""
+    """Build or carry each input into `con`, in order, then make the joint tables and
+    the search index. Returns the streams carried and the requirements that PEP 508
+    refused."""
     carried: list[str] = []
     refused = 0
     for item in inputs:
@@ -149,7 +173,7 @@ def _fill(
             _carry(con, item.stream, previous)
             carried.append(item.stream)
         else:
-            refused += BUILDERS[item.stream](con, item.staged)
+            refused += _build(con, item, daily_years)
             _write_input(con, item)
     expand_affected(con)
     con.execute("INSERT INTO search(search) VALUES ('rebuild')")
@@ -190,7 +214,9 @@ def _write_input(con: sqlite3.Connection, item: StreamInput) -> None:
 def _carry(con: sqlite3.Connection, stream: str, previous: Path | None) -> None:
     """Copy the tables of `stream`, with its `input` and `attribution` rows, from the
     database at `previous`. The ids come with the rows, because both databases are made
-    from one schema and the tables that link by id are carried together."""
+    from one schema and the tables that link by id are carried together. The download
+    tables are the exception: they name the registry's projects, which may have been
+    read afresh, so their rows are linked again by name (see `carry_downloads`)."""
     if previous is None:
         raise CarryError(f"{stream} could not be read, and there is no previous build")
     # The previous build was downloaded, so it is checked against the schema before it is
@@ -199,8 +225,11 @@ def _carry(con: sqlite3.Connection, stream: str, previous: Path | None) -> None:
     attach_read_only(con, previous, "previous")
     if con.execute(_PREVIOUS_INPUT, (stream,)).fetchone() is None:
         raise CarryError(f"{stream} could not be read, and the previous build lacks it")
-    for table in SOURCED[stream]:
-        con.execute(f"INSERT INTO main.{table} SELECT * FROM previous.{table}")
+    if stream == pypi_downloads.STREAM:
+        carry_downloads(con)
+    else:
+        for table in SOURCED[stream]:
+            con.execute(f"INSERT INTO main.{table} SELECT * FROM previous.{table}")
     con.execute(_CARRY_INPUT, (stream,))
     con.execute(_CARRY_ATTRIBUTION, (stream,))
     # A database cannot be detached while the transaction that read it is open.

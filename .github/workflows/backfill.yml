@@ -1,33 +1,44 @@
 name: backfill
 
-# The two-week sweep of the pypi-registry stream, which reads the page of every project that
-# no run has read in full. A sweep stops starting projects after 15,000 s, which is about
-# 12,000 pages at one request every 1.25 s, so the roughly 930,000 pages take about 78
-# sweeps one after another. It runs when it is dispatched, and each sweep that leaves
-# projects behind dispatches the next one. Start it once by hand, after the registry's
-# bootstrap.
+# The long passes of the pypi-registry stream, each a chain of runs in which every run that
+# leaves work behind dispatches the next. The `task` input names the pass, and every run
+# of a chain runs the task that started it:
 #
-# `sweep` exits with 3 when it read some projects and others are left, and with 0 when it
-# is done, or when it read nothing, which is a page that stays unusable: the chain ends
-# there and does not go round for ever. Both mean that the chain is well, and a sweep that
-# ends so closes the backfill's failure issue, which is its own and not the tick's. Any
-# other code is a failure: the chain stops and the issue opens. Dispatch the workflow
-# again by hand once the cause is gone.
+# - `sweep` reads the page of every project that no run has read in full. A sweep stops
+#   starting projects after 15,000 s, which is about 12,000 pages at one request every
+#   1.25 s, so the roughly 930,000 pages take about 78 sweeps, about two weeks. Start it
+#   once by hand, after the registry's bootstrap.
+# - `records` reads the release record of each project's current release that the
+#   registry lacks. It goes at the sweep's pace and stops at the same time, so its
+#   roughly 900,000 requests take about 75 runs. Start it once by hand, after the sweep
+#   has read every project (the registry's manifest says `unswept: 0`).
 #
-# The chain can also stop without a sweep saying so. The next sweep may fail to be
-# dispatched, a sweep may be cancelled while it waits for the group (a run that queues
-# there replaces the one that waits), and a sweep may be cancelled while it runs, as one
-# that hits the timeout of its job may be. The last job dispatches again a sweep that was
-# cancelled while it waited, so that the chain goes on, and reports the rest. A sweep that
+# A run exits with 3 when it did some of the work and more is left, and with 0 when the
+# work is done, or when it did none of it: a sweep that read nothing met only pages that
+# stay unusable, and a records run that came to no project made no progress, so the chain
+# ends there and does not go round for ever. Both codes mean that the chain is well, and
+# a run that ends so closes the backfill's failure issue, which is its own and not the
+# tick's. Any other code is a failure: the chain stops and the issue opens. Dispatch the
+# workflow again by hand, with the same task, once the cause is gone.
+#
+# The job is named `sweep` for the task it was first written for. It runs whichever task
+# the run was dispatched with, and so do the jobs after it.
+#
+# The chain can also stop without a run saying so. The next run may fail to be
+# dispatched, a run may be cancelled while it waits for the group (a run that queues
+# there replaces the one that waits), and a run may be cancelled while it runs, as one
+# that hits the timeout of its job may be. The last job dispatches again a run that was
+# cancelled while it waited, so that the chain goes on, and reports the rest. A run that
 # it dispatches may in turn replace a tick that waits in the group. That is benign: the
 # next tick catches up.
 #
-# There is never more than one chain. Before each try at dispatching a sweep, a job looks
-# for another backfill run that has not completed, and leaves the chain to it if there is
-# one. To stop the chain, disable this workflow (`gh workflow disable backfill.yml`).
-# Cancelling a run whose sweep is still waiting does not stop it, because the last job
-# then dispatches a new sweep. To resume, enable the workflow (`gh workflow enable
-# backfill.yml`) and dispatch it once.
+# There is never more than one chain. Before each try at dispatching a run, a job looks for
+# another backfill run that has not completed, and leaves the chain to it if there is one.
+# So run one task at a time: a task dispatched while the other's chain goes on ends one of
+# the two chains at its next dispatch. To stop the chain, disable this workflow (`gh
+# workflow disable backfill.yml`). Cancelling a run that is still waiting does not stop
+# it, because the last job then dispatches a new run. To resume, enable the workflow (`gh
+# workflow enable backfill.yml`) and dispatch it once with the task that was running.
 
 on:
   workflow_dispatch:
@@ -37,6 +48,7 @@ on:
         type: choice
         options:
           - sweep
+          - records
         default: sweep
 
 permissions: {}
@@ -44,7 +56,7 @@ permissions: {}
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    # The sweep stops starting projects after 250 minutes (15,000 s, passed below). Then it
+    # Each task stops starting projects after 250 minutes (15,000 s, passed below). Then it
     # finishes the project in hand, applies the changes and publishes, which compresses a
     # state of about 2 GB late in the backfill. The step gives up after 297 minutes, which
     # leaves 47 for that.
@@ -52,7 +64,7 @@ jobs:
     permissions:
       contents: write
       issues: write
-    # The same group as the tick, so a sweep and a tick never publish at once.
+    # The same group as the tick, so a backfill run and a tick never publish at once.
     concurrency:
       group: stream-pypi-registry
       cancel-in-progress: false
@@ -60,10 +72,10 @@ jobs:
       continue: ${{ steps.sweep.outputs.continue }}
       started: ${{ steps.started.outputs.started }}
     steps:
-      # First, so that a sweep that ran at all says so. One that a newer run replaced while
-      # it waited for the group runs no step, so it leaves `started` unset: that is how the
-      # report job below tells it from a sweep that was cancelled while it ran.
-      - name: Note that the sweep started
+      # First, so that a run that started at all says so. One that a newer run replaced
+      # while it waited for the group runs no step, so it leaves `started` unset: that is
+      # how the report job below tells it from a run that was cancelled while it ran.
+      - name: Note that the run started
         id: started
         run: echo "started=true" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,16 +86,17 @@ jobs:
           version: "0.13.6"
       - run: uv sync --locked --package pypi-registry
       - id: sweep
-        name: Sweep
-        # A hung sweep should end as a failed step, which `failure()` below matches, and not
+        name: Run the task
+        # A hung run should end as a failed step, which `failure()` below matches, and not
         # as a job that timed out, which GitHub may count as cancelled. The step gives up
         # three minutes before the job does, which is time enough to open the issue.
         timeout-minutes: 297
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          TASK: ${{ inputs.task }}
         run: |
           code=0
-          uv run --package pypi-registry python -m pypi_registry sweep \
+          uv run --package pypi-registry python -m pypi_registry "$TASK" \
             --max-seconds 15000 || code=$?
           if [ "$code" -eq 3 ]; then
             echo "continue=true" >> "$GITHUB_OUTPUT"
@@ -94,21 +107,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh pypi-registry-backfill failure
-      # Failing to close the issue must not fail the job. The next sweep is dispatched only
+      # Failing to close the issue must not fail the job. The next run is dispatched only
       # when this job succeeds, so a failure here would end the chain with no report. The
-      # next good sweep closes the issue.
+      # next good run closes the issue.
       - if: success()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/rolling-issue.sh pypi-registry-backfill success
 
-  # The next sweep is dispatched from a job of its own, after the sweep job has left the
+  # The next run is dispatched from a job of its own, after the sweep job has left the
   # group above. A group holds one running job and one waiting job, and a job that queues
-  # replaces the one that waits. Dispatched from inside the group, the next sweep would
+  # replaces the one that waits. Dispatched from inside the group, the next run would
   # queue while this one runs and replace the tick that waits behind it, and no tick would
-  # run for as long as the sweeps go on. Dispatched from here, a tick that is waiting
-  # starts first, and the next sweep waits behind it.
+  # run for as long as the chain goes on. Dispatched from here, a tick that is waiting
+  # starts first, and the next run waits behind it.
   redispatch:
     needs: sweep
     if: needs.sweep.outputs.continue == 'true'
@@ -117,8 +130,9 @@ jobs:
     permissions:
       actions: write
     steps:
-      # A dispatch that fails once would end a chain of some 78 sweeps, so it is tried up to
-      # three times. Each try first looks for another backfill run that has not completed.
+      # A dispatch that fails once would end a chain of some 75 runs or more, so it is tried
+      # up to three times, each time with this run's task, so that the chain goes on with
+      # the same one. Each try first looks for another backfill run that has not completed.
       # One that is there carries the chain on, so nothing is dispatched, which would start
       # a second chain. Looking before every try also keeps a dispatch that GitHub took but
       # reported as failed from being made twice. A listing that fails proves nothing, so it
@@ -126,11 +140,12 @@ jobs:
       # another, fails the step at once. The step gives up before the job does, so that a
       # hung call fails the step, and the report job below sees a failure and not a
       # cancelled job.
-      - name: Dispatch the next sweep
+      - name: Dispatch the next run of the task
         timeout-minutes: 4
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TASK: ${{ inputs.task }}
         run: |
           : "${GITHUB_RUN_ID:?}"
           for attempt in 1 2 3; do
@@ -139,11 +154,11 @@ jobs:
               --jq '.[] | select(.status != "completed") | .databaseId'); then
               others=$(printf '%s\n' "$listed" | grep -vx -e "$GITHUB_RUN_ID" -e '' || true)
               if [ -n "$others" ]; then
-                echo "Another backfill run carries the chain on, so no sweep is dispatched:"
+                echo "Another backfill run carries the chain on, so nothing is dispatched:"
                 printf '%s\n' "$others"
                 exit 0
               fi
-              if gh workflow run backfill.yml -f task=sweep; then
+              if gh workflow run backfill.yml -f task="$TASK"; then
                 exit 0
               fi
             fi
@@ -154,17 +169,17 @@ jobs:
           done
           exit 1
 
-  # The ways in which the chain stops without a sweep saying so: the next sweep could not be
-  # dispatched, a sweep was cancelled while it waited (a run that queues in the group
-  # replaces the one that waits there), and a sweep was cancelled while it ran, as one that
-  # hits the timeout of its job may be. A sweep that fails reports through its own step
+  # The ways in which the chain stops without a run saying so: the next run could not be
+  # dispatched, a run was cancelled while it waited (a run that queues in the group
+  # replaces the one that waits there), and a run was cancelled while it ran, as one that
+  # hits the timeout of its job may be. A run that fails reports through its own step
   # above, and this job is skipped then. That is why the step that closes the issue after a
-  # good sweep may not fail the job: the sweep job would fail, the dispatch would be
+  # good run may not fail the job: the sweep job would fail, the dispatch would be
   # skipped, and this job would stay skipped too.
   #
-  # A sweep that was cancelled while it waited never set `started`. It is dispatched again,
-  # with the same tries as the next sweep is, and the issue opens only if no try works.
-  # Every other stop opens the issue.
+  # A run that was cancelled while it waited never set `started`. It is dispatched again,
+  # with its task and the same tries as the next run is, and the issue opens only if no
+  # try works. Every other stop opens the issue.
   report:
     needs: [sweep, redispatch]
     if: always() && (needs.sweep.result == 'cancelled' || needs.redispatch.result == 'failure')
@@ -182,13 +197,14 @@ jobs:
         with:
           persist-credentials: false
       # The same tries as the redispatch job, which look for another backfill run first.
-      - name: Dispatch the sweep that was replaced while it waited
+      - name: Dispatch the run that was replaced while it waited
         id: dispatch
         if: needs.sweep.result == 'cancelled' && needs.sweep.outputs.started != 'true'
         timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TASK: ${{ inputs.task }}
         run: |
           : "${GITHUB_RUN_ID:?}"
           for attempt in 1 2 3; do
@@ -197,11 +213,11 @@ jobs:
               --jq '.[] | select(.status != "completed") | .databaseId'); then
               others=$(printf '%s\n' "$listed" | grep -vx -e "$GITHUB_RUN_ID" -e '' || true)
               if [ -n "$others" ]; then
-                echo "Another backfill run carries the chain on, so no sweep is dispatched:"
+                echo "Another backfill run carries the chain on, so nothing is dispatched:"
                 printf '%s\n' "$others"
                 exit 0
               fi
-              if gh workflow run backfill.yml -f task=sweep; then
+              if gh workflow run backfill.yml -f task="$TASK"; then
                 exit 0
               fi
             fi

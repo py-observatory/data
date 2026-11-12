@@ -6,6 +6,8 @@
 min_gap_minutes = 50  # a build waits this long after the last one
 max_gap_hours = 24    # and one is made anyway once the last is this old
 pin_wait_hours = 24   # a day's pin waits this long after the day for a stream to seal it
+# Daily downloads are kept for this many years: the newest counted day's and the one before.
+download_daily_years = 2
 
 [streams.pypi-registry]
 tables = ["projects", "versions_seen", "files_current", "files", "release_records", "events"]
@@ -14,3 +16,9 @@ stale_after_hours = 30
 [streams.osv-pypi]
 tables = ["advisories"]
 stale_after_hours = 72
+
+# After the registry: streams are built in this order, and the download tables link to
+# the registry's projects by name.
+[streams.pypi-downloads]
+tables = ["projects", "days", "breaks", "monthly", "months", "top_set", "daily", "recent"]
+stale_after_hours = 54

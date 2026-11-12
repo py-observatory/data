@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 
 import pytest
 
+from test_catalog_downloads import counted, counts, coverage, day, member
 from test_catalog_serving import (
+    DAILY_YEARS,
+    downloads_input,
     event,
     osv_input,
     project,
@@ -32,7 +35,8 @@ def gh() -> GitHub:
 def built(gh, tmp_path, projects, records=(), events=()):
     """Build a serving database from a registry of these rows, and return its path."""
     out = tmp_path / "out.db"
-    build_serving(out, [registry_input(gh, tmp_path, projects, records, events)], None)
+    registry = registry_input(gh, tmp_path, projects, records, events)
+    build_serving(out, [registry], None, daily_years=DAILY_YEARS)
     return out
 
 
@@ -176,7 +180,7 @@ def test_admits_osv_pypi_advisories(gh, tmp_path):
             {"id": "MAL-1", "kind": "malware", "status": "removed"},
         ],
     )
-    build_serving(out, [osv], None)
+    build_serving(out, [osv], None, daily_years=DAILY_YEARS)
 
     assert select(out, "SELECT advisory_id, id, kind, status, summary FROM advisory ORDER BY id") == [
         (1, "MAL-1", "malware", "removed", None),
@@ -184,6 +188,160 @@ def test_admits_osv_pypi_advisories(gh, tmp_path):
     ]  # fmt: skip
     assert select(out, "SELECT advisory_id, name, versions FROM advisory_package") == [
         (2, "foo-bar", '["1.0"]')
+    ]
+
+
+def with_downloads(gh, tmp_path, *, state=None, serving=None, last_day="2026-11-10"):
+    """Build a serving database from a registry of foo and bar and a downloads stream
+    with these rows of its state and its serving database, in which foo is the stream's
+    project 2 and bar its project 1, and return its path. The newest day that the
+    stream counted is `last_day`, as its coverage says."""
+    registry = registry_input(
+        gh, tmp_path, [project("foo", "1.0"), project("bar", "1.0")], []
+    )
+    names = [{"project_id": 1, "name": "bar"}, {"project_id": 2, "name": "foo"}]
+    downloads = downloads_input(
+        gh,
+        tmp_path,
+        state={"projects": names, **(state or {})},
+        serving=serving or {},
+        coverage=coverage(
+            first_day="2026-10-31",
+            last_day=last_day,
+            days=2,
+            backfill_left=3935,
+            projects=2,
+            window_days=2,
+        ),
+    )
+    out = tmp_path / "out.db"
+    build_serving(out, [registry, downloads], None, daily_years=DAILY_YEARS)
+    return out
+
+
+def test_admits_pypi_downloads_projects(gh, tmp_path):
+    # bar is the catalog's project 1 and foo its project 2, by name.
+    out = with_downloads(
+        gh,
+        tmp_path,
+        serving={"monthly": [counts(2, "month", 202611, 8, 3)]},
+    )
+
+    assert select(out, "SELECT project_id, month, downloads FROM download_month") == [
+        (2, 202611, 8)
+    ]
+    assert select(out, "SELECT name FROM project WHERE project_id = 2") == [("foo",)]
+
+
+def test_admits_pypi_downloads_days(gh, tmp_path):
+    out = with_downloads(
+        gh,
+        tmp_path,
+        state={"days": counted(day("2026-10-31"), day("2026-11-01"))},
+        last_day="2026-11-01",
+    )
+
+    # The window is the 30 days up to the newest day counted.
+    assert select(
+        out,
+        "SELECT launch, first_day, last_day, days, backfill_left, window_from, "
+        "window_to, window_days FROM download_coverage",
+    ) == [
+        (
+            "2026-11-01",
+            "2026-10-31",
+            "2026-11-01",
+            2,
+            3935,
+            "2026-10-03",
+            "2026-11-01",
+            2,
+        )
+    ]
+
+
+def test_admits_pypi_downloads_breaks(gh, tmp_path):
+    breaks = [
+        {"day": day("2018-07-26"), "note": "undercounted before"},
+        {"day": day("2026-08-24"), "note": "no PEP 658 fetches"},
+    ]
+    out = with_downloads(gh, tmp_path, state={"breaks": breaks})
+
+    assert select(out, "SELECT day, note FROM download_break ORDER BY day") == [
+        ("2018-07-26", "undercounted before"),
+        ("2026-08-24", "no PEP 658 fetches"),
+    ]
+
+
+def test_admits_pypi_downloads_monthly(gh, tmp_path):
+    out = with_downloads(
+        gh,
+        tmp_path,
+        serving={
+            "monthly": [
+                counts(1, "month", 202610, 5, 1),
+                counts(2, "month", 202610, 9),
+                counts(2, "month", 202611, 4, 2),
+            ]
+        },
+    )
+
+    assert select(out, "SELECT * FROM download_month ORDER BY project_id, month") == [
+        (1, 202610, 5, 1),
+        (2, 202610, 9, 0),
+        (2, 202611, 4, 2),
+    ]
+
+
+def test_admits_pypi_downloads_months(gh, tmp_path):
+    months = [{"month": 202610, "days": 1, "downloads": 14, "mirror_downloads": 1}]
+    out = with_downloads(gh, tmp_path, serving={"months": months})
+
+    # October has one of its 31 days.
+    assert select(out, "SELECT * FROM download_period") == [(202610, 1, 31, 14, 1)]
+
+
+def test_admits_pypi_downloads_top_set(gh, tmp_path):
+    members = [member(2027, 2, "foo", 202612, 1), member(2027, 1, "bar", 202701, 9)]
+    out = with_downloads(gh, tmp_path, serving={"top_set": members})
+
+    assert select(out, "SELECT * FROM download_top ORDER BY project_id") == [
+        (2027, 1, 202701, 9),
+        (2027, 2, 202612, 1),
+    ]
+
+
+def test_admits_pypi_downloads_daily(gh, tmp_path):
+    out = with_downloads(
+        gh,
+        tmp_path,
+        state={"days": counted(day("2026-11-01"))},
+        serving={"daily": [counts(2, "day", day("2026-11-01"), 6, 1)]},
+        last_day="2026-11-01",
+    )
+
+    assert select(out, "SELECT * FROM download_day") == [(2, day("2026-11-01"), 6, 1)]
+
+
+def test_admits_pypi_downloads_recent(gh, tmp_path):
+    newest = day("2026-11-01")
+    out = with_downloads(
+        gh,
+        tmp_path,
+        state={"days": counted(newest - 1, newest)},
+        serving={
+            "recent": [
+                counts(1, "day", newest - 1, 3),
+                counts(1, "day", newest, 4),
+                counts(2, "day", newest, 9, 1),
+            ]
+        },
+        last_day="2026-11-01",
+    )
+
+    assert select(out, "SELECT * FROM download_last30 ORDER BY rank") == [
+        (2, 9, 1, 1),
+        (1, 7, 0, 2),
     ]
 
 

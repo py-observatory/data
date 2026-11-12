@@ -12,6 +12,7 @@ BUILD = """\
 min_gap_minutes = 50
 max_gap_hours = 24
 pin_wait_hours = 24
+download_daily_years = 2
 """
 STREAMS = """\
 [streams.pypi-registry]
@@ -30,6 +31,7 @@ LIMITS = [
     ("min_gap_minutes = 50", "build.min_gap_minutes"),
     ("max_gap_hours = 24", "build.max_gap_hours"),
     ("pin_wait_hours = 24", "build.pin_wait_hours"),
+    ("download_daily_years = 2", "build.download_daily_years"),
     ("stale_after_hours = 72", "streams.osv-pypi.stale_after_hours"),
 ]
 # What no limit may be: zero or less, a float, a string, and a bool, which TOML's `true`
@@ -78,6 +80,11 @@ REFUSED = [
         changed("pin_wait_hours = 24\n", ""),
         "build.pin_wait_hours",
         id="no pin_wait_hours",
+    ),
+    pytest.param(
+        changed("download_daily_years = 2\n", ""),
+        "build.download_daily_years",
+        id="no download_daily_years",
     ),
     pytest.param(
         changed('tables = ["advisories"]\n', ""),
@@ -170,7 +177,8 @@ def write(tmp_path: Path, text: str) -> Path:
 def test_load_config_reads_the_admitted_streams():
     config = load_config()
 
-    assert list(config.streams) == ["pypi-registry", "osv-pypi"]
+    # The downloads stream comes after the registry, whose projects its tables link to.
+    assert list(config.streams) == ["pypi-registry", "osv-pypi", "pypi-downloads"]
     assert config.streams["pypi-registry"] == StreamAdmission(
         stream="pypi-registry",
         tables=frozenset(
@@ -188,9 +196,26 @@ def test_load_config_reads_the_admitted_streams():
     assert config.streams["osv-pypi"] == StreamAdmission(
         stream="osv-pypi", tables=frozenset({"advisories"}), stale_after_hours=72
     )
+    assert config.streams["pypi-downloads"] == StreamAdmission(
+        stream="pypi-downloads",
+        tables=frozenset(
+            {
+                "projects",
+                "days",
+                "breaks",
+                "monthly",
+                "months",
+                "top_set",
+                "daily",
+                "recent",
+            }
+        ),
+        stale_after_hours=54,
+    )
     assert config.min_gap_minutes == 50
     assert config.max_gap_hours == 24
     assert config.pin_wait_hours == 24
+    assert config.download_daily_years == 2
 
 
 @pytest.mark.parametrize(("text", "key"), REFUSED)

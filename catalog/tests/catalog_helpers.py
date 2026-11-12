@@ -41,6 +41,7 @@ from datetime import date
 from pathlib import Path
 
 import osv_pypi
+import pypi_downloads
 import pypi_registry
 from obskit.cycle import month_manifest_name
 from obskit.github import GitHub, NotFound
@@ -57,6 +58,8 @@ from obskit.tags import current_tag, month_tag
 from obskit.zst import sha256_file
 from osv_pypi import store as osv_store
 from osv_pypi.index import instant_key
+from pypi_downloads import serving as downloads_serving
+from pypi_downloads import store as downloads_store
 from pypi_registry import store as registry_store
 
 REPO = "py-observatory/data"
@@ -150,6 +153,32 @@ _OSV = _Stream(
     },
 )
 
+# The downloads stream's days are numbered from 1970-01-01, and the time that the counter
+# wrote them is `TIME` unless a test says. The state's `seq` says which delta wrote a day,
+# so a test names it.
+_DOWNLOADS = _Stream(
+    id=pypi_downloads.STREAM,
+    state_schema=downloads_store.STATE_SCHEMA,
+    delta_schema=downloads_store.DELTA_SCHEMA,
+    data_through=lambda open_day: Watermark(open_day, "day"),
+    defaults={
+        "meta": {"value": ""},
+        "days": {
+            "rows_bigquery": 0,
+            "rows_counted": 0,
+            "partition_modified": TIME,
+            "projects": 0,
+            "downloads": 0,
+            "mirror_downloads": 0,
+            "null_project_rows": 0,
+            "read_bytes": 0,
+            "counted_at": TIME,
+            "observed_at": TIME,
+        },
+        "breaks": {"note": ""},
+    },
+)
+
 
 def publish_registry(
     gh: GitHub,
@@ -175,7 +204,7 @@ def publish_registry(
     The manifest says that the publish was made at the start of `open_day`, and that the
     data reaches the serial of that day (see `_registry_data_through`). Its licences are
     the upstreams that the stream's stream.toml names, as a run gives them. The catalog
-    reads nothing more of a stream's manifest than those, the assets and whether the
+    reads nothing more of the registry's manifest than those, the assets and whether the
     data is complete, so the coverage is empty and there is no cursor. The data is
     complete unless `complete` says otherwise, as the registry's is not until its sweep
     has read every project.
@@ -228,6 +257,46 @@ def publish_osv(
     )
 
 
+def publish_downloads(
+    gh: GitHub,
+    *,
+    state: Rows,
+    serving: Rows,
+    open_day: str,
+    open_delta: Rows,
+    coverage: Mapping[str, object] | None = None,
+    sealed: Mapping[str, Rows] | None = None,
+    complete: bool = False,
+) -> Manifest:
+    """Publish pypi-downloads as its run on `open_day`, given as YYYY-MM-DD, leaves it,
+    and return the live manifest.
+
+    `state` holds the rows of the state's tables (meta, projects, days, breaks, spend and
+    clearances), and `open_delta` those of the open delta. `serving` holds the rows of
+    the serving database's tables (folded, months, monthly, top_set, daily and recent),
+    which goes up beside the state as the stream's derived asset: `pypi-downloads-
+    serving.db.zst` in the current release, with the role public and no period. A row of
+    the state's days leaves out nothing but what `_DOWNLOADS` gives it, so it names its
+    `seq`. `sealed` gives the rows of the sealed delta of each day, as
+    `publish_registry`'s does. The data reaches the start of `open_day`, as a day. The
+    manifest's coverage is `coverage`, which the catalog copies into its own tables, or
+    empty. The stream's data is not complete, as it is not until its backfill has
+    counted every day.
+    """
+    return _publish(
+        gh,
+        _DOWNLOADS,
+        state,
+        open_day,
+        open_delta,
+        sealed or {},
+        {},
+        complete=complete,
+        serving=serving,
+        coverage=coverage,
+    )
+
+
 def _publish(
     gh: GitHub,
     stream: _Stream,
@@ -239,15 +308,19 @@ def _publish(
     *,
     generated_at: str | None = None,
     complete: bool = True,
+    serving: Rows | None = None,
+    coverage: Mapping[str, object] | None = None,
 ) -> Manifest:
     """Publish `stream` as `publish_registry` says, and return the manifest. Its
-    `generated_at` is the start of `open_day` unless `generated_at` gives another, and
-    it says that the data is complete unless `complete` is False.
+    `generated_at` is the start of `open_day` unless `generated_at` gives another, it
+    says that the data is complete unless `complete` is False, and its coverage is
+    `coverage`, or empty.
 
     The files go up as a run puts them up: first those of the month releases, each to
     the release that its entry names, and then the state and the open delta, which
     `publish_current` swaps into the current release with the manifest last. A first
-    publish creates the current release.
+    publish creates the current release. With `serving`, the rows of the downloads
+    stream's serving database, that database goes up beside them as a derived asset.
     """
     prior = _live_manifest(gh, stream.id)
     carried = [asset for asset in prior.assets if asset.closed] if prior else []
@@ -257,7 +330,7 @@ def _publish(
         producer=producer(gh.repo),
         generated_at=generated_at or f"{open_day}T00:00:00Z",
         complete=complete,
-        coverage={},
+        coverage=dict(coverage or {}),
         data_through=stream.data_through(open_day),
         cursor=None,
         licences=toml["upstreams"],
@@ -287,6 +360,22 @@ def _publish(
             classes=classes,
             period=open_day,
         )
+        current = [(state_file, state_entry), (delta_file, delta_entry)]
+        if serving is not None:
+            current.append(
+                prepare_asset(
+                    _database(
+                        work / downloads_serving.SERVING_DB,
+                        downloads_serving.SCHEMA,
+                        serving,
+                        {},
+                    ),
+                    work,
+                    tag=tag,
+                    role="public",
+                    classes=classes,
+                )
+            )
         made = _month_files(
             stream,
             work,
@@ -302,10 +391,14 @@ def _publish(
         held = {(asset.tag, asset.name) for asset in carried}
         added = [entry for _, entry in made if (entry.tag, entry.name) not in held]
         manifest = replace(
-            manifest, assets=[state_entry, delta_entry, *carried, *added]
+            manifest, assets=[*(entry for _, entry in current), *carried, *added]
         )
         publish_current(
-            gh, stream.id, [state_file, delta_file], manifest, bootstrap=prior is None
+            gh,
+            stream.id,
+            [file for file, _ in current],
+            manifest,
+            bootstrap=prior is None,
         )
     return manifest
 
@@ -503,8 +596,12 @@ def _database(
     with closing(open_db(path, schema, create=True)) as con:
         listed = [(table, row) for table, many in rows.items() for row in many]
         for place, (table, row) in enumerate(listed, start=1):
+            have = {r[1] for r in con.execute(f"PRAGMA table_info({_quote(table)})")}
             values = {**defaults.get(table, {}), **row}
-            if first_seq is not None:
+            # A default is for the columns that the schema has: one table of a state
+            # and its delta may differ in them, as the downloads days do in `observed_at`.
+            values = {c: v for c, v in values.items() if c in have or c in row}
+            if first_seq is not None and "seq" in have:
                 values.setdefault("seq", first_seq + place)
             columns = ", ".join(_quote(column) for column in values)
             marks = ", ".join("?" * len(values))
