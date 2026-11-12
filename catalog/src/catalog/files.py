@@ -51,13 +51,16 @@ def file_kind(filename: str) -> str:
 
 
 # The files that each project's latest version has now and has not yanked, in the order
-# of the projects, so that one project's files are in hand at a time.
+# of the projects, so that one project's files are in hand at a time. The stage's
+# columns have no type and the catalog's incarnation is an INTEGER, so a plain comparison
+# would apply INTEGER affinity and keep SQLite from using current_files' key past the
+# name; the unary + drops it, so each version's files are found by the whole key.
 _LATEST_FILES = """
 SELECT p.project_id, p.latest_version, c.filename, c.size, c.has_provenance
 FROM main.project AS p
 JOIN stage.current_files AS c
     ON c.name = p.name
-    AND c.incarnation = p.incarnation
+    AND c.incarnation = +p.incarnation
     AND c.version = p.latest_version
 ORDER BY p.project_id
 """

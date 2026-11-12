@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 from catalog.config import load_config
-from catalog.files import build_files, file_kind, wheel_tags
+from catalog.files import _LATEST_FILES, build_files, file_kind, wheel_tags
 from catalog.inputs import needed_assets
 from catalog.registry import build_registry
 from catalog.schema import SERVING_DB, SERVING_SCHEMA
-from catalog.stage import stage_registry
+from catalog.stage import attach_read_only, stage_registry
 from catalog_helpers import REPO, TOKEN, no_sleep, publish_registry
 from obskit.github import GitHub
 from obskit.sqlite import open_db
@@ -295,3 +295,16 @@ def test_wheel_tags_are_shared_between_projects(gh, tmp_path):
 
     assert select(db, "SELECT * FROM wheel_tag") == [(1, "py3", "none", "any")]
     assert select(db, "SELECT * FROM latest_wheel_tag ORDER BY 1") == [(1, 1), (2, 1)]
+
+
+def test_the_latest_files_are_found_by_name_incarnation_and_version(gh, tmp_path):
+    # The stage holds tens of millions of files, so each project's latest files must be
+    # found through the whole key of current_files, not by name alone.
+    db = build(gh, tmp_path, *one_project([("sampleproject-1.1.tar.gz", "1.1", 10, 0)]))
+    with closing(open_db(db, SERVING_SCHEMA)) as con:
+        attach_read_only(con, tmp_path / "work" / "stage.db", "stage")
+        plan = " ".join(
+            row[3] for row in con.execute(f"EXPLAIN QUERY PLAN {_LATEST_FILES}")
+        )
+
+    assert "name=? AND incarnation=? AND version=?" in plan
