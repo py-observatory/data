@@ -45,7 +45,8 @@ def gh() -> GitHub:
 
 def project(name: str, *versions: str, status: str = "active") -> dict:
     """The rows, by table, of a project that has a file in each of `versions`, whose
-    state has seen each of them with a record. The files are of the open delta."""
+    state has seen each of them with a record. The files are of the open delta, and each
+    gives a requires-python."""
     rows: dict[str, list[dict]] = {
         "projects": [{"name": name, "status": status}],
         "versions_seen": [],
@@ -61,6 +62,7 @@ def project(name: str, *versions: str, status: str = "active") -> dict:
                 "filename": filename,
                 "version": version,
                 "upload_time": "2026-10-05T00:00:00Z",
+                "requires_python": ">=3.9",
             }
         )
         rows["files_current"].append({"name": name, "filename": filename})

@@ -16,6 +16,7 @@ TABLES = {
     "attribution",
     "project",
     "release",
+    "requires_python_text",
     "change",
     "requirement_text",
     "requirement",

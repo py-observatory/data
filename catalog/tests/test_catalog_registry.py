@@ -312,6 +312,72 @@ def test_a_project_never_read_counts_no_releases(gh, tmp_path):
     ]
 
 
+def test_each_release_takes_the_requires_python_of_its_files(gh, tmp_path):
+    next_sdist = "sampleproject-1.1.tar.gz"
+    other = "otherproject-2.0.tar.gz"
+    db = build(
+        gh,
+        tmp_path,
+        state={
+            "projects": [{"name": NAME}, {"name": "otherproject"}],
+            "versions_seen": [
+                seen("1.0"),
+                seen("1.1"),
+                seen("2.0", name="otherproject"),
+            ],
+            "files_current": [
+                current(SDIST),
+                current(next_sdist),
+                current(other, name="otherproject"),
+            ],
+        },
+        open_delta={
+            "files": [
+                file(SDIST, "1.0", UPLOADED, requires_python=">=3.8"),
+                file(next_sdist, "1.1", LATER),
+                file(other, "2.0", LATER, name="otherproject", requires_python=">=3.8"),
+            ]
+        },
+    )
+
+    # One text, kept once; 1.1 gives none. otherproject sorts first, so it is project 1.
+    assert select(db, "SELECT requires_python_id, text FROM requires_python_text") == [
+        (1, ">=3.8")
+    ]
+    assert select(
+        db,
+        "SELECT project_id, version, requires_python_id FROM release "
+        "ORDER BY project_id, version",
+    ) == [(1, "2.0", 1), (2, "1.0", 1), (2, "1.1", None)]
+
+
+def test_requires_python_texts_are_numbered_in_text_order(gh, tmp_path):
+    next_sdist = "sampleproject-1.1.tar.gz"
+    db = build(
+        gh,
+        tmp_path,
+        state={
+            "projects": [{"name": NAME}],
+            "versions_seen": [seen("1.0"), seen("1.1")],
+            "files_current": [current(SDIST), current(next_sdist)],
+        },
+        open_delta={
+            "files": [
+                file(SDIST, "1.0", UPLOADED, requires_python=">=3.9"),
+                file(next_sdist, "1.1", LATER, requires_python=">=3.10"),
+            ]
+        },
+    )
+
+    assert select(db, "SELECT requires_python_id, text FROM requires_python_text") == [
+        (1, ">=3.10"),
+        (2, ">=3.9"),
+    ]
+    assert select(
+        db, "SELECT version, requires_python_id FROM release ORDER BY version"
+    ) == [("1.0", 2), ("1.1", 1)]
+
+
 def test_latest_version_prefers_finals_and_skips_yanked_and_removed(gh, tmp_path):
     assert latest_version(["1.0", "2.0rc1"]) == "1.0"
     assert latest_version(["2.0rc1"]) == "2.0rc1"

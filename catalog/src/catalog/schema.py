@@ -79,9 +79,18 @@ CREATE TABLE release (
     yanked INTEGER NOT NULL,           -- 1 when every file it has now is yanked
     yanked_reason TEXT,
     has_record INTEGER NOT NULL,
+    requires_python_id INTEGER,        -- requires_python_text; NULL when no file gives one
     PRIMARY KEY (project_id, version)
 ) WITHOUT ROWID;
 CREATE INDEX release_by_upload ON release (uploaded);
+
+-- Each requires-python that a release has, as the earliest uploaded of its files that
+-- gives one writes it, numbered in text order. A value that is empty or only whitespace
+-- is none.
+CREATE TABLE requires_python_text (
+    requires_python_id INTEGER PRIMARY KEY,
+    text TEXT NOT NULL UNIQUE
+);
 
 -- The fields each recorded release changed.
 CREATE TABLE change (
@@ -299,6 +308,7 @@ SOURCED: dict[str, tuple[str, ...]] = {
     "pypi-registry": (
         "project",
         "release",
+        "requires_python_text",
         "change",
         "requirement_text",
         "requirement",
