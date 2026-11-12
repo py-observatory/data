@@ -63,13 +63,15 @@ def workdir(tmp_path: Path) -> Path:
     return path
 
 
-def file(filename: str, version: str | None, uploaded: str | None) -> dict:
-    """A row of a delta's files: a file of sampleproject, as the delta first saw it."""
+def file(filename: str, version: str | None, uploaded: str | None, **columns) -> dict:
+    """A row of a delta's files: a file of sampleproject, as the delta first saw it, with
+    any other `columns` of the row."""
     return {
         "name": NAME,
         "filename": filename,
         "version": version,
         "upload_time": uploaded,
+        **columns,
     }
 
 
@@ -96,7 +98,26 @@ def select(db: Path, query: str) -> list[tuple]:
 
 def release_files(stage: RegistryStage) -> list[tuple]:
     return select(
-        stage.stage, "SELECT * FROM release_files ORDER BY name, incarnation, version"
+        stage.stage,
+        "SELECT name, incarnation, version, uploaded, files_ever, files_now, "
+        "files_yanked, yanked_reason "
+        "FROM release_files ORDER BY name, incarnation, version",
+    )
+
+
+def release_python(stage: RegistryStage) -> list[tuple]:
+    return select(
+        stage.stage,
+        "SELECT name, incarnation, version, requires_python, requires_python_at "
+        "FROM release_files ORDER BY name, incarnation, version",
+    )
+
+
+def current_files(stage: RegistryStage) -> list[tuple]:
+    return select(
+        stage.stage,
+        "SELECT name, incarnation, version, filename, size, has_provenance "
+        "FROM current_files ORDER BY name, incarnation, version, filename",
     )
 
 
@@ -319,6 +340,175 @@ def test_files_without_a_version_are_left_out(gh, workdir):
     stage = staged(gh, manifest, workdir)
 
     assert release_files(stage) == [(NAME, 1, "1.0", UPLOADED, 1, 1, 0, None)]
+
+
+def test_requires_python_is_the_earliest_files_value(gh, workdir):
+    # The wheel was uploaded first and says >=3.8; the sdist, later, says >=3.9.
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(SDIST), current(WHEEL)]},
+        open_day="2026-11-02",
+        open_delta={"files": [file(SDIST, "1.0", LATER, requires_python=">=3.9")]},
+        sealed={
+            "2026-11-01": {
+                "files": [file(WHEEL, "1.0", UPLOADED, requires_python=">=3.8")]
+            }
+        },
+    )
+
+    assert release_python(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", ">=3.8", UPLOADED)
+    ]
+
+
+def test_a_later_part_with_an_earlier_file_gives_requires_python(gh, workdir):
+    # The part read first holds the later file; the open delta, read last, the earlier.
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(SDIST), current(WHEEL)]},
+        open_day="2026-11-02",
+        open_delta={"files": [file(WHEEL, "1.0", UPLOADED, requires_python=">=3.8")]},
+        sealed={
+            "2026-11-01": {
+                "files": [file(SDIST, "1.0", LATER, requires_python=">=3.9")]
+            }
+        },
+    )
+
+    assert release_python(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", ">=3.8", UPLOADED)
+    ]
+
+
+def test_a_blank_requires_python_is_none(gh, workdir):
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(SDIST), current(WHEEL)]},
+        open_day="2026-11-02",
+        open_delta={
+            "files": [
+                file(WHEEL, "1.0", UPLOADED, requires_python="  "),
+                file(SDIST, "1.0", LATER, requires_python=">=3.10"),
+            ]
+        },
+    )
+
+    assert release_python(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", ">=3.10", LATER)
+    ]
+
+
+def test_a_file_without_an_upload_time_gives_requires_python_last(gh, workdir):
+    # The wheel has no upload time, so the sdist's value comes first, though the wheel
+    # sorts first by name.
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(SDIST), current(WHEEL)]},
+        open_day="2026-11-02",
+        open_delta={
+            "files": [
+                file(WHEEL, "1.0", None, requires_python=">=3.8"),
+                file(SDIST, "1.0", LATER, requires_python=">=3.9"),
+            ]
+        },
+    )
+
+    assert release_python(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", ">=3.9", LATER)
+    ]
+
+
+def test_a_release_with_no_requires_python_has_none(gh, workdir):
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(SDIST)]},
+        open_day="2026-11-02",
+        open_delta={"files": [file(SDIST, "1.0", UPLOADED)]},
+    )
+
+    assert release_python(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", None, None)
+    ]
+
+
+def test_current_files_hold_the_files_the_state_has_and_has_not_yanked(gh, workdir):
+    # 1.0's sdist is yanked, its py2 wheel removed; its py3 wheel stays.
+    removed = "sampleproject-1.0-py2-none-any.whl"
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(SDIST, yanked="broken"), current(WHEEL)]},
+        open_day="2026-11-02",
+        open_delta={"files": [file(WHEEL, "1.0", LATER, size=2048, has_provenance=1)]},
+        sealed={
+            "2026-11-01": {
+                "files": [
+                    file(SDIST, "1.0", UPLOADED, size=4096, has_provenance=0),
+                    file(removed, "1.0", UPLOADED, size=1024, has_provenance=0),
+                ]
+            }
+        },
+    )
+
+    assert current_files(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", WHEEL, 2048, 1)
+    ]
+
+
+def test_current_files_leave_out_files_without_a_version(gh, workdir):
+    egg = "sampleproject.egg"
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(egg)]},
+        open_day="2026-11-02",
+        open_delta={"files": [file(egg, None, UPLOADED)]},
+    )
+
+    assert current_files(staged(gh, manifest, workdir)) == []
+
+
+def test_current_files_keep_each_incarnation_apart(gh, workdir):
+    # Both incarnations of sampleproject have a 1.0 whose file the state still has.
+    old = "sampleproject-1.0.zip"
+    manifest = publish_registry(
+        gh,
+        state={
+            "files_current": [
+                current(old),
+                {**current(SDIST), "incarnation": 2},
+            ]
+        },
+        open_day="2026-11-02",
+        open_delta={},
+        parts={
+            "2026-10": {
+                "files": [
+                    file(old, "1.0", UPLOADED),
+                    {**file(SDIST, "1.0", LATER), "incarnation": 2},
+                ]
+            }
+        },
+    )
+
+    assert current_files(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", old, None, None),
+        (NAME, 2, "1.0", SDIST, None, None),
+    ]
+
+
+def test_a_file_two_parts_hold_is_kept_once(gh, workdir):
+    # The registry writes a file once, when first seen; were two parts to hold one, the
+    # stage keeps the row of the part read first.
+    manifest = publish_registry(
+        gh,
+        state={"files_current": [current(WHEEL)]},
+        open_day="2026-11-02",
+        open_delta={"files": [file(WHEEL, "1.0", UPLOADED, size=200)]},
+        sealed={"2026-11-01": {"files": [file(WHEEL, "1.0", UPLOADED, size=100)]}},
+    )
+
+    assert current_files(staged(gh, manifest, workdir)) == [
+        (NAME, 1, "1.0", WHEEL, 100, None)
+    ]
 
 
 def test_records_and_events_come_from_every_part(gh, workdir):
