@@ -8,8 +8,9 @@ are tables of its deltas, which are large: their files alone are tens of million
 rows. So `stage_registry` reads the parts one at a time, keeps of each only what a build
 needs, and deletes each before it downloads the next, so that the disk never holds the
 files twice. It sums each release's files into one row, joined with the state's
-files_current for what each file is now, and copies the release records and the events
-as they are.
+files_current for what each file is now, keeps a short row for each file that the state
+still has and has not yanked, and copies the release records and the events as they
+are.
 
 A downloaded database is data from outside. Each is opened with obskit.sqlite.open_db
 against its stream's schema, which refuses one that lacks a table, and the stage reads
@@ -88,7 +89,16 @@ def _registry_tables(tables: tuple[str, ...]) -> str:
 # the earliest upload time of its files, as the registry writes it. `files_ever` counts
 # the files that the deltas have seen, `files_now` those that the state still has, and
 # `files_yanked` those of them that the state has yanked. `yanked_reason` is the reason
-# that the first part to give one gives.
+# that the first part to give one gives. `requires_python` is the release's, as the
+# earliest uploaded of its files that gives one writes it, of every file the deltas have
+# seen, a removed one included; a value that is empty or only whitespace gives none.
+# A file with no upload time comes after every file with one, and files uploaded at the
+# same time are taken in the order of their names within a part, and in the order of
+# the parts between them. `requires_python_at` is the upload time of that file, which
+# is how a later part is weighed against what the earlier ones gave.
+#
+# current_files has one row for each file with a version that the state still has and
+# has not yanked: what the summary of a project's latest release is made from.
 #
 # release_records and events are as the registry's delta makes them, so that each is
 # copied as it is.
@@ -102,7 +112,19 @@ CREATE TABLE release_files (
     files_now INTEGER NOT NULL,
     files_yanked INTEGER NOT NULL,
     yanked_reason,
+    requires_python,
+    requires_python_at,
     PRIMARY KEY (name, incarnation, version)
+) WITHOUT ROWID;
+
+CREATE TABLE current_files (
+    name,
+    incarnation,
+    version,
+    filename,
+    size,
+    has_provenance,
+    PRIMARY KEY (name, incarnation, version, filename)
 ) WITHOUT ROWID;
 """ + _registry_tables(_COPIED)
 
@@ -113,10 +135,27 @@ CREATE TABLE release_files (
 #
 # min() of two values is NULL when either is NULL, so the earliest upload goes through
 # coalesce, which keeps a time when only one of the two has one.
-_SUM_FILES = """
+#
+# `python` picks, for each release of the part, the earliest of its files that gives a
+# requires-python (see STAGE_SCHEMA). A part's value replaces the one staged only when
+# none is staged, or when its file was uploaded strictly earlier: a time beats no time,
+# and the part read first keeps a tie. SQLite works out every value of the SET from the
+# row as it was, so both columns see the same old row.
+_BLANK = "' ' || char(9) || char(10) || char(13)"
+_TAKE_PYTHON = """
+excluded.requires_python IS NOT NULL AND (
+    requires_python IS NULL OR (
+        excluded.requires_python_at IS NOT NULL AND (
+            requires_python_at IS NULL OR excluded.requires_python_at < requires_python_at
+        )
+    )
+)
+"""
+_SUM_FILES = f"""
 INSERT INTO release_files (
     name, incarnation, version, uploaded,
-    files_ever, files_now, files_yanked, yanked_reason
+    files_ever, files_now, files_yanked, yanked_reason,
+    requires_python, requires_python_at
 )
 SELECT
     f.name,
@@ -126,10 +165,29 @@ SELECT
     count(*),
     count(c.filename),
     count(*) FILTER (WHERE c.yanked),
-    min(c.yanked_reason)
+    min(c.yanked_reason),
+    python.requires_python,
+    python.upload_time
 FROM part.files AS f
 LEFT JOIN state.files_current AS c
     ON c.name = f.name AND c.incarnation = f.incarnation AND c.filename = f.filename
+LEFT JOIN (
+    SELECT name, incarnation, version, requires_python, upload_time
+    FROM (
+        SELECT
+            name, incarnation, version, requires_python, upload_time,
+            row_number() OVER (
+                PARTITION BY name, incarnation, version
+                ORDER BY upload_time IS NULL, upload_time, filename
+            ) AS place
+        FROM part.files
+        WHERE version IS NOT NULL AND trim(requires_python, {_BLANK}) <> ''
+    )
+    WHERE place = 1
+) AS python
+    ON python.name = f.name
+    AND python.incarnation = f.incarnation
+    AND python.version = f.version
 WHERE f.version IS NOT NULL
 GROUP BY f.name, f.incarnation, f.version
 ON CONFLICT (name, incarnation, version) DO UPDATE SET
@@ -137,7 +195,25 @@ ON CONFLICT (name, incarnation, version) DO UPDATE SET
     files_ever = files_ever + excluded.files_ever,
     files_now = files_now + excluded.files_now,
     files_yanked = files_yanked + excluded.files_yanked,
-    yanked_reason = coalesce(yanked_reason, excluded.yanked_reason)
+    yanked_reason = coalesce(yanked_reason, excluded.yanked_reason),
+    requires_python = CASE WHEN {_TAKE_PYTHON}
+        THEN excluded.requires_python ELSE requires_python END,
+    requires_python_at = CASE WHEN {_TAKE_PYTHON}
+        THEN excluded.requires_python_at ELSE requires_python_at END
+"""
+
+# The files of one part that have a version and that the state still has and has not
+# yanked. The registry writes a file once, when it first sees it, so no two parts should
+# hold one; were they to, the part read first keeps its row, because a duplicate that
+# changes nothing must not stop every build.
+_KEEP_CURRENT_FILES = """
+INSERT INTO current_files (name, incarnation, version, filename, size, has_provenance)
+SELECT f.name, f.incarnation, f.version, f.filename, f.size, f.has_provenance
+FROM part.files AS f
+JOIN state.files_current AS c
+    ON c.name = f.name AND c.incarnation = f.incarnation AND c.filename = f.filename
+WHERE f.version IS NOT NULL AND NOT c.yanked
+ON CONFLICT DO NOTHING
 """
 
 
@@ -147,9 +223,10 @@ def stage_registry(gh: GitHub, assets: list[Asset], workdir: Path) -> RegistrySt
 
     `assets` are as `needed_assets` gives them: the state, and then the delta parts in
     the order of their periods. The state comes first, and stays for the builders. Then
-    each part in turn is downloaded, its files are summed into release_files, its
-    release records and its events are copied, and it is deleted before the next one
-    is downloaded, so that the disk holds one part at a time. A part is staged whole or
+    each part in turn is downloaded, its files are summed into release_files, those
+    that the state still has and has not yanked are kept in current_files, its release
+    records and its events are copied, and it is deleted before the next one is
+    downloaded, so that the disk holds one part at a time. A part is staged whole or
     not at all.
 
     Raises sqlite3.IntegrityError when two parts hold one release record or one event,
@@ -181,6 +258,7 @@ def _stage_part(
     open_db(part, registry_store.DELTA_SCHEMA).close()
     attach_read_only(con, part, "part")
     con.execute(_SUM_FILES)
+    con.execute(_KEEP_CURRENT_FILES)
     for table in _COPIED:
         _copy(con, table)
     # The part cannot be detached while the transaction that read it is open.

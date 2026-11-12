@@ -45,7 +45,8 @@ def gh() -> GitHub:
 
 def project(name: str, *versions: str, status: str = "active") -> dict:
     """The rows, by table, of a project that has a file in each of `versions`, whose
-    state has seen each of them with a record. The files are of the open delta."""
+    state has seen each of them with a record. The files are of the open delta, and each
+    gives a requires-python."""
     rows: dict[str, list[dict]] = {
         "projects": [{"name": name, "status": status}],
         "versions_seen": [],
@@ -61,6 +62,7 @@ def project(name: str, *versions: str, status: str = "active") -> dict:
                 "filename": filename,
                 "version": version,
                 "upload_time": "2026-10-05T00:00:00Z",
+                "requires_python": ">=3.9",
             }
         )
         rows["files_current"].append({"name": name, "filename": filename})
@@ -205,13 +207,18 @@ def assert_carried(out: Path, previous: Path, stream: str) -> None:
 
 
 def a_registry(gh, tmp_path, *, day: str = FIRST) -> StreamInput:
-    """A registry with a project, foo, at 1.0 and 1.1, and a removed and a quarantined
-    one, with records and events that fill every table that a registry fills."""
+    """A registry with a project, foo, at 1.0 and 1.1, whose 1.1 has a wheel too, and a
+    removed and a quarantined one, with records and events that fill every table that a
+    registry fills."""
+    foo = project("foo", "1.0", "1.1")
+    wheel = "foo-1.1-py3-none-any.whl"
+    foo["files"].append({**foo["files"][1], "filename": wheel, "has_provenance": 1})
+    foo["files_current"].append({"name": "foo", "filename": wheel})
     return registry_input(
         gh,
         tmp_path,
         [
-            project("foo", "1.0", "1.1"),
+            foo,
             project("gone", "0.1", status="removed"),
             project("held", "0.1", status="quarantined"),
         ],

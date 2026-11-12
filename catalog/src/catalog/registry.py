@@ -4,9 +4,9 @@ each are new in a month.
 The registry is staged as two databases (see catalog.stage): its state, as it keeps it,
 and the stage, which holds what was taken from its deltas. A project is a row of the
 state's projects. Its releases are the versions that the state has seen of its current
-incarnation, and each takes the upload time and the file counts that the stage summed for
-it. The events are copied as they are, those of every incarnation, because they are the
-history of a name and not only of the project that holds it now.
+incarnation, and each takes the upload time, the file counts and the requires-python that
+the stage summed for it. The events are copied as they are, those of every incarnation,
+because they are the history of a name and not only of the project that holds it now.
 
 A release's record gives a project the rest of what it says of itself, such as its summary
 and its licence. Those columns are left empty here, and are filled afterwards from the
@@ -59,12 +59,13 @@ FROM state.projects
 # 2017-08-06T03:43:27.195869Z, in whole seconds. SQLite reads a time with no zone as UTC.
 _INSERT_RELEASES = """
 INSERT INTO main.release (
-    project_id, version, uploaded, files, yanked, yanked_reason, has_record
+    project_id, version, uploaded, files, yanked, yanked_reason, has_record,
+    requires_python_id
 )
 SELECT
     project_id, version, uploaded, files, yanked,
     CASE WHEN yanked THEN yanked_reason END,
-    has_record
+    has_record, requires_python_id
 FROM (
     SELECT
         p.project_id AS project_id,
@@ -73,14 +74,32 @@ FROM (
         r.files_now AS files,
         coalesce(r.files_now > 0 AND r.files_yanked = r.files_now, 0) AS yanked,
         r.yanked_reason AS yanked_reason,
-        v.record AS has_record
+        v.record AS has_record,
+        t.requires_python_id AS requires_python_id
     FROM main.project AS p
     JOIN state.versions_seen AS v
         ON v.name = p.name AND v.incarnation = p.incarnation
     LEFT JOIN stage.release_files AS r
         ON r.name = v.name AND r.incarnation = v.incarnation AND r.version = v.version
+    LEFT JOIN main.requires_python_text AS t
+        ON t.text = r.requires_python
 )
 ORDER BY project_id, version
+"""
+
+# The requires-python of the releases that _INSERT_RELEASES makes, each once, inserted in
+# text order so that they are numbered in it. A value of a version of an earlier
+# incarnation, which is no release now, is left out.
+_INTERN_REQUIRES_PYTHON = """
+INSERT INTO main.requires_python_text (text)
+SELECT DISTINCT r.requires_python
+FROM main.project AS p
+JOIN state.versions_seen AS v
+    ON v.name = p.name AND v.incarnation = p.incarnation
+JOIN stage.release_files AS r
+    ON r.name = v.name AND r.incarnation = v.incarnation AND r.version = v.version
+WHERE r.requires_python IS NOT NULL
+ORDER BY r.requires_python
 """
 
 # The totals of each project's releases. `releases` counts those that have a file now, a
@@ -165,11 +184,11 @@ GROUP BY month
 
 
 def build_registry(con: sqlite3.Connection, stage: RegistryStage) -> None:
-    """Fill `project`, `release`, `event` and `growth` of the serving database that
-    `con` is open on, from the registry that `stage` holds.
+    """Fill `project`, `release`, `requires_python_text`, `event` and `growth` of the
+    serving database that `con` is open on, from the registry that `stage` holds.
 
     `project` gets every column but `record_version` and those after it, which come from
-    a release's record. The four tables must be empty. `con` must be a connection that
+    a release's record. The five tables must be empty. `con` must be a connection that
     opens URIs, as the one that `open_db` gives does, because the state and the stage
     are attached by the URIs that make them read-only.
 
@@ -181,6 +200,7 @@ def build_registry(con: sqlite3.Connection, stage: RegistryStage) -> None:
     attach_read_only(con, stage.state, "state")
     attach_read_only(con, stage.stage, "stage")
     con.execute(_INSERT_PROJECTS)
+    con.execute(_INTERN_REQUIRES_PYTHON)
     con.execute(_INSERT_RELEASES)
     con.execute(_SET_RELEASE_TOTALS)
     _set_latest_versions(con)

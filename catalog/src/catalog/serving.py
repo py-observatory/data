@@ -25,6 +25,7 @@ from obskit.sqlite import open_db, table_counts
 
 from catalog.advisories import build_advisories, expand_affected
 from catalog.downloads import build_downloads, carry_downloads
+from catalog.files import build_files
 from catalog.records import build_records
 from catalog.registry import build_registry
 from catalog.schema import SERVING_SCHEMA, SOURCED
@@ -71,6 +72,7 @@ class CarryError(RuntimeError):
 def _build_registry(con: sqlite3.Connection, stage: RegistryStage) -> int:
     """The registry's tables, and the number of requirements that PEP 508 refused."""
     build_registry(con, stage)
+    build_files(con, stage)
     return build_records(con, stage)
 
 
