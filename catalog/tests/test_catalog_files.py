@@ -58,7 +58,17 @@ def test_extra_dashes_still_give_the_last_three_fields():
 
 @pytest.mark.parametrize(
     "filename",
-    ["broken.whl", "pkg-1.0-py3.whl", "pkg-1.0-py3-none.whl", "pkg-1.0.tar.gz", ""],
+    [
+        "broken.whl",
+        "pkg-1.0-py3.whl",
+        "pkg-1.0-py3-none.whl",
+        "pkg-1.0.tar.gz",
+        "",
+        "pkg-1.0-py3-none-.whl",
+        "pkg-1.0-py2..py3-none-any.whl",
+        "my-pkg-1.0-py3-none.whl",
+        "pkg-1.0-py3-none-any@x.whl",
+    ],
 )
 def test_a_name_that_is_not_a_readable_wheel_gives_none(filename):
     assert wheel_tags(filename) is None

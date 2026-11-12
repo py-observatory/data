@@ -9,6 +9,7 @@ string, never used as a path.
 into the catalog's latest_files, and lists its wheels' tags in latest_wheel_tag.
 """
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from itertools import groupby, product
@@ -22,19 +23,27 @@ SDIST_SUFFIXES = (".tar.gz", ".zip", ".tar.bz2", ".tgz", ".tar.xz", ".tar")
 
 _WHEEL = ".whl"
 
+# Every value of a Python, ABI or platform tag starts with a letter and holds only
+# letters, digits and underscores, once lowercased: a dash or a dot in a platform is
+# written as an underscore (PEP 425).
+_TAG_VALUE = re.compile(r"[a-z][a-z0-9_]*")
+
 
 def wheel_tags(filename: str) -> frozenset[tuple[str, str, str]] | None:
     """The (python, abi, platform) tags of the wheel named `filename`, lowercased, with
     every combination of a tag set that lists several values. None when the name does
-    not end in `.whl`, or has fewer than five fields split by `-` before it. The last
-    three fields are the tags whatever comes before them, so a build tag, or a dash that
-    a project's name should not have kept, does not change them."""
+    not end in `.whl`, has fewer than five fields split by `-` before it, or has a tag
+    value that no tag could have, such as an empty one or one that starts with a digit.
+    The last three fields are the tags whatever comes before them, so a build tag, or a
+    dash that a project's name should not have kept, does not change them."""
     if not filename.lower().endswith(_WHEEL):
         return None
     fields = filename[: -len(_WHEEL)].split("-")
     if len(fields) < 5:
         return None
     python, abi, platform = (field.lower().split(".") for field in fields[-3:])
+    if not all(_TAG_VALUE.fullmatch(value) for value in (*python, *abi, *platform)):
+        return None
     return frozenset(product(python, abi, platform))
 
 
