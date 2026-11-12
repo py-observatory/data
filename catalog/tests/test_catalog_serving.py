@@ -207,13 +207,18 @@ def assert_carried(out: Path, previous: Path, stream: str) -> None:
 
 
 def a_registry(gh, tmp_path, *, day: str = FIRST) -> StreamInput:
-    """A registry with a project, foo, at 1.0 and 1.1, and a removed and a quarantined
-    one, with records and events that fill every table that a registry fills."""
+    """A registry with a project, foo, at 1.0 and 1.1, whose 1.1 has a wheel too, and a
+    removed and a quarantined one, with records and events that fill every table that a
+    registry fills."""
+    foo = project("foo", "1.0", "1.1")
+    wheel = "foo-1.1-py3-none-any.whl"
+    foo["files"].append({**foo["files"][1], "filename": wheel, "has_provenance": 1})
+    foo["files_current"].append({"name": "foo", "filename": wheel})
     return registry_input(
         gh,
         tmp_path,
         [
-            project("foo", "1.0", "1.1"),
+            foo,
             project("gone", "0.1", status="removed"),
             project("held", "0.1", status="quarantined"),
         ],

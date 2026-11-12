@@ -92,6 +92,38 @@ CREATE TABLE requires_python_text (
     text TEXT NOT NULL UNIQUE
 );
 
+-- What the files of each project's latest version are, counting only the files that it
+-- has now and has not yanked. A project that has no latest version has no row. Older
+-- releases have no such summary.
+CREATE TABLE latest_files (
+    project_id INTEGER PRIMARY KEY,
+    version TEXT NOT NULL,             -- the project's latest_version
+    files INTEGER NOT NULL,
+    wheels INTEGER NOT NULL,           -- files whose name ends in .whl
+    sdists INTEGER NOT NULL,           -- source distributions, the legacy formats included
+    sdist_bytes INTEGER,               -- the largest sdist whose size is known
+    wheel_min_bytes INTEGER,           -- of the wheels whose size is known
+    wheel_max_bytes INTEGER,
+    provenance INTEGER NOT NULL        -- files with a provenance (attestation)
+);
+
+-- The wheel tags of the latest versions' wheels, each tag (PEP 425) once, lowercased,
+-- with a tag set that lists several values split into one row for each, numbered in
+-- (python, abi, platform) order. A wheel whose name cannot be split into its tags gives
+-- none.
+CREATE TABLE wheel_tag (
+    wheel_tag_id INTEGER PRIMARY KEY,
+    python TEXT NOT NULL,
+    abi TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    UNIQUE (python, abi, platform)
+);
+CREATE TABLE latest_wheel_tag (
+    project_id INTEGER NOT NULL,
+    wheel_tag_id INTEGER NOT NULL,
+    PRIMARY KEY (project_id, wheel_tag_id)
+) WITHOUT ROWID;
+
 -- The fields each recorded release changed.
 CREATE TABLE change (
     project_id INTEGER NOT NULL,
@@ -309,6 +341,9 @@ SOURCED: dict[str, tuple[str, ...]] = {
         "project",
         "release",
         "requires_python_text",
+        "latest_files",
+        "wheel_tag",
+        "latest_wheel_tag",
         "change",
         "requirement_text",
         "requirement",
