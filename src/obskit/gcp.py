@@ -366,22 +366,15 @@ class Google:
         return raw
 
     def pull(
-        self,
-        project: str,
-        subscription: str,
-        *,
-        max_messages: int = 100,
-        acknowledge: bool = True,
+        self, project: str, subscription: str, *, max_messages: int = 100
     ) -> list[dict]:
         """Every message waiting in a Pub/Sub subscription, decoded from its JSON, with
         the time Pub/Sub published it added as `publishTime`. A message that is not a
         JSON object raises a GoogleError and is left unacknowledged.
 
-        With `acknowledge`, each batch is acknowledged once it is decoded, so a message
-        is delivered to a run only once. Without it nothing is acknowledged, and each
-        message also carries its `ackId`, for `acknowledge` once the caller has kept
-        what it says. Until then Pub/Sub holds the messages back from other pulls, and
-        once the subscription's ack deadline has passed it delivers them again."""
+        Each batch is acknowledged once it is decoded, within the subscription's ack
+        deadline, which may be as short as 10 s: Pub/Sub ignores a later
+        acknowledgement and delivers the message again."""
         base = f"{_PUBSUB_URL}/{project}/subscriptions/{subscription}"
         messages: list[dict] = []
         while True:
@@ -394,19 +387,12 @@ class Google:
             received = _list_of_objects(reply, "receivedMessages", where)
             if not received:
                 return messages
-            decoded = [_decoded(item, where) for item in received]
+            messages.extend(_decoded(item, where) for item in received)
             ack_ids = [item["ackId"] for item in received]
-            if acknowledge:
-                messages.extend(decoded)
-                self.acknowledge(project, subscription, ack_ids)
-            else:
-                messages.extend(
-                    {**message, "ackId": ack_id}
-                    for message, ack_id in zip(decoded, ack_ids, strict=True)
-                )
+            self.acknowledge(project, subscription, ack_ids)
 
     def acknowledge(self, project: str, subscription: str, ack_ids: list[str]) -> None:
-        """Acknowledge the messages of a Pub/Sub subscription that `pull` gave under
+        """Acknowledge the messages of a Pub/Sub subscription that were pulled under
         `ack_ids`, so that they are not delivered again. An empty list sends nothing.
         Pub/Sub may ignore an ackId whose ack deadline has passed, and then delivers its
         message again."""

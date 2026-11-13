@@ -87,7 +87,7 @@ The usage is taken from Cloud Run itself: the vCPU- and GiB-seconds of every exe
 
 The budget counts two kinds of credit, FREE_TIER and DISCOUNT, and no other. Cloud Run books its free tier as a spending-based discount, of the type DISCOUNT, and other services book theirs as FREE_TIER, so a budget that leaves either out reports free use as spend, and the stream would hold. Promotions stay excluded, so that a trial's credit cannot hide a real charge. The setup under "Google Cloud" sets this.
 
-The budget's notifications come from a Pub/Sub subscription, `budget-alerts-pull`, which each run reads. The newest one of the month is kept in the `spend` table, and a message is acknowledged only once its spend is published.
+The budget's notifications come from a Pub/Sub subscription, `budget-alerts-pull`, which each run reads. The newest one of the month is kept in the `spend` table. Each message is acknowledged as it is pulled, since the subscription allows 10 seconds for that. A run that fails before it publishes learns the spend again from the budget's next notification, which holds the month's cost so far.
 
 A run also reads the partition row counts of the newest 10 days after launch. A day whose count has moved since it was counted is named in the report as drift. It is detected, not recounted. When that read fails, the report says `drift_unknown: true`, and the run goes on to count and publish.
 

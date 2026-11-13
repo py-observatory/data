@@ -226,18 +226,21 @@ def test_a_bootstrap_held_by_the_budget_starts_no_execution(tmp_path):
 
     assert stream.started == []
     assert stream.github.release(CURRENT) is None
-    # Nothing was published to hold the spend, so the notification is not
-    # acknowledged, and Pub/Sub delivers it again to a rerun before the budget's next.
-    assert stream.cloud.acked == []
+    # The notification was acknowledged as it was pulled, though nothing was
+    # published to hold the spend. The budget's next holds the month's cost so far, so
+    # a rerun learns of the spend from it.
+    assert stream.cloud.acked == ["ack-1"]
+    stream.notify(0.01, at="2026-11-11T09:20:00Z")
 
     with pytest.raises(BootstrapError, match=r"\$0.01 spent"):
         stream.bootstrap("2026-11-11T09:30:00Z")
 
     assert stream.started == []
-    assert stream.cloud.acked == []
+    assert stream.cloud.acked == ["ack-1", "ack-2"]
 
     # A person who has looked clears the spend with a reason, and the bootstrap
     # counts. The clearance is published with the first state.
+    stream.notify(0.01, at="2026-11-11T09:45:00Z")
     report = stream.run(
         "2026-11-11T10:00:00Z", bootstrap=True, override_reason="a test charge"
     )
@@ -247,7 +250,7 @@ def test_a_bootstrap_held_by_the_budget_starts_no_execution(tmp_path):
     assert state.execute("SELECT * FROM clearances").fetchall() == [
         ("2026-11", 0.01, "a test charge", "2026-11-11T10:00:00Z")
     ]
-    assert stream.cloud.acked == ["ack-3"]
+    assert stream.cloud.acked == ["ack-1", "ack-2", "ack-3"]
 
 
 # ---- the runs after it
@@ -306,13 +309,39 @@ def test_later_run_counts_forward_days_before_backfill(tmp_path):
         "top_set": 0,
     }
     assert manifest.complete is False
-    # The notification is kept in the state, and acknowledged once the state that
-    # holds it is published. The series breaks go on.
+    # The notification is kept in the state, and was acknowledged as it was pulled.
+    # The series breaks go on.
     assert state.execute("SELECT * FROM spend").fetchall() == [
         ("2026-11", 0.0, 1.0, "2026-11-13T08:00:00Z")
     ]
     assert stream.cloud.acked == ["ack-1"]
     assert len(manifest.series_breaks) == 2
+
+
+def test_notifications_are_acknowledged_as_they_are_pulled(tmp_path):
+    stream = Stream(tmp_path)
+    stream.bootstrap(BOOTSTRAP_AT)
+    stream.notify(0.0, at="2026-11-12T08:00:00Z")
+    # Pub/Sub gives a run 10 s to acknowledge what it pulls, far less than an
+    # execution takes, so the lease of a message left unacknowledged runs out while
+    # the day is counted.
+    count = stream.cloud.on_run
+    assert count is not None
+
+    def slow(env: dict[str, str]) -> dict:
+        stream.cloud.expire_leases()
+        return count(env)
+
+    stream.cloud.on_run = slow
+
+    stream.run("2026-11-12T09:00:00Z", max_seconds=1)
+
+    assert stream.cloud.acked == ["ack-1"]
+
+    # Acknowledged in time, it is not given to the next run again.
+    stream.run("2026-11-12T15:00:00Z", max_seconds=0)
+
+    assert stream.cloud.acked == ["ack-1"]
 
 
 def test_a_day_in_the_bucket_is_not_counted_again(tmp_path):
@@ -544,47 +573,50 @@ def test_spend_above_zero_counts_nothing_and_exits_2(tmp_path, monkeypatch, caps
     assert stream.manifest().generated_at == "2026-11-12T15:00:00Z"
 
 
-def test_a_run_that_fails_after_the_pull_acknowledges_nothing(tmp_path):
+def test_a_spend_pulled_by_a_run_that_fails_comes_back_with_the_next_notification(
+    tmp_path,
+):
     stream = Stream(tmp_path)
     stream.bootstrap(BOOTSTRAP_AT)
     stream.notify(0.25, at="2026-11-12T08:00:00Z")
     # The run fails after it has pulled the notification: Cloud Run refuses the list
-    # of the job's executions.
+    # of the job's executions. The notification was acknowledged as it was pulled.
     stream.cloud.fail_next(403, url_contains="/executions")
 
     with pytest.raises(GoogleError, match="HTTP 403"):
         stream.run("2026-11-12T09:00:00Z")
 
     assert stream.manifest().generated_at == BOOTSTRAP_AT
-    assert stream.cloud.acked == []
+    assert stream.cloud.acked == ["ack-1"]
 
-    # The next run is given the notification again, and holds for the spend, but its
-    # publish fails as the manifest goes up. That acknowledges nothing either.
+    # The budget's next notification holds the month's cost so far. The next run
+    # holds for the spend, but its publish fails as the manifest goes up.
+    stream.notify(0.25, at="2026-11-12T11:00:00Z")
     stream.github.fail("POST", "name=swap-next-manifest.json", 422)
 
     with pytest.raises(GitHubError):
         stream.run("2026-11-12T12:00:00Z")
 
     assert stream.manifest().generated_at == BOOTSTRAP_AT
-    assert stream.cloud.acked == []
 
-    # The run after it is given the notification once more, and holds for the spend.
-    # It acknowledges the notification once its publish holds the spend.
+    # The run after it holds for the spend that the next notification gives, and its
+    # publish keeps it in the state.
+    stream.notify(0.25, at="2026-11-12T14:00:00Z")
     report = stream.run("2026-11-12T15:00:00Z")
 
     assert (report.counted, report.held_kind) == ([], "spend")
     assert days_after_bootstrap(stream) == []
-    assert stream.cloud.acked == ["ack-3"]
+    assert stream.cloud.acked == ["ack-1", "ack-2", "ack-3"]
     state = stream.open(CURRENT, STATE)
     assert state.execute("SELECT * FROM spend").fetchall() == [
-        ("2026-11", 0.25, 1.0, "2026-11-12T08:00:00Z")
+        ("2026-11", 0.25, 1.0, "2026-11-12T14:00:00Z")
     ]
 
-    # Acknowledged, it is not given again, and the state still holds the spend.
+    # With no notification since, the state still holds the spend.
     report = stream.run("2026-11-12T21:00:00Z")
 
     assert (report.counted, report.held_kind) == ([], "spend")
-    assert stream.cloud.acked == ["ack-3"]
+    assert stream.cloud.acked == ["ack-1", "ack-2", "ack-3"]
 
 
 def test_a_day_whose_partition_moved_is_reported(tmp_path, monkeypatch, capsys):
@@ -650,7 +682,7 @@ def test_a_drift_check_that_fails_is_reported_and_the_run_goes_on(
         None,
     )
     assert stream.manifest().generated_at == "2026-11-12T09:00:00Z"
-    # The notification is acknowledged after the publish, as on any run.
+    # The notification was acknowledged as it was pulled, as on any run.
     assert stream.cloud.acked == ["ack-1"]
 
 
@@ -1159,7 +1191,6 @@ def test_a_serving_database_that_fails_its_check_stops_the_run_before_it_publish
     assert rebuilt == [SERVING_DB]
     assert stream.github.asset_bytes(CURRENT, MANIFEST) == published
     assert stream.manifest().generated_at == BOOTSTRAP_AT
-    assert stream.cloud.acked == []
 
 
 # ---- the counter's job
