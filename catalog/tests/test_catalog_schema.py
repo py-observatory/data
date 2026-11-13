@@ -87,6 +87,16 @@ def test_serving_schema_makes_every_table(serving_db):
     assert names(serving_db, "view") == {"tombstone"}
 
 
+def test_release_has_no_index_but_its_key(serving_db):
+    # Nothing reads releases by upload time, and an index of them was more than a
+    # quarter of the compressed catalog.
+    indexes = serving_db.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'release' "
+        "AND sql IS NOT NULL"
+    ).fetchall()
+    assert indexes == []
+
+
 def test_search_is_fts5_over_project(serving_db):
     serving_db.executemany(
         "INSERT INTO project (name, incarnation, status, first_seen, "
