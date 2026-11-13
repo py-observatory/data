@@ -352,49 +352,10 @@ def test_pull_decodes_and_acknowledges_every_message():
     assert got == [{**n, "publishTime": fake.publish_time} for n in notes]
     assert fake.messages == []
     assert fake.acked == [f"ack-{i}" for i in range(1, 6)]
-    assert google.pull(PROJECT, "budget-alerts-pull") == []
-
-
-def test_pull_without_acknowledging_gives_ack_ids_and_the_messages_come_back():
-    fake = FakeGoogle()
-    notes = [{"costAmount": float(i), "budgetAmount": 1.0} for i in range(3)]
-    fake.messages = list(notes)
-    fake.publish_time = "2026-11-12T08:00:00.000Z"
-    google, _, _ = make_google(fake)
-
-    got = google.pull(PROJECT, "budget-alerts-pull", max_messages=2, acknowledge=False)
-
-    first_ids = ["ack-1", "ack-2", "ack-3"]
-    assert got == [
-        {**n, "publishTime": "2026-11-12T08:00:00.000Z", "ackId": ack_id}
-        for n, ack_id in zip(notes, first_ids)
-    ]
-    assert fake.acked == []
-    # While their lease holds, the messages are not delivered again.
-    assert google.pull(PROJECT, "budget-alerts-pull", acknowledge=False) == []
-
-    # Once it has run out, Pub/Sub delivers them again, as they were published, under
-    # new ackIds. A message published since comes after them.
-    fake.expire_leases()
-    fake.messages.append({"costAmount": 3.0, "budgetAmount": 1.0})
-    fake.publish_time = "2026-11-12T09:00:00.000Z"
-    again = google.pull(PROJECT, "budget-alerts-pull", acknowledge=False)
-
-    assert [m["costAmount"] for m in again] == [0.0, 1.0, 2.0, 3.0]
-    assert [m["publishTime"] for m in again] == [
-        *["2026-11-12T08:00:00.000Z"] * 3,
-        "2026-11-12T09:00:00.000Z",
-    ]
-    assert [m["ackId"] for m in again] == ["ack-4", "ack-5", "ack-6", "ack-7"]
-
-    # Acknowledged, they are gone for good. An ackId whose lease ran out acknowledges
-    # nothing, as Pub/Sub may ignore it.
-    google.acknowledge(PROJECT, "budget-alerts-pull", ["ack-1", "ack-4", "ack-5"])
-    fake.expire_leases()
-
-    assert fake.acked == ["ack-1", "ack-4", "ack-5"]
-    left = google.pull(PROJECT, "budget-alerts-pull")
-    assert [m["costAmount"] for m in left] == [2.0, 3.0]
+    # Each batch is acknowledged before the next is pulled, well inside an ack
+    # deadline of seconds.
+    calls = [url.rpartition(":")[2] for _, url in fake.requests if "pubsub" in url]
+    assert calls == ["pull", "acknowledge"] * 3 + ["pull"]
     fake.expire_leases()
     assert google.pull(PROJECT, "budget-alerts-pull") == []
 

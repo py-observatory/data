@@ -30,9 +30,11 @@ looked at the billing report. The run then records a clearance of each month's c
 it stands, and counts. A clearance covers only that cost, so more spend in the same
 month holds the stream again.
 
-The budget's notifications are acknowledged only once a publish holds their spend. A
-run that publishes nothing leaves them to Pub/Sub, which delivers them again to the next
-run, so a spend above $0 is never forgotten.
+The budget's notifications are acknowledged as they are pulled: Pub/Sub ignores an
+acknowledgement that comes after the subscription's deadline, which is seconds, and a
+run lasts an hour. Each notification holds the month's cost so far, and the budget
+sends one many times a day, so when a run publishes nothing, the spend it pulled comes
+back with the next notification.
 
 Each later run reads the sizes of the partitions of the newest days counted from launch
 on, and names each day whose partition has changed since it was counted. Late rows are
@@ -393,24 +395,16 @@ def _take(
     return ensured.outcome
 
 
-def _record_spend(google: Google, config: Config, delta: Delta) -> list[str]:
-    """Pull the budget's notifications without acknowledging them, write the newest of
-    each billing month to the open delta, and return the ackIds of every one.
+def _record_spend(google: Google, config: Config, delta: Delta) -> None:
+    """Pull the budget's notifications, acknowledging each batch as it comes, and write
+    the newest of each billing month to the open delta.
 
-    The run acknowledges them once its publish holds their spend (`_acknowledge`). A
-    run that publishes nothing acknowledges nothing, so Pub/Sub delivers them again to
-    the next run, and a spend above $0 is never forgotten. The state keeps the newest
-    of each month whichever way round they come (see `store.apply`)."""
-    messages = google.pull(config.project, config.subscription, acknowledge=False)
+    A run that publishes nothing has still acknowledged them. The next notification
+    holds the month's cost so far, so the spend comes back with it. The state keeps the
+    newest of each month whichever way round they come (see `store.apply`)."""
+    messages = google.pull(config.project, config.subscription)
     for spend in spend_from(messages):
         delta.spend(spend.month, spend.cost, spend.budget, spend.notified_at)
-    return [message["ackId"] for message in messages]
-
-
-def _acknowledge(google: Google, config: Config, ack_ids: list[str]) -> None:
-    """Acknowledge the notifications that the run pulled, once the state that holds
-    their spend is published."""
-    google.acknowledge(config.project, config.subscription, ack_ids)
 
 
 def _spends(state: sqlite3.Connection) -> list[Spend]:
@@ -804,12 +798,12 @@ def _bootstrap(
     at the time then (see `_wall`). The serving database is made from the open delta,
     which holds the launch day, and checked (see `_rebuild_serving`). The state is
     copied as the base of today's month, and published with the open delta, the
-    serving database and a manifest that lists the breaks. Only then are the
-    notifications acknowledged.
+    serving database and a manifest that lists the breaks.
 
     Raises BootstrapError, and publishes nothing, when the guard refuses the launch
     day or the day fails: a stream with no day counted has nothing to publish. The
-    notifications are then not acknowledged, so a rerun is given them again.
+    notifications it pulled are acknowledged all the same, and a rerun learns the
+    spend from the budget's next.
     """
     launch = latest_due(today)
     serving_db = workdir / serving.SERVING_DB
@@ -832,7 +826,7 @@ def _bootstrap(
         delta = Delta(conn, moment, first_seq=1)
         for day, note in BREAKS:
             delta.series_break(day_number(day), note)
-        pulled = _record_spend(google, config, delta)
+        _record_spend(google, config, delta)
         _commit_and_apply(state, conn)
         if override_reason:
             _clear_spend(state, conn, delta, override_reason)
@@ -876,7 +870,6 @@ def _bootstrap(
         series_breaks=[{"day": day.isoformat(), "note": note} for day, note in BREAKS],
         derived=(serving_db,),
     )
-    _acknowledge(google, config, pulled)
     return _report(
         days,
         held=None,
@@ -906,7 +899,7 @@ def run_once(
     and then a bootstrap builds and publishes the first state (see `_bootstrap`).
     Otherwise the prior manifest must list the state and the open delta
     (PriorStateError). The run rolls over (`cycle.roll_over`), writes the budget's
-    notifications to the delta, without acknowledging them, and with `override_reason`
+    notifications to the delta, acknowledging them as it pulls, and with `override_reason`
     a clearance of any spend that would hold it (see `_clear_spend`), and applies it.
     It names the days whose partition moved, or that the drift is unknown when the
     read fails, and measures what the billing month has used.
@@ -924,14 +917,13 @@ def run_once(
     the prior manifest lacks, is made afresh from the published parts that hold the
     counts and the open delta. It then publishes (`cycle.publish`): the manifest is
     checked with the gates, and the state, the open delta, the serving database and
-    the manifest are swapped into the current release. Only then are the
-    notifications acknowledged.
+    the manifest are swapped into the current release.
 
     Every error other than a failed day propagates, and an error before the publish
-    publishes nothing to the current release and acknowledges no notification, so the
-    next run is given them again. A serving database made afresh that still disagrees
-    with the state is such an error (ServingMismatch). What a rollover already added to
-    a month's release stays, as in `obskit.cycle`.
+    publishes nothing to the current release. The notifications it pulled are not given
+    again, and the next run learns the spend from the budget's next. A serving database
+    made afresh that still disagrees with the state is such an error (ServingMismatch).
+    What a rollover already added to a month's release stays, as in `obskit.cycle`.
     """
     started = clock()
     deadline = started + max_seconds
@@ -973,7 +965,7 @@ def run_once(
         # A new day's delta is numbered on from what the state has applied, and
         # today's goes on after its own last row.
         delta = Delta(conn, moment, first_seq=resume.applied + 1)
-        pulled = _record_spend(google, config, delta)
+        _record_spend(google, config, delta)
         _commit_and_apply(state, conn)
         if override_reason:
             _clear_spend(state, conn, delta, override_reason)
@@ -1035,7 +1027,6 @@ def run_once(
         override_reason=override_reason,
         derived=(serving_db,),
     )
-    _acknowledge(google, config, pulled)
     return _report(
         days,
         held=held,
